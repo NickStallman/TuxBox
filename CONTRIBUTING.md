@@ -42,7 +42,7 @@ Put the printed summary, your GPU, driver and backend in the pull request. Pass 
 
 If your change adds or fixes behaviour, add or extend a Lanes scenario that fails without it. If it cannot be exercised from Lanes, say why in the pull request.
 
-CI has no GPU, so it cannot run Lanes. A reviewer should not merge a pull request without a passing GPU run, from the author or from someone who has the hardware. `python tuxbox.py check --no-gpu` runs only the first group while you work.
+CI builds the providers, guests and Lanes, but it has no GPU, so it cannot run them. A reviewer should not merge a pull request without a passing GPU run, from the author or from someone who has the hardware. `python tuxbox.py check --no-gpu` runs only the first group while you work.
 
 ## Code checks
 

@@ -88,6 +88,8 @@ cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xg-layout
 cargo check --locked --target x86_64-pc-windows-msvc -p tuxbox-d3d12
 ```
 
+A second job builds every provider, guest and Lanes on Linux, without running them, because GitHub's runners have no suitable GPU.
+
 The D3D12 command typechecks the Windows provider. The unit tests check that `docs/progress.svg` and `docs/RESULTS.md` match the recorded evidence. After editing evidence, regenerate both from the repository root:
 
 ```sh
