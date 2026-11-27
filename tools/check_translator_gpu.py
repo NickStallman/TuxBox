@@ -41,6 +41,7 @@ def assembled(tool, *extra):
 
 CHECKS = {
     "alu": assembled("check_basic_alu_gpu"),
+    "float-forms": assembled("check_float_forms_gpu"),
     "ordinary-integer": assembled("check_ordinary_integer_gpu"),
     "packed-integer": assembled("check_packed_integer_gpu"),
     "packed-saturate": assembled("check_packed_integer_gpu", "--clamp"),
