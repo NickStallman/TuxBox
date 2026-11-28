@@ -29,7 +29,7 @@ struct Upload {
 const BATCH_BYTES: usize = 128 << 20;
 
 pub(super) struct Transfer {
-    queue: ID3D12CommandQueue,
+    pub(super) queue: ID3D12CommandQueue,
     pub(super) fence: ID3D12Fence,
     next: u64,
     pub(super) failed: Option<HRESULT>,

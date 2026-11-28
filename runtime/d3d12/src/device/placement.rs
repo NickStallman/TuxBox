@@ -3,6 +3,7 @@ mod descriptors;
 mod digest;
 mod guarded_copy;
 mod publication;
+mod residency;
 mod upload;
 mod waits;
 mod writeback;
@@ -113,6 +114,7 @@ struct Images(Mutex<BTreeMap<u64, Vec<Alias>>>);
 
 pub(crate) struct Texture {
     pub(super) native: ID3D12Resource,
+    residency: residency::Residency,
     pub(super) desc: D3D12_RESOURCE_DESC,
     pub(super) address: u64,
     plane: Option<Plane>,
@@ -255,13 +257,22 @@ impl Texture {
                 | (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)),
             ..*desc
         };
-        let native = committed(
-            device,
-            D3D12_HEAP_TYPE_DEFAULT,
-            &host,
-            D3D12_RESOURCE_STATE_COMMON,
-            clear,
-        )?;
+        // Images that need castable formats or two planes keep committed memory.
+        let reserved = if pitch.is_none() && !super::allocation::needs_packed_uav_cast(device, host.Format, host.Flags) {
+            residency::reserve(device, &host, clear)
+        } else {
+            None
+        };
+        let (native, residency) = match reserved {
+            Some(reserved) => reserved,
+            None => (committed(
+                device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                &host,
+                D3D12_RESOURCE_STATE_COMMON,
+                clear,
+            )?, residency::Residency::Committed),
+        };
         let mut mips = Vec::with_capacity(count as usize);
         for index in 0..count {
             let (slice, level, element_bytes, source) = if let Some(p) = &plane {
@@ -319,6 +330,7 @@ impl Texture {
         });
         Ok(Arc::new(Self {
             native,
+            residency,
             desc: *desc,
             address,
             plane,
@@ -480,6 +492,7 @@ impl PlacementMemory {
                     && unsafe { write.published.GetCompletedValue() } < write.tick
             })
         });
+        submissions.transfer.back(device, &textures)?;
         submissions.transfer.refresh(device, &textures)
     }
 }
@@ -730,6 +743,8 @@ pub(crate) unsafe fn submit(
         crate::commands::queue_trace::waited(queue, "wait for an earlier texture publication", &fence, value);
     }
     let transfer = &mut submission.transfer;
+    // Every image this batch reads, writes or copies gets its memory first.
+    transfer.back(&device.native, textures)?;
     transfer.refresh(&device.native, &refresh)?;
     let required = textures
         .iter()
