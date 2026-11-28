@@ -305,8 +305,21 @@ fn sdwa_f32_applies_modifiers_before_preserving_unselected_bits() {
     // gfx1030: v_add_f32_sdwa v4, -|v1|, v2 clamp mul:2 dst_sel:WORD_1
     // dst_unused:UNUSED_PRESERVE src0_sel:DWORD src1_sel:DWORD
     let hlsl = translate(Stage::Compute, &[0x0608_04f9, 0x0636_7501]).unwrap();
-    assert!(hlsl.contains("saturate((((-abs(asfloat(v1))) + asfloat(v2)) * 2.0))"), "{hlsl}");
+    assert!(hlsl.contains("saturate(tb_omod((-abs(asfloat(v1))) + asfloat(v2), 1))"), "{hlsl}");
     assert!(hlsl.contains("(v4) & 0xffffu"), "{hlsl}");
+}
+
+#[test]
+fn omod_scales_the_rounded_result_by_its_exponent() {
+    use super::float64::tests::translate;
+    // gfx1030: v_mul_legacy_f32_e64 v4, v1, v2 div:2. Written as `(a * b) * 0.5`,
+    // the scale moved into the product, so 2 * MAX came back as MAX, not infinity.
+    let hlsl = translate(Stage::Compute, &[0xd507_0004, 0x1802_0501]).unwrap();
+    assert!(hlsl.contains("v4 = asuint(tb_omod(tb_mull(asfloat(v1), asfloat(v2)), -1));"), "{hlsl}");
+    assert!(hlsl.contains("float tb_omod(float x, int k) {"), "{hlsl}");
+    // Without OMOD the helper is left out.
+    let plain = translate(Stage::Compute, &[0xd507_0004, 0x0002_0501]).unwrap();
+    assert!(!plain.contains("tb_omod"), "{plain}");
 }
 
 #[test]
@@ -314,7 +327,7 @@ fn sdwa_f32_scales_a_full_word_without_source_modifiers() {
     use super::float64::tests::translate;
     // gfx1030: v_mul_f32_sdwa v4, v1, v2 div:2 (all selectors DWORD).
     let hlsl = translate(Stage::Compute, &[0x1008_04f9, 0x0606_d601]).unwrap();
-    assert!(hlsl.contains("v4 = asuint(((asfloat(v1) * asfloat(v2)) * 0.5))"), "{hlsl}");
+    assert!(hlsl.contains("v4 = asuint(tb_omod(asfloat(v1) * asfloat(v2), -1))"), "{hlsl}");
 }
 
 #[test]
@@ -327,7 +340,7 @@ fn sdwa_f32_rounding_applies_input_and_output_modifiers() {
     ] {
         let hlsl = translate(Stage::Compute, &[opcode, 0x0036_5601]).unwrap();
         let mode = if intrinsic == "tb_fract_f32" { ", 0u" } else { "" };
-        let result = format!("asuint((({intrinsic}((-abs(asfloat(v1))){mode})) * 2.0))");
+        let result = format!("asuint(tb_omod({intrinsic}((-abs(asfloat(v1))){mode}), 1))");
         assert!(hlsl.contains(&result), "{hlsl}");
     }
 }
@@ -342,7 +355,7 @@ fn sdwa_integer_to_float_has_float_output_and_integer_input_modifiers() {
                    0x7e08_24f9, 0x7e08_26f9, 0x7e08_28f9] {
         let hlsl = translate(Stage::Compute, &[opcode, sdwa]).unwrap();
         assert!(hlsl.lines().any(|line| line.contains("v4 = asuint(saturate(")
-            && line.ends_with(" * 4.0)));")), "{hlsl}");
+            && line.ends_with(", 2)));")), "{hlsl}");
         // SRC0_NEG is invalid for an integer input.
         let error = translate(Stage::Compute, &[opcode, sdwa | (1 << 20)]).unwrap_err();
         assert!(error.contains("unsupported SDWA neg/abs"), "{error}");
@@ -358,7 +371,7 @@ fn widen_f16_reads_a_half_precision_source_before_applying_modifiers() {
     // v_cvt_f32_f16_sdwa v4, -|v1| clamp mul:2 dst_sel:DWORD src0_sel:WORD_1
     let hlsl = translate(Stage::Compute, &[0x7e08_16f9, 0x0035_7601]).unwrap();
     assert!(hlsl.contains("((v1 >> 16) & 0xffffu)"), "{hlsl}");
-    assert!(hlsl.contains("saturate((((-abs(f16tof32("), "{hlsl}");
+    assert!(hlsl.contains("saturate(tb_omod((-abs(f16tof32("), "{hlsl}");
 }
 
 #[test]

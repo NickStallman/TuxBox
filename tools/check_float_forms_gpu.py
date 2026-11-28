@@ -381,25 +381,12 @@ FORMS = [
           (0, 4, 1, 0, True), (0, 1, 2, 0, True), (0, 7, 0, 7, True)]],
 ]
 
-def omod_in_product(a, b, c):
-    """The legacy product with the 0.5 of OMOD moved into it: a * b * 0.5 rounded
-    once, so a product that overflows comes back finite."""
-    a, b = flush(a), flush(b)
-    if not a & 0x7fffffff or not b & 0x7fffffff:
-        return 0
-    return to_bits(to_float(a) * to_float(b) * 0.5)
-
-
 # Known faults of the translation on one kind of host, which the check expects
 # until they are fixed. Each is modelled exactly: on that host a result that
 # differs from the console must be the modelled one, and the console's result
-# there fails as "FIXED?" so the entry is removed with the fix.
-KNOWN = {
-    # DXC's fast-math reassociates `(a * b) * 0.5` into `(a * 0.5) * b`. RADV
-    # recombines it into a hardware output modifier, so only NVIDIA shows it.
-    "omod-in-product": dict(hosts=("10de",), forms={"v_mul_legacy_f32_e64 v{d}, v4, v5 div:2": omod_in_product},
-                            cause="DXC moves OMOD's 0.5 into the product, so an overflowing product stays finite"),
-}
+# there fails as "FIXED?" so the entry is removed with the fix. Entries are
+# dict(hosts=(PCI vendor IDs,), forms={label: model of the faulty word}, cause=text).
+KNOWN = {}
 
 
 def known_for(adapter, label):

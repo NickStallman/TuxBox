@@ -285,6 +285,7 @@ fn is_pure_tb_helper(token: &str) -> bool {
             | "tb_cube_dir"
             | "tb_mull"
             | "tb_log2"
+            | "tb_omod"
             | "tb_f16_cvt"
             | "tb_mad24_sat"
             | "tb_f16_rne"
