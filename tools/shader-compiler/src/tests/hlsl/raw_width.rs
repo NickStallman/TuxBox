@@ -62,6 +62,56 @@ fn raw_buffer_transfers_are_emitted_one_dword_at_a_time() {
     }
 }
 
+/// The lines that read `buffer` without testing the lane's EXEC bit first.
+fn loads_outside_exec(hlsl: &str, buffer: &str) -> Vec<String> {
+    let load = format!("{buffer}.Load(");
+    hlsl.lines()
+        .filter(|line| line.find(&load).is_some_and(|at| !line[..at].contains("if (exec_lo & ")))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn raw_loads_read_only_for_lanes_in_exec() {
+    // A lane outside EXEC performs no memory access, and its address register can hold
+    // anything. vdata v[4:7], srsrc s[8:11], soffset 0: no address register, OFFEN v2,
+    // IDXEN v2, IDXEN v2 with OFFEN v3.
+    for first in [0xe038_0000u32, 0xe038_1000, 0xe038_2000, 0xe038_3000] {
+        let ex = compute_extract(&[first, 0x8002_0402]);
+        let insns = disassemble(&ex.isa);
+        assert_eq!(insns[0].mnemonic, "buffer_load_dwordx4");
+        let mut em = Emitter::new(&ex, insns.clone());
+        em.raw_byte_index.insert(insns[0].offset);
+        em.raw_transfer_on(&insns[0], "raw_sbuf0".into(), false).unwrap();
+        assert_eq!(em.body.matches("raw_sbuf0.Load(").count(), 4, "{first:#x}:\n{}", em.body);
+        assert_eq!(loads_outside_exec(&em.body, "raw_sbuf0"), Vec::<String>::new(), "{first:#x}:\n{}", em.body);
+    }
+}
+
+#[test]
+fn a_stale_address_outside_exec_is_never_read() {
+    // ProjectScarlett's skinned mesh programs divide by a meshlet count, which leaves the
+    // reciprocal (0xFFFFFF00 / n) in v1, then narrow EXEC to the meshlet's vertices and
+    // load at a byte offset only those lanes compute. Read by the other lanes through a
+    // root SRV, which has no bounds, the reciprocal faulted the GPU up to 4 GiB past the
+    // buffer. Encodings produced by llvm-mc -mcpu=gfx1030.
+    let mut ex = compute_extract(&[
+        0xbe8b_03ff, 0x1101_4fac, // s_mov_b32 s11, 0x11014fac: format
+        0xbe8a_03c1,              // s_mov_b32 s10, -1: count
+        0xbe88_030c,              // s_mov_b32 s8, s12: low address
+        0x8809_ff0d, 0x0001_0000, // s_or_b32 s9, s13, 0x10000: high address | byte stride
+        0x7e04_02ff, 0x7fff_ff80, // v_mov_b32 v2, 0x7fffff80
+        0x7da8_000e,              // v_cmpx_gt_u32 s14, v0
+        0x3404_0082,              // v_lshlrev_b32 v2, 2, v0
+        0xe030_1000, 0x8002_0302, // buffer_load_dword v3, v2, s[8:11], 0 offen
+        0xbf81_0000,
+    ]);
+    ex.resources.push(crate::psv::PsvResource { res_type: 4, space: 0, lower: 0, upper: 0 });
+    let hlsl = super::translate(&ex).unwrap().hlsl;
+    assert_eq!(hlsl.matches("raw_sbuf0.Load(").count(), 1, "{hlsl}");
+    assert_eq!(loads_outside_exec(&hlsl, "raw_sbuf0"), Vec::<String>::new(), "{hlsl}");
+}
+
 #[test]
 fn store_beyond_a_single_srv_range_uses_only_a_corroborated_uav() {
     use crate::meta::{RootParam, RootParamKind, RootRange};
