@@ -45,6 +45,7 @@ CASES = {
     "buffer-unmap-released": ("d3d12-buffer-import", ("--unmap-released",), "d3d12-buffer-unmap", ("mode=released", "later-submits=ok")),
     "null-usage": ("d3d12-null-usage", (), "d3d12-null-usage", ("words=64/64", "recorded=64", "valid=2")),
     "null-disabled": ("d3d12-null-usage", ("--reject",), "d3d12-null-disabled", ("rejected=1", "valid=1")),
+    "address-uav": ("d3d12-address-uav", (), "d3d12-address-uav", ("words=10/10", "start=432", "stride=20")),
 }
 DEFAULT = tuple(name for name in CASES if name not in ("root-cbv-window", "root-cbv-offsets", "alias-deferred", "copy-resource", "indirect-scarlett", "mesh", "buffer-import", "buffer-import-reject", "buffer-layout", "buffer-remap", "buffer-unmap-alive", "buffer-unmap-released"))
 # These run with the constant-buffer settings `tuxbox.py run` gives a game. The
