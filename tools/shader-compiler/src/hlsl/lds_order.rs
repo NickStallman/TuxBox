@@ -85,7 +85,7 @@ pub(super) fn exchange_waits(insns: &[Insn], loops: &[(usize, usize)]) -> BTreeS
             Some(Access::Write)
         } else if name.starts_with("ds_read") {
             Some(Access::Read)
-        } else if name == "ds_max_u32" {
+        } else if matches!(name, "ds_max_u32" | "ds_min_i32" | "ds_max_i32") {
             Some(Access::Atomic)
         } else {
             None

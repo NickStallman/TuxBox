@@ -257,8 +257,12 @@ GROUP_MEMORY = {
     "ds_add_u32": ([WRITE, "ds_add_u32 v20, v6", READ], lambda b, c: [(b + c) & M]),
     "ds_min_u32": ([WRITE, "ds_min_u32 v20, v6", READ], lambda b, c: [min(b, c)]),
     "ds_max_u32": ([WRITE, "ds_max_u32 v20, v6", READ], lambda b, c: [max(b, c)]),
+    "ds_min_i32": ([WRITE, "ds_min_i32 v20, v6", READ], lambda b, c: [min(b, c, key=s32)]),
+    "ds_max_i32": ([WRITE, "ds_max_i32 v20, v6", READ], lambda b, c: [max(b, c, key=s32)]),
     # The returning form also gives the word as it was.
     "ds_add_rtn_u32": ([WRITE, "ds_add_rtn_u32 {1}, v20, v6", READ], lambda b, c: [(b + c) & M, b]),
+    "ds_min_rtn_i32": ([WRITE, "ds_min_rtn_i32 {1}, v20, v6", READ], lambda b, c: [min(b, c, key=s32), b]),
+    "ds_max_rtn_i32": ([WRITE, "ds_max_rtn_i32 {1}, v20, v6", READ], lambda b, c: [max(b, c, key=s32), b]),
     "ds_write2_b32": (["ds_write2_b32 v20, v5, v6 offset1:1", READ, "ds_read_b32 {1}, v20 offset:4"],
                       lambda b, c: [b, c]),
     "ds_read2_b32": ([WRITE, "ds_write_b32 v20, v6 offset:4", "ds_read2_b32 v[{0n}:{1n}], v20 offset1:1"],

@@ -1002,8 +1002,8 @@ Ds 0x1 ds_sub_u32 | unsupported encoding
 Ds 0x2 ds_rsub_u32 | unsupported encoding
 Ds 0x3 ds_inc_u32 | unsupported encoding
 Ds 0x4 ds_dec_u32 | unsupported encoding
-Ds 0x5 ds_min_i32 | unsupported encoding
-Ds 0x6 ds_max_i32 | unsupported encoding
+Ds 0x5 ds_min_i32 | yes
+Ds 0x6 ds_max_i32 | yes
 Ds 0x7 ds_min_u32 | yes
 Ds 0x8 ds_max_u32 | yes
 Ds 0x9 ds_and_b32 | yes
@@ -1032,8 +1032,8 @@ Ds 0x21 ds_sub_rtn_u32 | unsupported encoding
 Ds 0x22 ds_rsub_rtn_u32 | unsupported encoding
 Ds 0x23 ds_inc_rtn_u32 | unsupported encoding
 Ds 0x24 ds_dec_rtn_u32 | unsupported encoding
-Ds 0x25 ds_min_rtn_i32 | unsupported encoding
-Ds 0x26 ds_max_rtn_i32 | unsupported encoding
+Ds 0x25 ds_min_rtn_i32 | yes
+Ds 0x26 ds_max_rtn_i32 | yes
 Ds 0x27 ds_min_rtn_u32 | yes
 Ds 0x28 ds_max_rtn_u32 | yes
 Ds 0x29 ds_and_rtn_b32 | yes

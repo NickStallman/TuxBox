@@ -198,7 +198,8 @@ impl<'a> Emitter<'a> {
                 if self.is_cs
                     && (m == "ds_wrxchg_rtn_b32" || matches!(
                         m.replace("_rtn", "").as_str(),
-                        "ds_add_u32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32"
+                        "ds_add_u32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32" | "ds_and_b32"
+                            | "ds_or_b32" | "ds_xor_b32"
                     )) =>
             {
                 // Atomic read-modify-write on group-shared memory (the `_rtn` forms also
@@ -211,7 +212,15 @@ impl<'a> Emitter<'a> {
                     op.enc == Enc::Sopp && Self::branch_cond(op.op).is_some()) {
                     return Err("LDS exchange with unverified branch convergence".into());
                 }
-                let func = match m.replace("_rtn", "").as_str() {
+                let operation = m.replace("_rtn", "");
+                // `tb_lds` holds unsigned words, so HLSL's minimum and maximum on it compare
+                // unsigned. The signed forms compare and exchange until no lane intervened.
+                let signed = match operation.as_str() {
+                    "ds_min_i32" => Some("min"),
+                    "ds_max_i32" => Some("max"),
+                    _ => None,
+                };
+                let func = match operation.as_str() {
                     "ds_add_u32" => "InterlockedAdd",
                     "ds_min_u32" => "InterlockedMin",
                     "ds_max_u32" => "InterlockedMax",
@@ -224,9 +233,16 @@ impl<'a> Emitter<'a> {
                 let addr = r(&s[0])?;
                 let t = self.tmp;
                 self.tmp += 1;
+                let data = r(&s[1])?;
+                let update = match signed {
+                    None => format!("{func}(tb_lds[t{t}i], {data}, t{t});"),
+                    Some(pick) => format!(
+                        "InterlockedOr(tb_lds[t{t}i], 0u, t{t}); uint t{t}seen; [allow_uav_condition] do {{ t{t}seen = t{t}; \
+                         InterlockedCompareExchange(tb_lds[t{t}i], t{t}seen, asuint({pick}(asint(t{t}seen), asint({data}))), t{t}); }} while (t{t} != t{t}seen);"
+                    ),
+                };
                 self.line(&format!(
-                    "uint t{t} = 0u; uint t{t}i = ({addr} + {off:#x}u) >> 2; if ((exec_lo & 1u) && t{t}i < TB_LDS_WORDS) {{ {func}(tb_lds[t{t}i], {}, t{t}); }}",
-                    r(&s[1])?
+                    "uint t{t} = 0u; uint t{t}i = ({addr} + {off:#x}u) >> 2; if ((exec_lo & 1u) && t{t}i < TB_LDS_WORDS) {{ {update} }}"
                 ));
                 if m.contains("_rtn") {
                     self.wv(&d.ok_or("no dst")?, &format!("t{t}"))?;

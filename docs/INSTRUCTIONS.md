@@ -12,7 +12,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 
 - 1,085 instructions in 1,398 encodings.
 - 372 are used by the recorded shaders; a GPU check runs 372 of those.
-- 210 encodings have no translation, and 186 are unproven: alone they need a bound resource or a stage, and no recorded shader uses them.
+- 206 encodings have no translation, and 186 are unproven: alone they need a bound resource or a stage, and no recorded shader uses them.
 
 | Family | Encodings | Translates | Seen translating | Nothing to emit | Unproven | Not translated | Used | Used without a GPU check |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -27,7 +27,7 @@ Every instruction the decoder names, from [AMD's machine-readable instruction se
 | [Vector compare (VOPC)](#vector-compare-vopc) | 190 | 190 | 0 | 0 | 0 | 0 | 61 | 0 |
 | [Vector, three operands (VOP3 and VOP3P)](#vector-three-operands-vop3-and-vop3p) | 457 | 421 | 7 | 1 | 1 | 27 | 199 | 0 |
 | [Interpolation (VINTRP)](#interpolation-vintrp) | 3 | 0 | 3 | 0 | 0 | 0 | 3 | 0 |
-| [Group memory (DS)](#group-memory-ds) | 123 | 36 | 0 | 0 | 0 | 87 | 17 | 0 |
+| [Group memory (DS)](#group-memory-ds) | 123 | 40 | 0 | 0 | 0 | 83 | 17 | 0 |
 | [Flat, global and scratch memory (FLAT)](#flat-global-and-scratch-memory-flat) | 54 | 0 | 5 | 0 | 0 | 49 | 5 | 0 |
 | [Untyped buffers (MUBUF)](#untyped-buffers-mubuf) | 75 | 2 | 25 | 0 | 48 | 0 | 25 | 0 |
 | [Typed buffers (MTBUF)](#typed-buffers-mtbuf) | 16 | 0 | 4 | 0 | 12 | 0 | 4 | 0 |
@@ -1104,8 +1104,8 @@ Most used first. Each needs a check before it can be trusted.
 | `ds_rsub_u32` | 0x2 | **No** | — | — |
 | `ds_inc_u32` | 0x3 | **No** | — | — |
 | `ds_dec_u32` | 0x4 | **No** | — | — |
-| `ds_min_i32` | 0x5 | **No** | — | — |
-| `ds_max_i32` | 0x6 | **No** | — | — |
+| `ds_min_i32` | 0x5 | Yes | — | — |
+| `ds_max_i32` | 0x6 | Yes | — | — |
 | `ds_min_u32` | 0x7 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 134 |
 | `ds_max_u32` | 0x8 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 78 |
 | `ds_and_b32` | 0x9 | Yes | AMD 1002:13c0, NVIDIA 10de:2705 | 4 |
@@ -1134,8 +1134,8 @@ Most used first. Each needs a check before it can be trusted.
 | `ds_rsub_rtn_u32` | 0x22 | **No** | — | — |
 | `ds_inc_rtn_u32` | 0x23 | **No** | — | — |
 | `ds_dec_rtn_u32` | 0x24 | **No** | — | — |
-| `ds_min_rtn_i32` | 0x25 | **No** | — | — |
-| `ds_max_rtn_i32` | 0x26 | **No** | — | — |
+| `ds_min_rtn_i32` | 0x25 | Yes | — | — |
+| `ds_max_rtn_i32` | 0x26 | Yes | — | — |
 | `ds_min_rtn_u32` | 0x27 | Yes | — | — |
 | `ds_max_rtn_u32` | 0x28 | Yes | — | — |
 | `ds_and_rtn_b32` | 0x29 | Yes | — | — |
