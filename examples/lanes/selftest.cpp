@@ -732,12 +732,14 @@ ComPtr<ID3D12PipelineState> console_pipeline(ID3D12Device* device, Stream& parts
 
 // Draws a fullscreen triangle with `vertex` (the console vertex program unless
 // another is given), or with `mesh` when that is given, and `pixel` under `root`, into a 16x16 target of 32-bit
-// `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`.
+// `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`, with `sampler_heap` beside it
+// when given.
 // Returns the texels, row by row.
 std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
                                       DXGI_FORMAT format, ID3D12DescriptorHeap* view_heap,
                                       std::initializer_list<UINT> tables, D3D12_SHADER_BYTECODE mesh = {},
-                                      D3D12_SHADER_BYTECODE vertex = {raster_vertex, sizeof(raster_vertex)}) {
+                                      D3D12_SHADER_BYTECODE vertex = {raster_vertex, sizeof(raster_vertex)},
+                                      ID3D12DescriptorHeap* sampler_heap = nullptr) {
     ComPtr<ID3D12PipelineState> pipeline;
     if (mesh.BytecodeLength) {
         frame_abi::MeshPipelineStream parts;
@@ -777,8 +779,8 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     constexpr float clear[4]{};
     method<frame_abi::Clear>(list, slot_clear_target)(list, rtv, clear, 0, nullptr);
     method<SetRoot>(list, slot_graphics_root)(list, root);
-    ID3D12DescriptorHeap* bound[]{view_heap};
-    method<BindHeaps>(list, slot_bind_heaps)(list, 1, bound);
+    ID3D12DescriptorHeap* bound[]{view_heap, sampler_heap};
+    method<BindHeaps>(list, slot_bind_heaps)(list, sampler_heap ? 2 : 1, bound);
     UINT parameter = 0;
     for (const UINT view : tables)
         method<SetTable>(list, slot_graphics_table)(list, parameter++, {gpu_base + UINT64(view) * stride});
@@ -1099,6 +1101,69 @@ ComPtr<ID3D12Resource> sampled_texture(ID3D12Device* device, D3D12_RESOURCE_STAT
         copy.finish("upload sampled texture");
     }
     return texture;
+}
+
+// A console vertex program samples a texture from the resource heap with a sampler
+// from the sampler heap at a constant index, the way RAGE's VfxVBuffer programs do:
+// both arms of an if/else copy the sampler into vector registers, and a waterfall
+// loop reads it back for the sample (`raster_fixture.py`). The sampled value is the
+// position's w. The point sampler at the program's index keeps the triangle over the
+// whole target; the linear ones everywhere else in the heap shrink it. A program the
+// translator refuses becomes a stand-in pipeline and draws nothing.
+void raster_sampler_waterfall(ID3D12Device* device) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                                  D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize waterfall root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create waterfall root");
+
+    auto texture = sampled_texture(device, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create waterfall view heap");
+    const UINT view_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T view_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(texture.Get(), &srv, {view_base + SIZE_T(waterfall_texture_index) * view_stride});
+
+    constexpr UINT samplers = 8;
+    D3D12_DESCRIPTOR_HEAP_DESC sampler_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, samplers,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> sampler_heap;
+    check(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&sampler_heap)), "create waterfall sampler heap");
+    const UINT sampler_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    const SIZE_T sampler_base = method<frame_abi::CpuHandle>(sampler_heap.Get(), 9)(sampler_heap.Get());
+    for (UINT i = 0; i < samplers; ++i) {
+        D3D12_SAMPLER_DESC sampler{};
+        sampler.Filter = i == waterfall_sampler_index ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxAnisotropy = 1;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sampler.MaxLOD = 12;
+        device->CreateSampler(&sampler, {sampler_base + SIZE_T(i) * sampler_stride});
+    }
+
+    const auto texels = draw_console_raster(device, root.Get(), {heap_stride_pixel, sizeof(heap_stride_pixel)},
+                                            DXGI_FORMAT_R32_UINT, view_heap.Get(), {}, {},
+                                            {waterfall_vertex, sizeof(waterfall_vertex)}, sampler_heap.Get());
+    for (UINT i = 0; i < texels.size(); ++i) {
+        if (texels[i] == heap_stride_expected) continue;
+        char message[200];
+        std::snprintf(message, sizeof(message),
+                      "texel %u,%u is %#x: a stand-in pipeline, a skipped draw or another sampler than heap slot %u",
+                      i % 16, i / 16, texels[i], waterfall_sampler_index);
+        throw std::runtime_error(message);
+    }
 }
 
 // Draws `pixel` (and `mesh`, when given) under `root` with the 2x1 texture the
@@ -3578,6 +3643,7 @@ constexpr Scenario scenarios[] = {
     {L"large-dispatch", large_dispatch},
     {L"late-pipeline", late_pipeline},
     {L"compute-heap-stride", compute_heap_stride},
+    {L"raster-sampler-waterfall", raster_sampler_waterfall},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -3638,7 +3704,8 @@ const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
                                              L"bindless-table-store", L"bindless-table-compute",
                                              L"raster-heap-stride", L"large-dispatch",
-                                             L"compute-heap-stride", L"late-pipeline"};
+                                             L"compute-heap-stride", L"late-pipeline",
+                                             L"raster-sampler-waterfall"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -3650,9 +3717,10 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its root-aware runtime shader worker.
-        // mixed-lane, raster-heap-stride, large-dispatch, compute-heap-stride and late-pipeline also need the live compiler.
+        // mixed-lane, raster-heap-stride, large-dispatch, compute-heap-stride, late-pipeline and raster-sampler-waterfall
+        // also need the live compiler.
         // mesh-signature-none needs a host profile without mesh shaders.
-        if (all && (!std::wcscmp(scenario.name, L"mesh-signature-none") || !std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcscmp(scenario.name, L"late-pipeline") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        if (all && (!std::wcscmp(scenario.name, L"mesh-signature-none") || !std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcscmp(scenario.name, L"late-pipeline") || !std::wcscmp(scenario.name, L"raster-sampler-waterfall") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

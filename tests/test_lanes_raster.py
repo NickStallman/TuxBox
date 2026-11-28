@@ -72,7 +72,8 @@ class RasterFixtureTests(unittest.TestCase):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
         for name, data in (("heap_stride_vertex", raster_fixture.heap_stride_vertex()),
-                           ("heap_stride_pixel", raster_fixture.heap_stride_pixel())):
+                           ("heap_stride_pixel", raster_fixture.heap_stride_pixel()),
+                           ("waterfall_vertex", raster_fixture.sampler_waterfall_vertex())):
             values = re.search(rf"{name}\[\] = \{{([0-9,]+)\}};", text).group(1)
             self.assertEqual(bytes(int(value) for value in values.split(",")), data)
 
@@ -81,6 +82,16 @@ class RasterFixtureTests(unittest.TestCase):
         self.assertNotIn(b"RTS0", found)
         self.assertEqual(found[b"SFI0"], struct.pack("<Q", 1 << 25))
         self.assertEqual(rows(fssm(found[b"DXIL"]), 0xe8, 0xf8), [[5, 0, 1, 0, 8]])
+
+    def test_waterfall_program_takes_both_heaps_and_no_root(self):
+        found = parts(raster_fixture.sampler_waterfall_vertex())
+        self.assertNotIn(b"RTS0", found)
+        self.assertEqual(found[b"SFI0"], struct.pack("<Q", 3 << 25))
+        self.assertEqual(rows(fssm(found[b"DXIL"]), 0xe8, 0xf8), [[5, 0, 1, 0, 8], [6, 0, 1, 0, 10]])
+        # The sampler load's offset is the heap index the scenario fills with the point sampler.
+        self.assertIn(0xFA000000 | 16 * raster_fixture.WATERFALL_SAMPLER_INDEX, raster_fixture.WATERFALL_VERTEX_CODE)
+        text = raster_fixture.header(raster_fixture.vertex(), raster_fixture.pixel())
+        self.assertIn("waterfall_texture_index = 100, waterfall_sampler_index = 5;", text)
 
     def test_sampler_program_declares_the_roots_register_and_builds_a_literal_state(self):
         data = raster_fixture.sampler_pixel()
@@ -184,7 +195,8 @@ class RasterGateTests(unittest.TestCase):
     def test_reflected_draw_passes_and_cleans_its_entries(self):
         seen, _ = self.run_gate(self.TRACE, ["a" * 64, "b" * 64])
         self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
-                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride",
+                                         "lanes-raster-sampler-waterfall"])
         self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-tables"])
         self.assertEqual(seen["stale"], [False, False])
         self.assertNotIn("TUXBOX_RASTER_ROOT_FALLBACK", seen["env"])
@@ -228,7 +240,8 @@ class RasterGateTests(unittest.TestCase):
         self.assertIsNone(seen["problem"])
         self.assertFalse(seen["mesh"])
         self.assertEqual(seen["calls"], ["lanes-raster-tables", "lanes-lane-spill-interp", "lanes-raster-samplers", "lanes-mesh-samplers", "lanes-mesh-sampler-single",
-                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride"])
+                                         "lanes-mesh-sampler-rootless", "lanes-raster-heap-stride",
+                                         "lanes-raster-sampler-waterfall"])
         self.assertEqual(seen["left"], ["title.cso"])
         self.assertIn("mesh pipeline", self.run_gate(trace(1), [], "mesh-samplers")[0]["problem"])
         self.assertIn("stand-in", self.run_gate(mesh_trace + "substituted null raster stream pipeline\n", [],
@@ -261,11 +274,20 @@ class RasterGateTests(unittest.TestCase):
         key = hashlib.sha256(raster_fixture.heap_stride_vertex()).hexdigest()
         self.assertIn("without its root", self.run_gate(bound, [key], "raster-heap-stride")[0]["problem"])
 
+    def test_waterfall_draw_needs_a_translation(self):
+        seen, _ = self.run_gate("", ["a" * 64], "raster-sampler-waterfall")
+        self.assertEqual(seen["arguments"][:2], ["--selftest", "raster-sampler-waterfall"])
+        self.assertIsNone(seen["problem"])
+        self.assertIn("translated nothing", self.run_gate("", [], "raster-sampler-waterfall")[0]["problem"])
+        self.assertIn("stand-in", self.run_gate("substituted null graphics pipeline\n", ["a" * 64],
+                                                "raster-sampler-waterfall")[0]["problem"])
+
     def test_scenario_runs_only_under_the_worker(self):
         self.assertNotIn("raster-tables", LANES_SCENARIOS)
         self.assertNotIn("raster-samplers", LANES_SCENARIOS)
         self.assertNotIn("mesh-samplers", LANES_SCENARIOS)
         self.assertNotIn("raster-heap-stride", LANES_SCENARIOS)
+        self.assertNotIn("raster-sampler-waterfall", LANES_SCENARIOS)
         self.assertIn("lanes-raster-tables", BASE_SUITES)
 
 
