@@ -207,8 +207,10 @@ impl<'a> Emitter<'a> {
     /// Record a read of word 2 of a four-word descriptor as a number.
     pub(super) fn note_buffer_count(&mut self, insns: &[Insn], at: usize, sym: &HashMap<u16, Sym>) {
         let ins = &insns[at];
-        // These take a descriptor as a descriptor, and a move carries the fact along.
-        if memory(ins) || matches!(ins.mnemonic.as_str(), "v_nop" | "s_mov_b32" | "s_mov_b64" | "s_getpc_b64") {
+        // These take a descriptor as a descriptor, and a move carries the fact along,
+        // as does a copy `descriptor_broadcast` proved a waterfall reads back.
+        if memory(ins) || matches!(ins.mnemonic.as_str(), "v_nop" | "s_mov_b32" | "s_mov_b64" | "s_getpc_b64")
+            || self.descriptor_copies.contains(&at) {
             return;
         }
         for (index, source) in ins.src.iter().enumerate() {
@@ -225,7 +227,13 @@ impl<'a> Emitter<'a> {
             // Certain when the load is in the same straight run and nothing
             // wrote the register since: the descriptor facts are optimistic
             // where paths join.
-            let certain = loads.iter().any(|&load| load < at && load >= run_start(insns, at)
+            // A waterfall's read of the copied word is as sure as the word it copied,
+            // except in the loop's own test for the lanes that hold that descriptor.
+            let read_back = !ins.mnemonic.starts_with("v_cmp_eq_u")
+                && (run_start(insns, at)..at).rev()
+                    .find(|&k| clobbers_scalar(&insns[k], register))
+                    .is_some_and(|k| self.descriptor_reads.contains(&k));
+            let certain = read_back || loads.iter().any(|&load| load < at && load >= run_start(insns, at)
                 && self.dsel_loads[&load].0 + 2 == u16::from(register)
                 && !(load + 1..at).any(|between| clobbers_scalar(&insns[between], register)));
             *self.count_reads.entry(id).or_insert(false) |= certain;

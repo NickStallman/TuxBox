@@ -192,3 +192,53 @@ fn buffer_record_counts_for_the_gpu_check() {
     }
     println!("BEGIN_HLSL\n{text}END_HLSL");
 }
+
+/// v[54:57] = s[8:11]; s[12:15] = the first lane's v[54:57]: a waterfall's copy and read
+/// of the buffer descriptor, which `descriptor_broadcast` proves.
+const ROUND_TRIP: [u32; 8] = [0x7e6c0208, 0x7e6e0209, 0x7e70020a, 0x7e72020b, 0x7e180536, 0x7e1a0537, 0x7e1c0538, 0x7e1e0539];
+const READ_BACK: [u32; 2] = [0xe0300000, 0x80030000]; // buffer_load_dword v0, off, s[12:15], 0
+const LAST_BACK: u32 = 0x8103c10e; // s_add_i32 s3, s14, -1
+const SAME_BACK: u32 = 0x7dc4700e; // v_cmp_eq_u64 vcc, s[14:15], v[56:57]
+
+/// A program indexing the resource heap (class 5 base in s20), so that waterfall copies
+/// are followed, under the table of `tabled`.
+fn heap_indexing(mut ex: ShaderExtract) -> ShaderExtract {
+    let mut program = vec![0u8; 0x110];
+    program[..8].copy_from_slice(b"FSSM\x01\x01\0\0");
+    let offset = (program.len() - 16) as u64;
+    program[0xe8..0xf0].copy_from_slice(&offset.to_le_bytes());
+    program[0xf8..0xfc].copy_from_slice(&1u32.to_le_bytes());
+    program.extend([5u32, 0, 1, 0, 20].into_iter().flat_map(u32::to_le_bytes));
+    let size = (program.len() - 16) as u32;
+    program[8..12].copy_from_slice(&size.to_le_bytes());
+    ex.fssm = program;
+    ex.required_features = Some(1 << 25);
+    ex.root_sig.as_mut().unwrap().flags = 0x400;
+    ex
+}
+
+#[test]
+fn a_table_descriptor_read_back_from_a_waterfall_copy_is_that_descriptor() {
+    // The copy of word 2 moves the descriptor; the read gives it back whole.
+    let ex = heap_indexing(buffered(&[&BUFFER, &ROUND_TRIP, &READ_BACK]));
+    let hlsl = translate(&ex).unwrap().hlsl;
+    assert!(hlsl.contains("raw_sbuf1") && !hlsl.contains("GetDimensions"), "{hlsl}");
+}
+
+#[test]
+fn a_count_read_back_from_a_waterfall_copy_is_still_a_count() {
+    // The word read back is used as a number: the load fills it, and the copies carry it.
+    let ex = heap_indexing(buffered(&[&BUFFER, &ROUND_TRIP, &[LAST_BACK]]));
+    let hlsl = translate(&ex).unwrap().hlsl;
+    assert!(hlsl.contains("raw_sbuf1.GetDimensions(n0);") && hlsl.contains("s10 = n0;"), "{hlsl}");
+    // With no host buffer to ask, that use is refused as before.
+    let ex = heap_indexing(tabled(&[&BUFFER, &ROUND_TRIP, &[LAST_BACK]]));
+    let refusal = translate(&ex).err().expect("refused");
+    assert!(refusal.contains("buffer record count read from a descriptor with no one host buffer"), "{refusal}");
+    // The loop's test for lanes holding the same descriptor compares the words back,
+    // and isn't sure to be a count: a sampler's word 2 is no count at all.
+    let ex = heap_indexing(tabled(&[&BUFFER, &ROUND_TRIP, &[SAME_BACK, LAST]]));
+    assert!(translate(&ex).is_err(), "the loaded word itself is still a count");
+    let ex = heap_indexing(tabled(&[&BUFFER, &ROUND_TRIP, &[SAME_BACK]]));
+    assert!(translate(&ex).is_ok());
+}
