@@ -32,6 +32,13 @@ void expect_performance_panel(Screen& screen, const Game& game) {
     auto screen_dc = find<decltype(&GetDC)>(L"user32.dll", "GetDC");
     auto release_dc = find<decltype(&ReleaseDC)>(L"user32.dll", "ReleaseDC");
     auto pixel = find<decltype(&GetPixel)>(L"gdi32.dll", "GetPixel");
+    // GetPixel reads physical pixels; Lanes, like a title, is not DPI aware and sees
+    // its window in logical pixels once Windows scales the display. Hosts without
+    // display scaling may lack the conversion.
+    using Convert = BOOL(WINAPI*)(HWND, POINT*);
+    HMODULE user32 = LoadLibraryW(L"user32.dll");
+    auto physical = user32 ? reinterpret_cast<Convert>(
+        GetProcAddress(user32, "LogicalToPhysicalPointForPerMonitorDPI")) : nullptr;
 
     struct Search {
         decltype(owner_of) owner;
@@ -64,9 +71,12 @@ void expect_performance_panel(Screen& screen, const Game& game) {
         // Two points of the panel's background, left of its text: 5 pixels into a
         // panel 16 pixels from the top left of the frame.
         constexpr int frame_x = 21, frame_y[2] = {40, 200};
-        for (int i = 0; i < 2; ++i)
-            found[i] = pixel(display, origin.x + client.right * frame_x / Screen::width,
-                             origin.y + client.bottom * frame_y[i] / Screen::height);
+        for (int i = 0; i < 2; ++i) {
+            POINT at{origin.x + client.right * frame_x / Screen::width,
+                     origin.y + client.bottom * frame_y[i] / Screen::height};
+            if (physical) physical(search.window, &at);
+            found[i] = pixel(display, at.x, at.y);
+        }
         release_dc(nullptr, display);
         if (close_to(found[0], 0x0e, 0x0e, 0x14) && close_to(found[1], 0x0e, 0x0e, 0x14)) return;
         Sleep(16);

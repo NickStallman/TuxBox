@@ -7,6 +7,10 @@ impl<'a> Emitter<'a> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
         let d = ins.dst.first().cloned();
+        // GDS (bit 17) addresses the global data share, not group shared memory.
+        if ins.enc == Enc::Ds && ins.raw[0] & (1 << 17) != 0 {
+            return Err("GDS is unsupported".into());
+        }
         match ins.enc {
             Enc::Ds
                 if !self.is_gs
@@ -66,7 +70,6 @@ impl<'a> Emitter<'a> {
                 self.emit_gs_lds(ins)
             }
             Enc::Ds if self.is_cs && matches!(m, "ds_read_b64" | "ds_read2_b64" | "ds_read2st64_b64" | "ds_write_b128" | "ds_write_b64" | "ds_write2_b64") => {
-                if ins.raw[0] & (1 << 17) != 0 { return Err("GDS is unsupported".into()); }
                 self.uses_lds = true;
                 let t = self.tmp;
                 self.tmp += 1;

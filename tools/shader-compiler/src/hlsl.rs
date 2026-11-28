@@ -38,6 +38,15 @@ mod scalar_values;
 mod code_offset;
 mod scalar_bits;
 #[cfg(test)]
+#[path = "tests/hlsl/instruction_inventory.rs"]
+mod instruction_inventory;
+#[cfg(test)]
+#[path = "tests/hlsl/buffer_loads.rs"]
+mod buffer_loads;
+#[cfg(test)]
+#[path = "tests/hlsl/image_ops.rs"]
+mod image_ops;
+#[cfg(test)]
 #[path = "tests/hlsl/raw_width.rs"]
 mod raw_width;
 #[cfg(test)]
@@ -55,6 +64,9 @@ mod cpu_oracle;
 #[cfg(test)]
 #[path = "tests/hlsl/heap_resinfo.rs"]
 mod heap_resinfo;
+#[cfg(test)]
+#[path = "tests/hlsl/descriptor_waterfall.rs"]
+mod descriptor_waterfall;
 #[cfg(test)]
 #[path = "tests/hlsl/compute_swizzle.rs"]
 mod compute_swizzle;
@@ -102,6 +114,7 @@ use params::Param;
 mod light_grid;
 mod lone_lane;
 mod page_waves;
+mod group_loops;
 mod wave_cull;
 mod ray_resolve;
 mod fspx_wave;
@@ -122,11 +135,15 @@ mod screen_gather;
 mod reflection_far;
 mod sampler_heap;
 mod lane_reads;
+mod descriptor_broadcast;
 mod heap_offsets;
 mod heap_origins;
+mod operand_fields;
+mod descriptor_size;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
+mod coverage;
 use packed_root::{PackedRoot, RootAbi};
 
 pub struct Translated {
@@ -197,6 +214,8 @@ enum Sym {
     /// A PC-relative pointer into the shader's own code section (`s_getpc_b64` + offsets),
     /// used to read constant tables embedded after the program.
     Code,
+    /// See `descriptor_size`. Kept under `descriptor_size::KEY` + the register.
+    Size(descriptor_size::SizePart),
 }
 
 /// An image op whose texture and/or sampler register holds one of several descriptors.
@@ -326,7 +345,7 @@ struct Emitter<'a> {
     reduction_execz_guards: BTreeSet<usize>,
     /// Set when every branch is a decision of the whole wave (see `lockstep`),
     /// with the condition codes to vote after the instructions that set them.
-    lockstep: Option<BTreeMap<usize, lockstep::Vote>>,
+    lockstep: Option<lockstep::Proof>,
     /// Structured loop latches with a verified guest trip bound.
     wave_bounded_latches: BTreeSet<usize>,
     portable_wave64: bool,
@@ -337,6 +356,11 @@ struct Emitter<'a> {
     /// Descriptor loads `(base register, descriptor id)` and base-dword moves `(dst, src)`
     /// per instruction, for maintaining the run-time `tb_dsel<reg>` selectors.
     dsel_loads: HashMap<usize, (u16, u32)>,
+    /// Descriptors whose size fields the program reads (`descriptor_size`).
+    size_reads: BTreeSet<u32>,
+    /// Buffer descriptors whose record count the program reads, and whether some
+    /// read is certain (`descriptor_size`).
+    count_reads: BTreeMap<u32, bool>,
     dsel_runtime: HashMap<usize, (u16, u8, u8, u32)>,
     dsel_moves: HashMap<usize, (u16, u16)>,
     /// Registers read before written (entry ABI), from `live_in`.
@@ -374,11 +398,23 @@ struct Emitter<'a> {
     /// Back-edge indices of loops whose single-wave group runs an exchange the
     /// same number of times: only these vote in the emitted while loop.
     accepted_swizzle_loops: BTreeSet<usize>,
+    /// `v_mov_b32 v, s` copies and the `v_readfirstlane_b32` reads proven to return
+    /// them (see `descriptor_broadcast`).
+    descriptor_copies: BTreeSet<usize>,
+    descriptor_reads: BTreeSet<usize>,
+    /// First-lane reads whose result indexes a descriptor heap. With no active lane
+    /// the console reads lane 0 and then touches nothing; here the result still
+    /// indexes the heap, so it must not be whatever lane 0 holds.
+    heap_index_reads: BTreeSet<usize>,
     /// Nesting stack of whether each open loop is an accepted swizzle loop.
     in_accepted_swizzle_loop_stack: Vec<bool>,
     fspx_wave: Option<u32>,
     hair_multisample: bool,
     hoist_wave_exchanges: bool,
+    /// Rendezvous whose vote `emit_program` took outside the guest branch guard.
+    hoisted_votes: BTreeSet<usize>,
+    /// The program calls `tb_group_any` (see `group_loops`).
+    group_votes: bool,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,

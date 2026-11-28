@@ -33,7 +33,9 @@ exports `DISPLAY=:99`. Nothing is visible. Two things need it:
   neither has Xwayland behind a software Weston, hence `--renderer=gl`.
 
 The script is idempotent and fails loudly when the display comes up without
-DRI3, so broken passthrough is reported instead of silently degrading.
+DRI3, so broken passthrough is reported instead of silently degrading. It
+refuses to run outside a container, and when it retries it stops only the
+Xwayland it started.
 
 ## Starting it
 

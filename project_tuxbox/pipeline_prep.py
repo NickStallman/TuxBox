@@ -123,6 +123,9 @@ def prepare_pipelines(executable, host, plan, cache, progress=None, *, standalon
         except (OSError, ValueError, UnicodeError):
             saved = {}
         env = host.env.copy()
+        # vulkaninfo and the helper below open the driver cache the title uses.
+        from .host import keep_nvidia_shader_cache
+        keep_nvidia_shader_cache(env)
         if standalone or env.get("TUXBOX_REFERENCE_CBV") == "1":
             from .console_cbv import configure_console_cbv
             configure_console_cbv(host.backend, env, executable, lambda message: print(message, file=sys.stderr))

@@ -28,11 +28,14 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 
 | Variable | Value | Purpose |
 | --- | --- | --- |
-| `VKD3D_SHADER_CACHE_PATH` | `<prefix>/shadercache` | vkd3d-proton's pipeline cache; `0` disables it |
+| `VKD3D_SHADER_CACHE_PATH` | `<prefix>/shadercache` | vkd3d-proton's pipeline cache; `0` disables it. The launcher merges the last launch's `.write` archive into it, which GE-Proton11-14 otherwise discards |
+| `MALLOC_ARENA_MAX`, `MALLOC_MMAP_THRESHOLD_`, `MALLOC_TRIM_THRESHOLD_` | `8`, `1048576`, `8388608` | glibc limits for Proton and Wine launches, so freed compile memory is shared and returned instead of piling up in per-thread arenas |
 | `__GL_SHADER_DISK_CACHE` | `1` | NVIDIA driver cache; `0` leaves it off |
 | `__GL_SHADER_DISK_CACHE_PATH` | `<prefix>/shadercache` | Gives each prefix its own NVIDIA cache |
 | `__GL_SHADER_DISK_CACHE_SKIP_CLEANUP` | `1` | Asks the NVIDIA driver not to trim the cache |
 | `__GL_SHADER_DISK_CACHE_SIZE` | 4 GiB | Size limit; larger cache files stopped being indexed |
+| `__GL_SHADER_DISK_CACHE_APP_NAME` | `tuxbox<n>` | Cache file this launch writes. A new number starts at 1 GiB, because the driver cannot index past 4 GiB |
+| `__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME` | every other file | Cache files the driver also reads. Setting either name yourself leaves both alone |
 | `TUXBOX_LOG` | `1` (`stderr` on Windows) | Sends provider messages to the game log |
 | `WINEDEBUG`, `VKD3D_DEBUG`, `DXVK_LOG_LEVEL` | warnings and errors | Backend messages in the game log |
 | `UMU_RUNTIME_UPDATE` | `0` for offline launches (always set) | Stops umu-run from needing the network |
@@ -48,11 +51,12 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `TUXBOX_SHADER_PREP_UI` | on for ProjectScarlett | `1` shows a desktop progress window |
 | `TUXBOX_SCARLETT_SEED_PACK` | off | `1` prepares every shader in `shaders.rpf` |
 | `TUXBOX_LARGE_COMPILES` | `4` | Large compute pipelines compiling at once; `0` removes the limit |
-| `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds before a large compile gets an empty stand-in; `0` waits |
+| `TUXBOX_TRACE_PIPELINE_REQUESTS` | `0` | With diagnostic logging enabled, also log start and completion of short slot-62 compute pipeline attempts, including the selected shader cache request key and byte size |
+| `TUXBOX_PIPELINE_DEADLINE` | `20` | Seconds, whole or fractional, before a large compile gets an empty stand-in, which the finished compile later replaces; `0` waits |
 | `TUXBOX_NULL_PIPELINES` | on | `0` fails unsupported pipelines instead of giving empty stand-ins |
 | `TUXBOX_PROGRESS_OVERLAY` | `auto` | `always` or `0` for the progress panel |
 | `TUXBOX_PROGRESS_OVERLAY_POS` | `tr` | `tl`, `tr`, `bl` or `br` |
-| `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display |
+| `TUXBOX_CHECK_DISPLAY` | private | The window checks sample a private Xwayland on Wayland desktops; `desktop` uses the current display. The splash check is skipped, and reported as skipped, for a GPU that presents to the private server through software |
 | `TUXBOX_CHECK_JOBS` | half the CPU threads, at most 8 | GPU checks run at once: the translator, the D3D12 controls and most Lanes and fixture gates |
 | `TUXBOX_OVERLAY` | off | `1` shows the [performance panel](USAGE.md#performance-overlay) (`run --overlay`) |
 | `TUXBOX_OVERLAY_POS` | `tl` | `tl`, `tr`, `bl` or `br` |
@@ -67,7 +71,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | Variable | Effect |
 | --- | --- |
 | `TUXBOX_HOST_PROFILE` | Replace what the [graphics driver reports](USAGE.md#host-profile) |
-| `TUXBOX_PERSISTENT_DXC` | Path of a persistent DXC helper to use during play |
+| `TUXBOX_PERSISTENT_DXC` | On Linux the launcher builds a [DXC helper](PROJECTSCARLETT.md#dxc-helper) that compiles shaders faster; `0` turns it off, a path uses that helper |
 | `TUXBOX_REFERENCE_CBV` | `1` applies the constant-buffer layer to a provider TuxBox didn't build |
 | `TUXBOX_RASTER_ROOT_FALLBACK` | Try an unsupported raster root signature unchanged |
 | `TUXBOX_DESCRIPTOR_HEAP_LIMIT` | Cap shader-visible descriptor heaps to force paging |
@@ -93,6 +97,7 @@ All are off by default. Capture variables write the game's data to disk, so don'
 | `TUXBOX_TRACE_ALLOCATION_BYTES` | Allocations of the listed sizes |
 | `TUXBOX_WATCH_ADDRESS` | Allocations and resources near `<hex>[,<hex radius>]` |
 | `TUXBOX_XG_TRACE` | XG address calculations |
+| `TUXBOX_XCRD_LOG` | DirectStorage requests counted by option word (zlib, BCPack mode, swizzle, page and memory flags) with their sizes, every five seconds and when a queue closes. Requests with options the provider can't handle are logged once per option word without it |
 | `TUXBOX_WAVE_DEBUG` | Why the translator didn't mask a wave reduction |
 | `TUXBOX_CAPTURE_SHADER_INPUTS`, `TUXBOX_CAPTURE_RASTER_ROOTS`, `TUXBOX_CAPTURE_RAY_ROOTS` | Folder for shader inputs and root data |
 | `TUXBOX_CAPTURE_BLAS` | Folder for acceleration structure inputs |
@@ -100,4 +105,14 @@ All are off by default. Capture variables write the game's data to disk, so don'
 
 ## Build and test tools
 
-`TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+`TUXBOX_XSHADER` selects the shader compiler for launcher preparation and `DXC` selects the DirectX Shader Compiler. `TUXBOX_XSHADER_COVERAGE` names a file to which the compiler appends the instructions of every program it emits; the [shader harness](SHADER_HARNESS.md) sets it for its GPU checks. `TUXBOX_BLESS_PROFILES`, `TUXBOX_ORACLE_*`, `TUXBOX_TEST_*` and the probe and replay variables in `tools/` belong to individual checks. `TUXBOX_PROVIDER`, `TUXBOX_SHADER_SESSION` and `TUXBOX_WINE_*` are internal; don't set them.
+
+
+Cold shader requests that translate to identical HLSL and the same target
+profile share a single DXC compilation across launcher processes using the
+same toolchain cache. Exact source cache hits still bypass compilation and
+locking. Different HLSL or target profiles compile independently. A failed
+compile does not publish an unsupported marker for another source; the next
+request can retry. Content locks are retained as empty files to avoid races
+with other processes. The wait is bounded by the maximum compiler fallback
+budget plus validation and scheduling margin.

@@ -1,4 +1,4 @@
-use super::{isa_table_image_writes, isa_writes_no_image, may_write_images, table_image_writes};
+use super::{isa_table_image_writes, isa_writes_no_image, may_write_images, stage_table_image_writes, stage_writes_no_image, table_image_writes};
 use crate::rdna2;
 
 fn isa(words: &[u32]) -> Vec<u8> {
@@ -134,4 +134,31 @@ fn setting_a_hardware_register_leaves_the_descriptor_alone() {
     let code = program(&[&TABLE_ADDRESS, &fetch(0x60), &setreg, &STORE, &[ENDPGM]]);
     assert_eq!(mnemonics_of(&code)[3], "s_setreg_imm32_b32");
     assert_eq!(isa_table_image_writes(&code, &TABLES), Some(vec![(1, 3)]));
+}
+
+/// s_swappc_b64 s[12:13], s[12:13]: a vertex program's call into its fetch program.
+const FETCH_CALL: u32 = 0xbe8c_210c;
+
+#[test]
+fn a_vertex_fetch_call_writes_nothing_because_the_translation_drops_it() {
+    assert_eq!(mnemonics(&[FETCH_CALL, ENDPGM]), ["s_swappc_b64", "s_endpgm"]);
+    let code = isa(&[FETCH_CALL, ENDPGM]);
+    assert!(stage_writes_no_image(&code, true).is_some());
+    assert_eq!(stage_table_image_writes(&code, &TABLES, true), Some(Vec::new()));
+    // Stores of the vertex program itself are still traced.
+    let code = program(&[&[FETCH_CALL], &TABLE_ADDRESS, &fetch(0x60), &STORE, &[ENDPGM]]);
+    assert_eq!(stage_table_image_writes(&code, &TABLES, true), Some(vec![(1, 3)]));
+}
+
+#[test]
+fn a_call_outside_a_vertex_program_still_counts_as_a_write() {
+    let code = isa(&[FETCH_CALL, ENDPGM]);
+    assert!(isa_writes_no_image(&code).is_none());
+    assert!(stage_writes_no_image(&code, false).is_none());
+    assert_eq!(isa_table_image_writes(&code, &TABLES), None);
+    assert_eq!(stage_table_image_writes(&code, &TABLES, false), None);
+    // Other calls stay unknown in a vertex program too.
+    let set_pc = 0xbe80_200c; // s_setpc_b64 s[12:13]
+    assert_eq!(mnemonics(&[set_pc])[0], "s_setpc_b64");
+    assert!(stage_writes_no_image(&isa(&[set_pc, ENDPGM]), true).is_none());
 }

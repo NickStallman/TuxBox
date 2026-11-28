@@ -4,14 +4,16 @@
 //! name: the same card behaves differently under another driver or system.
 //! `TUXBOX_HOST_PROFILE` replaces what the driver reports, so one machine can
 //! exercise a path meant for another, for example `wave=32` or
-//! `wave=32-64;section-import=substituted`.
+//! `wave=32-64;section-import=substituted;mesh=none`.
 mod section_probe;
 
 use super::Device;
 use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D12::{
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_FEATURE,
+    D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_D3D12_OPTIONS7,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS5,
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7, D3D12_MESH_SHADER_TIER_1, D3D12_RAYTRACING_TIER_1_0,
 };
 
 const VARIABLE: &str = "TUXBOX_HOST_PROFILE";
@@ -41,11 +43,15 @@ impl SectionImport {
     }
 }
 
-/// Capabilities given in `TUXBOX_HOST_PROFILE`.
+/// Capabilities given in `TUXBOX_HOST_PROFILE`. Mesh shaders and ray tracing
+/// can only be taken away: claiming one the driver lacks would hand it work it
+/// cannot run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Overrides {
     pub(crate) wave: Option<(u32, u32)>,
     pub(crate) section_import: Option<SectionImport>,
+    pub(crate) mesh: Option<bool>,
+    pub(crate) rays: Option<bool>,
 }
 
 fn lane_count(text: &str) -> Option<u32> {
@@ -72,6 +78,8 @@ pub(crate) fn parse_overrides(text: &str) -> Result<Overrides, String> {
             ("section-import", "aliased") => overrides.section_import = Some(SectionImport::Aliased),
             ("section-import", "substituted") => overrides.section_import = Some(SectionImport::Substituted),
             ("section-import", "refused") => overrides.section_import = Some(SectionImport::Refused),
+            ("mesh", "none") => overrides.mesh = Some(false),
+            ("rays", "none") => overrides.rays = Some(false),
             _ => return Err(bad()),
         }
     }
@@ -94,6 +102,8 @@ fn overrides() -> Overrides {
 pub(crate) struct Probes {
     wave: OnceLock<Option<(u32, u32)>>,
     section: OnceLock<SectionImport>,
+    mesh: OnceLock<bool>,
+    rays: OnceLock<bool>,
     reported: OnceLock<()>,
 }
 
@@ -116,6 +126,38 @@ fn host_wave_range(device: &Device) -> Option<(u32, u32)> {
         && options.WaveLaneCountMin != 0
         && options.WaveLaneCountMax >= options.WaveLaneCountMin)
         .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// The host's answer to a feature query, or `None` when it has no answer.
+fn host_feature<T: Default>(device: &Device, feature: D3D12_FEATURE) -> Option<T> {
+    let mut record = T::default();
+    // SAFETY: the record is the desktop structure for this feature, at its exact size.
+    let ok = unsafe {
+        device.native.CheckFeatureSupport(feature, (&raw mut record).cast(), size_of::<T>() as u32)
+    }
+    .is_ok();
+    ok.then_some(record)
+}
+
+/// Whether the host runs mesh shaders, and with them mesh dispatch records.
+/// Older desktop runtimes that do not know the query have none.
+pub(super) fn mesh_shaders(device: &Device) -> bool {
+    *device.state.host.mesh.get_or_init(|| {
+        overrides().mesh.unwrap_or_else(|| {
+            host_feature::<D3D12_FEATURE_DATA_D3D12_OPTIONS7>(device, D3D12_FEATURE_D3D12_OPTIONS7)
+                .is_some_and(|host| host.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0)
+        })
+    })
+}
+
+/// Whether the host traces rays, and with that runs ray dispatch records.
+pub(super) fn ray_tracing(device: &Device) -> bool {
+    *device.state.host.rays.get_or_init(|| {
+        overrides().rays.unwrap_or_else(|| {
+            host_feature::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>(device, D3D12_FEATURE_D3D12_OPTIONS5)
+                .is_some_and(|host| host.RaytracingTier.0 >= D3D12_RAYTRACING_TIER_1_0.0)
+        })
+    })
 }
 
 /// The PCI vendor and device identifiers of `adapter`, by which the operating
@@ -146,18 +188,24 @@ pub(crate) fn describe(
     wave: Option<(u32, u32)>,
     section: SectionImport,
     descriptors: (u32, u32),
+    shaders: (bool, bool),
     overrides: Overrides,
 ) -> String {
     let adapter = adapter.map_or("unknown".into(), |(vendor, device)| format!("{vendor:04x}:{device:04x}"));
     let mark = |set: bool| if set { " (set)" } else { "" };
     let wave_text = wave.map_or("none".into(), |(low, high)| format!("{low}-{high}"));
+    let has = |present: bool| if present { "yes" } else { "none" };
     format!(
-        "host profile: adapter={adapter} wave={wave_text}{} section-import={}{} descriptor-bytes={}/{}",
+        "host profile: adapter={adapter} wave={wave_text}{} section-import={}{} descriptor-bytes={}/{} mesh={}{} rays={}{}",
         mark(overrides.wave.is_some()),
         section.name(),
         mark(overrides.section_import.is_some()),
         descriptors.0,
         descriptors.1,
+        has(shaders.0),
+        mark(overrides.mesh.is_some()),
+        has(shaders.1),
+        mark(overrides.rays.is_some()),
     )
 }
 
@@ -177,7 +225,8 @@ pub(super) fn report(device: &Device) {
                 device.native.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER),
             )
         };
-        crate::diagnostics::log(&describe(adapter, wave_range(device), section, descriptors, overrides));
+        let shaders = (mesh_shaders(device), ray_tracing(device));
+        crate::diagnostics::log(&describe(adapter, wave_range(device), section, descriptors, shaders, overrides));
     });
 }
 

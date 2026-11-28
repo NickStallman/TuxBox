@@ -76,6 +76,16 @@ pub(super) unsafe extern "system" fn create_signature(
             return error;
         }
     }
+    // A host without mesh shaders or ray tracing cannot run these records.
+    // Some drivers fault while creating such a signature instead of refusing it.
+    let runs = match kind {
+        D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH => super::host_profile::mesh_shaders(this),
+        D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS => super::host_profile::ray_tracing(this),
+        _ => true,
+    };
+    if !runs {
+        return E_NOTIMPL;
+    }
     let argument = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: kind,
         ..Default::default()

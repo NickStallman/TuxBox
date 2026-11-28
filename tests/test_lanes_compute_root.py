@@ -54,6 +54,20 @@ class ComputeRootFixtureTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<6I", table), (1, 16, 7, 2, 3, 3))
         self.assertNotEqual(shader_fixture.root_shader(0x40), shader_fixture.root_shader(0xA0))
 
+    def test_root_srv_program_records_the_root_srv_and_both_user_rows(self):
+        data = shader_fixture.root_srv_shader()
+        found = parts(data)
+        self.assertNotIn(b"RTS0", found)
+        program = fssm(found[b"DXIL"])
+        # A root SRV in parameter 3 (s7) and a raw UAV at slot 2 of table 1.
+        self.assertEqual(rows(program, 0xf0, 0xfc), [[0x100, 0, 5, 1, 0x3_0704], [0x303, 16, 4, 1, 0x1_0504]])
+        self.assertEqual(rows(program, 0xe8, 0xf8), [[1, 0, 2, 5, 0x307], [3, 16, 1, 4, 0x105]])
+        psv = found[b"PSV0"]
+        table = psv[4 + struct.unpack_from("<I", psv, 0)[0]:]
+        self.assertEqual(struct.unpack_from("<10I", table), (2, 16, 4, 7, 5, 5, 7, 2, 4, 4))
+        self.assertIn(",".join(str(byte) for byte in data), shader_fixture.header())
+        self.assertIn("lanes-compute-root-srv", BASE_SUITES)
+
     def test_header_carries_both_programs_and_the_expected_value(self):
         text = shader_fixture.header()
         for name, offset in (("root_shader", 0x40), ("root_refused_shader", 0xA0)):

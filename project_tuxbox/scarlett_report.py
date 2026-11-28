@@ -37,6 +37,8 @@ REFUSALS = (
     ("wave_width", r"(?:conflicting wave widths for ballot and reduction|wave operation requires complete \d+-lane compute waves|resolve Wave32 requires a compatible wave reduction)"),
     ("lane_spill", r"(?:lane op at 0x[0-9a-f]+: non-constant lane operand|is used both as a lane spill area and as a vector|v_readlane at 0x[0-9a-f]+: unexpected destination)"),
     ("heap_atomic", r"atomic through a heap descriptor unsupported"),
+    # Heap-indexed IDXEN access, retried with the stride table appended.
+    ("heap_stride", r"raw buffer IDXEN needs the console descriptor stride"),
     ("packed_root", r"(?:unsupported packed compute root parameter|packed root arguments exceed 64 dwords|root argument offset outside signature|unsupported mutation of a root address|root address or padding used as shader data)"),
 
 )
@@ -51,6 +53,17 @@ def refusal_bucket(error):
         if re.search(pattern, message, re.IGNORECASE):
             return label
     return "other_refusal"
+
+
+# A mesh program without an embedded RTS0 cannot be translated at preparation
+# time — the pipeline creates it against the guest root later (with the root
+# embedded at that point). The emitter's refusal is real, but it is expected
+# here, so the receipt lists it separately from the actionable refusals.
+EXPECTED_AT_PREPARATION = frozenset({"mesh_root_layout"})
+
+
+def expected_at_preparation(bucket):
+    return bucket in EXPECTED_AT_PREPARATION
 
 def failure_bucket(error):
     if isinstance(error, subprocess.TimeoutExpired):

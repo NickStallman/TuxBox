@@ -218,7 +218,13 @@ static int virtual_cpu_profiles(void)
         REQUIRE(base && VirtualQuery(base, &area, sizeof area) == sizeof area && area.Protect == guarded);
         BYTE sample = 0xff; SIZE_T transferred = 0;
         REQUIRE(!ReadProcessMemory(GetCurrentProcess(), base, &sample, 1, &transferred));
-        REQUIRE(VirtualQuery(base, &area, sizeof area) == sizeof area && area.Protect == protections[i]);
+        // Wine's ReadProcessMemory takes the guard like an access. Windows refuses
+        // the read and keeps the guard for the next access: make one, which
+        // IsBadReadPtr catches.
+        REQUIRE(VirtualQuery(base, &area, sizeof area) == sizeof area);
+        if (area.Protect == guarded)
+            REQUIRE(IsBadReadPtr(base, 1) && VirtualQuery(base, &area, sizeof area) == sizeof area);
+        REQUIRE(area.Protect == protections[i]);
         // Execute-only pages are not guaranteed to be readable on every host.
         if (protections[i] != PAGE_EXECUTE) {
             REQUIRE(ReadProcessMemory(GetCurrentProcess(), base, &sample, 1, &transferred));

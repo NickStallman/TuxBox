@@ -28,10 +28,13 @@ impl<'a> Emitter<'a> {
 
     pub(in crate::hlsl) fn float_result(ins: &Insn, mut e: String) -> String {
         if ins.enc == Enc::Vop3 {
+            // OMOD scales the rounded result by a power of two. `tb_omod` adjusts
+            // the exponent, so the scale can't move into a product and lose an
+            // overflow to infinity.
             e = match ins.aux.imm2 {
-                1 => format!("(({e}) * 2.0)"),
-                2 => format!("(({e}) * 4.0)"),
-                3 => format!("(({e}) * 0.5)"),
+                1 => format!("tb_omod({e}, 1)"),
+                2 => format!("tb_omod({e}, 2)"),
+                3 => format!("tb_omod({e}, -1)"),
                 _ => e,
             };
             if ins.aux.imm != 0 {

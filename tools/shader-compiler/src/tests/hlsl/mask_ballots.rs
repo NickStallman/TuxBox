@@ -35,7 +35,7 @@ fn branch(op: u32, over: i64) -> Insn {
 
 /// Index of the definitions a program's counts take their ballots from.
 fn ballots(ops: Vec<Insn>) -> Option<Vec<(usize, u8)>> {
-    let found = find(&program(ops))?;
+    let found = find(&program(ops)).filter(|found| !found.uses.is_empty())?;
     Some(found.defs.iter().flat_map(|(&at, regs)| regs.iter().map(move |&r| (at, r))).collect())
 }
 
@@ -91,7 +91,7 @@ fn wide(mut ops: Vec<Insn>) -> Option<Vec<(usize, u8)>> {
     ops.insert(0, scalar("s_mov_b64", 98, vec![Opnd::ExecLo]));
     ops.push(Insn { op: 1, ..insn("s_endpgm", Enc::Sopp, vec![], vec![]) });
     for (i, op) in ops.iter_mut().enumerate() { op.offset = i * 4; }
-    let found = find(&ops)?;
+    let found = find(&ops).filter(|found| !found.uses.is_empty())?;
     Some(found.defs.iter().flat_map(|(&at, regs)| regs.iter().map(move |&r| (at, r))).collect())
 }
 
@@ -176,9 +176,9 @@ fn a_pair_is_not_a_mask_of_32_lanes() {
 fn lanes_that_parted_are_not_counted() {
     let gather = || scalar("s_or_b32", 11, vec![Opnd::Sgpr(11), Opnd::VccLo]);
     let empty = || scalar("s_mov_b32", 11, vec![Opnd::ConstInt(0)]);
-    // Jumped over by the lanes a branch on a mask takes with it.
+    // A branch on EXEC or VCC takes the whole wave, so no lanes part.
     for op in [6, 7, 8, 9] {
-        assert_eq!(ballots(vec![empty(), compare(), branch(op, 1), gather(), count(Opnd::Sgpr(11))]), None, "{op}");
+        assert_eq!(ballots(vec![empty(), compare(), branch(op, 1), gather(), count(Opnd::Sgpr(11))]), Some(vec![(1, 11), (4, 11)]), "{op}");
     }
     // The condition code of a mask operation, and of a comparison with a mask.
     let code = |op: Insn| ballots(vec![empty(), compare(), op, branch(5, 1), gather(), count(Opnd::Sgpr(11))]);
@@ -186,17 +186,16 @@ fn lanes_that_parted_are_not_counted() {
     let compared = |o| insn("s_cmp_eq_u32", Enc::Sopc, vec![Opnd::Scc], vec![o, Opnd::ConstInt(0)]);
     assert_eq!(code(compared(Opnd::VccLo)), None);
     assert!(code(compared(Opnd::Sgpr(0))).is_some());
-    // Lanes that are running arrive together.
     let saved = vec![compare(), branch(8, 1), scalar("s_mov_b32", 11, vec![Opnd::ExecLo]), branch(8, 0), count(Opnd::Sgpr(11))];
     assert_eq!(ballots(saved), None, "entry value");
     let inside = |op| ballots(vec![compare(), branch(op, 2), scalar("s_mov_b32", 11, vec![Opnd::ExecLo]), count(Opnd::Sgpr(11))]);
     assert_eq!(inside(8), Some(vec![(3, 11)]));
-    assert_eq!(inside(6), None);
-    // Some left the program.
-    let left = |op| vec![compare(), branch(op, 1), Insn { op: 1, ..insn("s_endpgm", Enc::Sopp, vec![], vec![]) },
+    assert_eq!(inside(6), Some(vec![(3, 11)]));
+    // Some left the program after a branch on a mask's condition code.
+    let left = vec![compare(), scalar("s_and_b32", 30, vec![Opnd::VccLo, Opnd::ExecLo]), branch(5, 1),
+        Insn { op: 1, ..insn("s_endpgm", Enc::Sopp, vec![], vec![]) },
         scalar("s_mov_b32", 11, vec![Opnd::ConstInt(0)]), gather(), count(Opnd::Sgpr(11))];
-    assert_eq!(ballots(left(7)), None);
-    assert_eq!(ballots(left(9)), None);
+    assert_eq!(ballots(left), None);
 }
 
 #[test]
@@ -232,5 +231,28 @@ fn counts_read_the_ballot() {
         assert_eq!(shader.hlsl.contains("tb_bal107 = 0u"), width == 64);
         assert_eq!(shader.required_wave_size, Some(width));
         assert_eq!(shader.profile, "cs_6_5");
+    }
+}
+
+#[test]
+fn branches_on_exec_and_vcc_are_decided_by_the_whole_wave() {
+    // s_mov_b32 s12, exec_lo; v_cmp_lt_u32 vcc, 1000, v0; s_and_saveexec_b32 s20, vcc_lo;
+    // s_cbranch_execz (or vccz) over s_mov_b32 s22, 2; s_mov_b32 exec_lo, s20; v_mov_b32 v10, s22
+    let words = |branch: u32| [0xbe8c_037e, 0x7d82_00ff, 1000, 0xbe94_3c6a, branch, 0xbe96_0382, 0xbefe_0314, 0x7e14_0216, 0xbf81_0000u32];
+    for (branch, whole, lane) in [
+        (0xbf88_0001, "!WaveActiveAnyTrue((exec_lo & 1u) != 0u)", "(exec_lo & 1u) == 0u"),
+        (0xbf86_0001, "!WaveActiveAnyTrue((vcc_lo & 1u) != 0u)", "(vcc_lo & 1u) == 0u"),
+    ] {
+        // A partial wave keeps each lane's own decision, which is then the same.
+        for (threads, wave) in [([64, 1, 1], true), ([16, 1, 1], false)] {
+            let (mut ex, _, _): (ShaderExtract, _, _) = fixture::shader(32);
+            ex.isa = words(branch).iter().flat_map(|w| w.to_le_bytes()).collect();
+            ex.isa_data = ex.isa.clone();
+            ex.psv_threads = Some(threads);
+            let shader = translate(&ex).unwrap();
+            assert_eq!(shader.hlsl.contains(whole), wave, "{}", shader.hlsl);
+            assert_eq!(shader.hlsl.contains(lane), !wave, "{}", shader.hlsl);
+            assert_eq!(shader.required_wave_size, wave.then_some(32));
+        }
     }
 }

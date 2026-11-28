@@ -35,11 +35,12 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     };
     // Draw and dispatch replay these bindings. Clear them with the host state,
     // or the next draw puts the old tables back.
+    let pipeline = pipeline.map(crate::device::late_pipeline::current);
     state.bindings = super::compute_bindings::Bindings::new(pipeline);
     state.predication = None;
     state.graphics_state.clear();
     state.bundle_executed = false;
-    state.stencil_slot = pipeline.and_then(|pipeline| pipeline.state.stencil_slot);
+    state.stencil_slot = pipeline.and_then(|(_, data)| data.stencil_slot);
     if let Some(targets) = &mut state.stencil_targets {
         targets.unbind();
     }
@@ -54,8 +55,8 @@ pub(super) unsafe extern "system" fn clear_state(list: &List, pipeline: *mut c_v
     // Desktop ClearState takes no pipeline. The guest argument is bound after
     // the reset so a following draw sees that pipeline.
     unsafe { state.native().ClearState(None::<&ID3D12PipelineState>) };
-    if let Some(pipeline) = pipeline {
-        unsafe { state.native().SetPipelineState(&pipeline.native) };
+    if let Some((native, _)) = pipeline {
+        unsafe { state.native().SetPipelineState(native) };
     }
 }
 

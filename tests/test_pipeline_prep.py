@@ -65,3 +65,28 @@ class PipelineCache(unittest.TestCase):
                 driver.rename(root / "old-driver-cache")
                 prep.prepare_pipelines(exe, host, plan, cache)
                 self.assertEqual(run.call_count, 3)
+
+    @unittest.skipUnless(sys.platform == "linux", "Proton preparation uses Linux file locks")
+    def test_gpu_processes_leave_an_exported_driver_cache_in_place(self):
+        # Given the path without SKIP_CLEANUP, the driver in vulkaninfo or the
+        # helper deletes the title's cache once the folder passes its default cap.
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            cache = root / "by_hlsl"
+            cache.mkdir()
+            exe = root / "title.exe"
+            host = SimpleNamespace(env={"__GL_SHADER_DISK_CACHE_PATH": temp}, version="fixture", command=["wine"])
+            records = []
+            for archive, index in sorted(prep.COMPUTE_PIPELINES):
+                records.append(dict(archive=archive, entry=index, cache_key=str(index)))
+                (cache / f"{index}.cso").write_bytes(str(index).encode())
+            plan = dict(shaders=records, executable_sha256="title", provider_sha256="provider")
+            with patch.object(prep, "helper_binary", return_value=exe), \
+                 patch.object(prep, "device_key", return_value=["test-gpu"]) as probe, \
+                 patch.object(prep.subprocess, "run", return_value=SimpleNamespace(returncode=1)) as run:
+                with self.assertRaises(ValueError):
+                    prep.prepare_pipelines(exe, host, plan, cache)
+            for env in (probe.call_args.args[0], run.call_args.kwargs["env"]):
+                self.assertEqual(env["__GL_SHADER_DISK_CACHE_PATH"], temp)
+                self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1")
+            self.assertNotIn("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", host.env)

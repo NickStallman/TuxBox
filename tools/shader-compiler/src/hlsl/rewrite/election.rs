@@ -116,6 +116,12 @@ pub(in crate::hlsl) fn reads_sgpr(ins: &Insn, n: u8) -> bool {
     })
 }
 
+/// Whether the scalar load `ins` writes SGPR `n`: it fills one register per loaded word.
+pub(in crate::hlsl) fn smem_writes_sgpr(ins: &Insn, n: u8) -> bool {
+    let words = ins.mnemonic.split_once("dwordx").and_then(|(_, count)| count.parse::<u16>().ok()).unwrap_or(1);
+    ins.dst.iter().any(|o| matches!(*o, Opnd::Sgpr(k) if u16::from(k) <= u16::from(n) && u16::from(n) < u16::from(k) + words))
+}
+
 pub(in crate::hlsl) fn branch_pc(ins: &Insn) -> i64 {
     ins.offset as i64 + 4 + ins.aux.imm * 4
 }
@@ -147,7 +153,7 @@ pub(in crate::hlsl) fn verify_lane_election(insns: &mut [Insn], ff1: usize, stra
     let targets = branch_targets(insns);
     // Two-source VOP3 forms decode an unused third source; ignore it.
     let sources = |ins: &Insn| {
-        let two = ins.mnemonic.starts_with("v_cmp_") || ins.mnemonic.starts_with("v_mbcnt_");
+        let two = ins.mnemonic.starts_with("v_cmp_") || ins.mnemonic.starts_with("v_mbcnt_") || ins.mnemonic == "v_writelane_b32";
         ins.src.iter().take(if two { 2 } else { usize::MAX }).cloned().collect::<Vec<_>>()
     };
     let cmp = (ff1 + 1..insns.len())
@@ -155,6 +161,11 @@ pub(in crate::hlsl) fn verify_lane_election(insns: &mut [Insn], ff1: usize, stra
             let ins = &insns[j];
             if straight_compute && ins.mnemonic == "s_mov_b32" {
                 return ins.src.iter().chain(&ins.dst).any(|o| *o == Opnd::Sgpr(lane));
+            }
+            // A scalar load names exact register ranges: a two- or four-word base,
+            // an optional offset register and as many destination words as it loads.
+            if ins.enc == Enc::Smem {
+                return reads_sgpr(ins, lane) || smem_writes_sgpr(ins, lane);
             }
             sources(ins).iter().chain(&ins.dst).any(|o| may_touch_sgpr(o, lane))
         })

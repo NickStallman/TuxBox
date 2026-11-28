@@ -89,3 +89,66 @@ fn waterfall_scalar_leftovers_must_be_dead() {
     let mut ops = waterfall_words(&[0xbe90_0380, 0x8001_8110]);
     assert_eq!(lower_waterfall_gathers(&mut ops), 1);
 }
+
+/// A raster first-lane read: `s0` names the first active lane, `v43` is read
+/// there, and the result is consumed before a branch. `after` follows the
+/// branch, with `s_endpgm` last.
+fn first_lane_words(after: &[u32]) -> Vec<Insn> {
+    let mut words = vec![
+        0xbe80_047e,              // s_mov_b64 s0, exec
+        0xbe80_1400,              // s_ff1_i32_b64 s0, s0
+        0xd760_0012, 0x0000_012b, // v_readlane_b32 s18, v43, s0
+        0x8012_8112,              // s_add_u32 s18, s18, 1
+        0xbf85_0002,              // s_cbranch_scc1 over two nops
+        0xbf80_0000,              // s_nop
+        0xbf80_0000,              // s_nop
+    ];
+    words.extend_from_slice(after);
+    words.push(0xbf81_0000); // s_endpgm
+    disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>())
+}
+
+#[test]
+fn first_lane_read_survives_a_branch_once_its_result_is_consumed() {
+    let mut ops = first_lane_words(&[]);
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[1].mnemonic, "s_mov_b32");
+    assert_eq!(ops[1].src, [Opnd::ConstInt(0)]);
+    assert_eq!(ops[2].mnemonic, "v_readfirstlane_b32");
+    assert_eq!(ops[2].dst, [Opnd::Sgpr(18)]);
+    assert_eq!(ops[2].src, [Opnd::Vgpr(43)]);
+}
+
+#[test]
+fn first_lane_read_stays_put_while_the_index_is_still_live() {
+    // s_add_u32 s0, s0, 1 after the branch reads the elected lane.
+    let mut ops = first_lane_words(&[0x8000_8100]);
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[1].mnemonic, "s_ff1_i32_b64");
+    assert_eq!(ops[2].mnemonic, "v_readlane_b32");
+}
+
+#[test]
+fn first_lane_read_stays_put_when_a_branch_reaches_a_use_of_the_index() {
+    // The branch skips `s_mov_b32 s0, 0`; its target adds 1 to the elected index.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xd760_0012, 0x0000_012b, 0xbf85_0001,
+        0xbe80_0380, 0x8001_8100, 0xbf81_0000];
+    let mut skipped = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut skipped);
+    assert_eq!(skipped[2].mnemonic, "v_readlane_b32");
+    // With the use gone, both paths drop the index and the read is lowered.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xd760_0012, 0x0000_012b, 0xbf85_0001,
+        0xbe80_0380, 0xbf80_0000, 0xbf81_0000];
+    let mut ops = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[2].mnemonic, "v_readfirstlane_b32");
+}
+
+#[test]
+fn first_lane_read_stays_put_across_a_saveexec() {
+    // s_and_saveexec_b64 s[2:3], vcc narrows EXEC after the election.
+    let words = [0xbe80_047eu32, 0xbe80_1400, 0xbe82_246a, 0xd760_0012, 0x0000_012b, 0xbf81_0000];
+    let mut ops = disassemble(&words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    lower_first_lane_reads(&mut ops);
+    assert_eq!(ops[3].mnemonic, "v_readlane_b32");
+}

@@ -2,6 +2,7 @@
 
 mod compute_hlsl;
 mod constant_pixel;
+pub mod group_base;
 use tuxbox_dxbc::fssm;
 #[cfg(feature = "legacy-hlsl")]
 pub mod hlsl;

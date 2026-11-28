@@ -21,6 +21,8 @@ fn deadline_text_uses_twenty_seconds_unless_zero_or_invalid() {
     assert_eq!(super::parse_deadline(Some("0")), Duration::ZERO);
     assert_eq!(super::parse_deadline(Some("20")), Duration::from_secs(20));
     assert_eq!(super::parse_deadline(Some("nope")), Duration::from_secs(20));
+    assert_eq!(super::parse_deadline(Some("0.01")), Duration::from_millis(10));
+    assert_eq!(super::parse_deadline(Some("-1")), Duration::from_secs(20));
 }
 
 #[test]

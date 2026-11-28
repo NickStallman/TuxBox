@@ -30,6 +30,7 @@ def code_steps(python, target):
         ("Shader compiler tests", [*cargo, "--manifest-path", "tools/shader-compiler/Cargo.toml"]),
         ("DXBC tests", [*cargo, "-p", "tuxbox-dxbc", "--features", "native-bindings"]),
         ("XG layout tests", [*cargo, "-p", "tuxbox-xg-layout"]),
+        ("Storage codec tests", [*cargo, "-p", "tuxbox-xcrdapi-codec"]),
         ("D3D12 Windows typecheck", ["cargo", "check", "--locked", "--target", "x86_64-pc-windows-msvc",
                                      "-p", "tuxbox-d3d12", "-p", "tuxbox-bvh"]),
     ]

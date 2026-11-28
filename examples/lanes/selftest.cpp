@@ -507,6 +507,180 @@ void wave64_shader_scenario(ID3D12Device* device) {
     check_wave_shader(device, {wave_shader, sizeof(wave_shader)}, wave_shader_expected);
 }
 
+// A console program that stores its group ID, dispatched with more groups in
+// a dimension than a desktop dispatch allows: 70,000 across, then 2 across
+// and 70,000 down. Each record holds the ID of the group that wrote it.
+void large_dispatch(ID3D12Device* device) {
+    constexpr UINT across = 2, down = 70000, records = across * down, words = records * 4;
+    constexpr UINT64 bytes = UINT64(words) * sizeof(UINT);
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    D3D12_ROOT_SIGNATURE_DESC signature{1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize group ID root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create group ID root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {group_shader, sizeof(group_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline from the group ID program");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create group ID view heap");
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu{method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get())};
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{method<GpuHandle>(heap.Get(), 10)(heap.Get())};
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::vector<UINT> unwritten(words, 0xdeadbeefu);
+    compute_fixture::upload(seed.Get(), unwritten.data(), size_t(bytes));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.Buffer.NumElements = words;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &view, cpu);
+
+    const UINT cases[][3] = {{down, 1, 1}, {across, down, 1}};
+    for (const auto& groups : cases) {
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ID3D12GraphicsCommandList* list = direct.list.Get();
+        list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+        method<SetRoot>(list, slot_compute_root)(list, root.Get());
+        list->SetPipelineState(pipeline.Get());
+        method<SetTable>(list, slot_compute_table)(list, 0, gpu);
+        list->Dispatch(groups[0], groups[1], groups[2]);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+        direct.submit();
+        direct.finish("dispatch over 65,535 groups");
+
+        D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+        void* mapped = nullptr;
+        check(readback->Map(0, &read, &mapped), "map group ID readback");
+        std::vector<UINT> got(words);
+        std::memcpy(got.data(), mapped, size_t(bytes));
+        readback->Unmap(0, &empty);
+        // Record x + 2y belongs to group (x, y, 0); the others stay unwritten.
+        for (UINT index = 0; index < records; ++index) {
+            const UINT x = groups[0] == across ? index % across : index, y = groups[0] == across ? index / across : 0;
+            const bool written = x < groups[0] && y < groups[1];
+            const UINT expected[4] = {written ? x : 0xdeadbeefu, written ? y : 0xdeadbeefu,
+                                      written ? 0u : 0xdeadbeefu, written ? group_shader_mark : 0xdeadbeefu};
+            for (UINT word = 0; word < 4; ++word) {
+                if (got[index * 4 + word] != expected[word]) {
+                    char message[160];
+                    std::snprintf(message, sizeof(message),
+                                  "dispatch (%u, %u, %u): record %u word %u holds %#x, expected %#x",
+                                  groups[0], groups[1], groups[2], index, word, got[index * 4 + word], expected[word]);
+                    throw std::runtime_error(message);
+                }
+            }
+        }
+    }
+}
+
+// A console program whose driver compile misses a short pipeline deadline. The
+// title gets a stand-in, which writes nothing; once the compile finishes, the
+// next bind runs the real pipeline. Each thread stores the end of its chain.
+void late_pipeline(ID3D12Device* device) {
+    constexpr UINT words = 64;
+    constexpr UINT64 bytes = words * sizeof(UINT);
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER table{};
+    table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    table.DescriptorTable = {1, &range};
+    D3D12_ROOT_SIGNATURE_DESC signature{1, &table, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeRootSignature(&signature, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, nullptr),
+          "serialize late pipeline root signature");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create late pipeline root signature");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {late_shader, sizeof(late_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline from the late program");
+
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create late pipeline view heap");
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu{method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get())};
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu{method<GpuHandle>(heap.Get(), 10)(heap.Get())};
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    const std::vector<UINT> unwritten(words, 0xdeadbeefu);
+    compute_fixture::upload(seed.Get(), unwritten.data(), size_t(bytes));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    view.Format = DXGI_FORMAT_R32_TYPELESS;
+    view.Buffer.NumElements = words;
+    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &view, cpu);
+
+    // A stand-in leaves every word unwritten. Anything else must be the real result.
+    for (int attempt = 0; attempt < 600; ++attempt) {
+        Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+        ID3D12GraphicsCommandList* list = direct.list.Get();
+        list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+        method<SetRoot>(list, slot_compute_root)(list, root.Get());
+        list->SetPipelineState(pipeline.Get());
+        method<SetTable>(list, slot_compute_table)(list, 0, gpu);
+        list->Dispatch(1, 1, 1);
+        compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+        direct.submit();
+        direct.finish("late pipeline dispatch");
+
+        D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+        void* mapped = nullptr;
+        check(readback->Map(0, &read, &mapped), "map late pipeline readback");
+        std::vector<UINT> got(words);
+        std::memcpy(got.data(), mapped, size_t(bytes));
+        readback->Unmap(0, &empty);
+        if (got == unwritten) {
+            Sleep(200);
+            continue;
+        }
+        for (UINT word = 0; word < words; ++word) {
+            if (got[word] != late_shader_expected[word]) {
+                char message[128];
+                std::snprintf(message, sizeof(message), "thread %u stored %#x, expected %#x", word, got[word],
+                              late_shader_expected[word]);
+                throw std::runtime_error(message);
+            }
+        }
+        return;
+    }
+    throw std::runtime_error("the stand-in was never replaced by the finished compile");
+}
+
 void mixed_lane_scenario(ID3D12Device* device) {
     check_wave_shader(device, {lane_shader, sizeof(lane_shader)}, lane_shader_expected);
 }
@@ -558,12 +732,14 @@ ComPtr<ID3D12PipelineState> console_pipeline(ID3D12Device* device, Stream& parts
 
 // Draws a fullscreen triangle with `vertex` (the console vertex program unless
 // another is given), or with `mesh` when that is given, and `pixel` under `root`, into a 16x16 target of 32-bit
-// `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`.
+// `format` cleared to zero. Table N is bound at view `tables[N]` of `view_heap`, with `sampler_heap` beside it
+// when given.
 // Returns the texels, row by row.
 std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature* root, D3D12_SHADER_BYTECODE pixel,
                                       DXGI_FORMAT format, ID3D12DescriptorHeap* view_heap,
                                       std::initializer_list<UINT> tables, D3D12_SHADER_BYTECODE mesh = {},
-                                      D3D12_SHADER_BYTECODE vertex = {raster_vertex, sizeof(raster_vertex)}) {
+                                      D3D12_SHADER_BYTECODE vertex = {raster_vertex, sizeof(raster_vertex)},
+                                      ID3D12DescriptorHeap* sampler_heap = nullptr) {
     ComPtr<ID3D12PipelineState> pipeline;
     if (mesh.BytecodeLength) {
         frame_abi::MeshPipelineStream parts;
@@ -603,8 +779,8 @@ std::vector<UINT> draw_console_raster(ID3D12Device* device, ID3D12RootSignature*
     constexpr float clear[4]{};
     method<frame_abi::Clear>(list, slot_clear_target)(list, rtv, clear, 0, nullptr);
     method<SetRoot>(list, slot_graphics_root)(list, root);
-    ID3D12DescriptorHeap* bound[]{view_heap};
-    method<BindHeaps>(list, slot_bind_heaps)(list, 1, bound);
+    ID3D12DescriptorHeap* bound[]{view_heap, sampler_heap};
+    method<BindHeaps>(list, slot_bind_heaps)(list, sampler_heap ? 2 : 1, bound);
     UINT parameter = 0;
     for (const UINT view : tables)
         method<SetTable>(list, slot_graphics_table)(list, parameter++, {gpu_base + UINT64(view) * stride});
@@ -784,6 +960,101 @@ void raster_heap_stride(ID3D12Device* device) {
     }
 }
 
+// A root-less console compute program reads a structured buffer in the resource
+// heap by thread number and stores the word it found back through a second
+// structured buffer at the same thread index (`shader_fixture.py`). The load is
+// an IDXEN raw access whose record stride the console stores in the descriptor's
+// word 1, which the program carries no way to carry: the provider must retry the
+// translation against a root with the stride table appended and bind that table
+// for the dispatch. A refused pipeline, a skipped dispatch or another stride
+// leaves the output at its decoy.
+void compute_heap_stride(ID3D12Device* device) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize heap stride root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create heap stride root");
+
+    constexpr UINT records = compute_heap_stride_records, record_bytes = compute_heap_stride_bytes;
+    constexpr UINT words = records * (record_bytes / sizeof(UINT));
+    constexpr UINT64 bytes = UINT64(words) * sizeof(UINT);
+    // Each record starts with a marker and ends with a decoy that must stay.
+    constexpr UINT decoy = 0xD0000000u;
+    std::vector<UINT> input_words(words, decoy);
+    for (UINT i = 0; i < records; ++i) input_words[i * (record_bytes / sizeof(UINT))] = 0x10000000u | (i + 1u);
+    auto input = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(input.Get(), input_words.data(), size_t(bytes));
+    std::vector<UINT> decoy_words(words, decoy);
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), decoy_words.data(), size_t(bytes));
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create heap stride view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer = {0, records, record_bytes, D3D12_BUFFER_SRV_FLAG_NONE};
+    device->CreateShaderResourceView(input.Get(), &srv, {cpu_base + SIZE_T(compute_heap_stride_input_slot) * stride});
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_UNKNOWN;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer = {0, records, record_bytes, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, {cpu_base + SIZE_T(compute_heap_stride_output_slot) * stride});
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {compute_heap_stride_shader, sizeof(compute_heap_stride_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create compute heap stride pipeline");
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    auto list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{view_heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    direct.submit();
+    direct.finish("dispatch console heap stride compute");
+
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map heap stride readback");
+    std::vector<UINT> got(words);
+    std::memcpy(got.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    for (UINT i = 0; i < records; ++i) {
+        const UINT base = i * (record_bytes / sizeof(UINT));
+        const UINT expected = 0x10000000u | (i + 1u);
+        if (got[base] == expected
+            && std::all_of(got.begin() + base + 1, got.begin() + base + record_bytes / sizeof(UINT),
+                           [decoy](UINT word) { return word == decoy; })) continue;
+        char message[200];
+        std::snprintf(message, sizeof(message),
+                      "record %u: expected marker %#x, found %#x", i, expected, got[base]);
+        throw std::runtime_error(message);
+    }
+}
+
 // A point-filtered, clamped static sampler at register `slot`, space0.
 D3D12_STATIC_SAMPLER_DESC point_sampler(UINT slot) {
     D3D12_STATIC_SAMPLER_DESC point{};
@@ -830,6 +1101,69 @@ ComPtr<ID3D12Resource> sampled_texture(ID3D12Device* device, D3D12_RESOURCE_STAT
         copy.finish("upload sampled texture");
     }
     return texture;
+}
+
+// A console vertex program samples a texture from the resource heap with a sampler
+// from the sampler heap at a constant index, the way RAGE's VfxVBuffer programs do:
+// both arms of an if/else copy the sampler into vector registers, and a waterfall
+// loop reads it back for the sample (`raster_fixture.py`). The sampled value is the
+// position's w. The point sampler at the program's index keeps the triangle over the
+// whole target; the linear ones everywhere else in the heap shrink it. A program the
+// translator refuses becomes a stand-in pipeline and draws nothing.
+void raster_sampler_waterfall(ID3D12Device* device) {
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
+                                                  D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize waterfall root");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create waterfall root");
+
+    auto texture = sampled_texture(device, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    D3D12_DESCRIPTOR_HEAP_DESC view_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 128,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> view_heap;
+    check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view_heap)), "create waterfall view heap");
+    const UINT view_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T view_base = method<frame_abi::CpuHandle>(view_heap.Get(), 9)(view_heap.Get());
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(texture.Get(), &srv, {view_base + SIZE_T(waterfall_texture_index) * view_stride});
+
+    constexpr UINT samplers = 8;
+    D3D12_DESCRIPTOR_HEAP_DESC sampler_desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, samplers,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> sampler_heap;
+    check(device->CreateDescriptorHeap(&sampler_desc, IID_PPV_ARGS(&sampler_heap)), "create waterfall sampler heap");
+    const UINT sampler_stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    const SIZE_T sampler_base = method<frame_abi::CpuHandle>(sampler_heap.Get(), 9)(sampler_heap.Get());
+    for (UINT i = 0; i < samplers; ++i) {
+        D3D12_SAMPLER_DESC sampler{};
+        sampler.Filter = i == waterfall_sampler_index ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.MaxAnisotropy = 1;
+        sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        sampler.MaxLOD = 12;
+        device->CreateSampler(&sampler, {sampler_base + SIZE_T(i) * sampler_stride});
+    }
+
+    const auto texels = draw_console_raster(device, root.Get(), {heap_stride_pixel, sizeof(heap_stride_pixel)},
+                                            DXGI_FORMAT_R32_UINT, view_heap.Get(), {}, {},
+                                            {waterfall_vertex, sizeof(waterfall_vertex)}, sampler_heap.Get());
+    for (UINT i = 0; i < texels.size(); ++i) {
+        if (texels[i] == heap_stride_expected) continue;
+        char message[200];
+        std::snprintf(message, sizeof(message),
+                      "texel %u,%u is %#x: a stand-in pipeline, a skipped draw or another sampler than heap slot %u",
+                      i % 16, i / 16, texels[i], waterfall_sampler_index);
+        throw std::runtime_error(message);
+    }
 }
 
 // Draws `pixel` (and `mesh`, when given) under `root` with the 2x1 texture the
@@ -1205,6 +1539,115 @@ void compute_root_recovery(ID3D12Device* device) {
     }
 }
 
+// A console program under a root of three tables and a root SRV, the layout
+// of some retail compute roots (`shader_fixture.py`). Its records name that
+// root SRV and a raw UAV at slot 2 of table 1, where the title's root declares
+// four SRVs; the title fills the table as the program was compiled to use it.
+// The provider must bind the layout the program's own records give. Against
+// the title's declaration the store has no UAV, so nothing translates the
+// program and view 10 keeps its decoy (or, with stand-ins disabled, the
+// pipeline is not created).
+void compute_root_srv(ID3D12Device* device) {
+    D3D12_DESCRIPTOR_RANGE1 ranges[]{
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 1, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 3, D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE, 0}};
+    D3D12_ROOT_PARAMETER1 params[4]{};
+    for (UINT i = 0; i < 3; ++i) {
+        params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[i].DescriptorTable = {1, &ranges[i]};
+    }
+    // The program's record names this parameter t5, space7.
+    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[3].Descriptor = {1, 3, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC signature{};
+    signature.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    signature.Desc_1_1 = {4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    ComPtr<ID3DBlob> serialized;
+    check(D3D12SerializeVersionedRootSignature(&signature, &serialized, nullptr), "serialize root with a root SRV");
+    ComPtr<ID3D12RootSignature> root;
+    check(device->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+                                      IID_PPV_ARGS(&root)), "create root signature with a root SRV");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC shader{};
+    shader.pRootSignature = root.Get();
+    shader.CS = {root_srv_shader, sizeof(root_srv_shader)};
+    ComPtr<ID3D12PipelineState> pipeline;
+    check(method<CreateComputePipeline>(device, device_create_compute)(device, &shader, 0, nullptr,
+                                                                       IID_PPV_ARGS(&pipeline)),
+          "create pipeline storing through a slot the root declares an SRV");
+
+    // Sixteen raw UAVs of one buffer. Table 0 starts at view 0, table 1 at view
+    // 8 and table 2 at view 12, so the program writes view 10. Every view
+    // starts with a decoy naming it.
+    constexpr UINT views = 16, view_words = 64, decoy = 0xD0000000, written_view = 10;
+    constexpr UINT64 bytes = views * view_words * sizeof(UINT);
+    std::vector<UINT> words(views * view_words);
+    for (UINT i = 0; i < views; ++i) words[i * view_words] = decoy | i;
+    auto seed = buffer(device, D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+    compute_fixture::upload(seed.Get(), words.data(), size_t(bytes));
+    auto output = buffer(device, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COPY_DEST,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    auto readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, views,
+                                         D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    ComPtr<ID3D12DescriptorHeap> heap;
+    check(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)), "create root view heap");
+    const UINT stride = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const SIZE_T cpu_base = method<frame_abi::CpuHandle>(heap.Get(), 9)(heap.Get());
+    const UINT64 gpu_base = method<GpuHandle>(heap.Get(), 10)(heap.Get());
+    for (UINT i = 0; i < views; ++i) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        view.Format = DXGI_FORMAT_R32_TYPELESS;
+        view.Buffer.FirstElement = UINT64(i) * view_words;
+        view.Buffer.NumElements = view_words;
+        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+        device->CreateUnorderedAccessView(output.Get(), nullptr, &view, {cpu_base + SIZE_T(i) * stride});
+    }
+
+    Queue direct(device, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    ID3D12GraphicsCommandList* list = direct.list.Get();
+    list->CopyBufferRegion(output.Get(), 0, seed.Get(), 0, bytes);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    ID3D12DescriptorHeap* heaps[]{heap.Get()};
+    method<BindHeaps>(list, slot_bind_heaps)(list, 1, heaps);
+    method<SetRoot>(list, slot_compute_root)(list, root.Get());
+    // The program never reads through the root SRV, so the title leaves it unset.
+    constexpr UINT first_view[]{0, 8, 12};
+    for (UINT i = 0; i < 3; ++i)
+        method<SetTable>(list, slot_compute_table)(list, i, {gpu_base + UINT64(first_view[i]) * stride});
+    list->SetPipelineState(pipeline.Get());
+    list->Dispatch(1, 1, 1);
+    compute_fixture::transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback.Get(), 0, output.Get(), 0, bytes);
+    direct.submit();
+    direct.finish("dispatch storing through a slot the root declares an SRV");
+
+    D3D12_RANGE read{0, SIZE_T(bytes)}, empty{};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "map root SRV readback");
+    std::vector<UINT> got(views * view_words);
+    std::memcpy(got.data(), mapped, size_t(bytes));
+    readback->Unmap(0, &empty);
+    for (UINT i = 0; i < views; ++i) {
+        for (UINT j = 1; j < view_words; ++j)
+            if (got[i * view_words + j] != 0) throw std::runtime_error("the root SRV program modified a guard word");
+        const UINT expected = i == written_view ? root_shader_expected : decoy | i;
+        const UINT found = got[i * view_words];
+        if (found == expected) continue;
+        char message[160];
+        if (i == written_view && found == (decoy | i))
+            std::snprintf(message, sizeof(message), "view 10 kept its decoy: a stand-in pipeline or a skipped dispatch");
+        else if (found == root_shader_expected)
+            std::snprintf(message, sizeof(message), "view %u was written, not table 1 slot 2 (view 10)", i);
+        else
+            std::snprintf(message, sizeof(message), "view %u: expected %#x, found %#x", i, expected, found);
+        throw std::runtime_error(message);
+    }
+}
+
 ComPtr<ID3D12PipelineState> compute_pipeline(ID3D12Device* device, ComPtr<ID3D12RootSignature>& root,
                                           D3D12_SHADER_BYTECODE bytecode) {
     D3D12_ROOT_PARAMETER params[2]{};
@@ -1389,6 +1832,31 @@ void indirect_dispatch(ID3D12Device* device) {
     if (rows[0].front() != 0x0001) throw std::runtime_error("direct course dispatch wrote an unexpected course");
     if (rows[0] != rows[1]) throw std::runtime_error("indirect dispatch differs from the direct dispatch");
 }
+
+// A mesh dispatch signature is made exactly when the device reports mesh
+// shaders. Without them it must be refused: some drivers fault while
+// creating one instead of returning an error. `without` requires a device
+// that reports none, as under TUXBOX_HOST_PROFILE=mesh=none.
+void check_mesh_signature(ID3D12Device* device, bool without) {
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
+    check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options)), "mesh options");
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+    D3D12_COMMAND_SIGNATURE_DESC desc{sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), 1, &argument, 0};
+    ComPtr<ID3D12CommandSignature> command;
+    const HRESULT hr = device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&command));
+    const bool mesh = options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+    std::fprintf(stderr, "mesh-signature tier=%d result=0x%08lx\n", static_cast<int>(options.MeshShaderTier),
+                 static_cast<unsigned long>(hr));
+    if (mesh && (FAILED(hr) || !command))
+        throw std::runtime_error("mesh dispatch signature refused on a device with mesh shaders");
+    if (!mesh && (hr != E_NOTIMPL || command))
+        throw std::runtime_error("mesh dispatch signature not refused on a device without mesh shaders");
+    if (without && mesh) throw std::runtime_error("the device still reports mesh shaders");
+}
+
+void mesh_signature(ID3D12Device* device) { check_mesh_signature(device, false); }
+void mesh_signature_none(ID3D12Device* device) { check_mesh_signature(device, true); }
 
 // The producer and ExecuteIndirect share a compute list. Only the final
 // readback waits on a CPU fence.
@@ -3258,6 +3726,8 @@ constexpr Scenario scenarios[] = {
     {L"indirect-dispatch", indirect_dispatch},
     {L"gpu-indirect-dispatch", gpu_indirect_dispatch},
     {L"gpu-indirect-order", gpu_indirect_order},
+    {L"mesh-signature", mesh_signature},
+    {L"mesh-signature-none", mesh_signature_none},
     {L"dispatch-wait", dispatch_wait},
     {L"texture-readback", texture_readback},
     {L"texture-publication", texture_publication},
@@ -3278,6 +3748,7 @@ constexpr Scenario scenarios[] = {
     {L"mesh-sampler-single", mesh_sampler_single},
     {L"mesh-sampler-rootless", mesh_sampler_rootless},
     {L"compute-root-recovery", compute_root_recovery},
+    {L"compute-root-srv", compute_root_srv},
     {L"bindless-compute", bindless_compute},
     {L"bindless-sampler", bindless_sampler},
     {L"bindless-heap-read", bindless_heap_read},
@@ -3285,6 +3756,10 @@ constexpr Scenario scenarios[] = {
     {L"bindless-table-store", bindless_table_store},
     {L"bindless-table-compute", bindless_table_compute},
     {L"raster-heap-stride", raster_heap_stride},
+    {L"large-dispatch", large_dispatch},
+    {L"late-pipeline", late_pipeline},
+    {L"compute-heap-stride", compute_heap_stride},
+    {L"raster-sampler-waterfall", raster_sampler_waterfall},
 };
 
 // A fresh Scarlett device on the requested adapter. The factory is reached
@@ -3334,16 +3809,19 @@ std::string narrow(const wchar_t* text) {
 const wchar_t* const selftest_scenarios[] = {L"labels",            L"cross-queue",      L"compute-frame",
                                              L"skipped-command",   L"copy-memory",      L"direct-copy-wait", L"shared-texture",
                                              L"indirect-dispatch", L"gpu-indirect-dispatch", L"gpu-indirect-order",
+                                             L"mesh-signature", L"mesh-signature-none",
                                              L"dispatch-wait", L"texture-readback", L"texture-publication",
                                              L"ray-tracing-builder", L"ray-tracing-guest-memory",
                                              L"thread-dimensions", L"descriptor-reclaim", L"unwritten-descriptors",
                                              L"xbox-shader", L"wave64-shader", L"mixed-lane",
                                              L"raster-tables", L"lane-spill-interp", L"wave-alloc", L"raster-samplers", L"compute-root",
                                              L"mesh-samplers", L"mesh-sampler-single", L"mesh-sampler-rootless",
-                                             L"compute-root-recovery", L"bindless-compute",
+                                             L"compute-root-recovery", L"compute-root-srv", L"bindless-compute",
                                              L"bindless-sampler", L"bindless-heap-read", L"bindless-texture-store",
                                              L"bindless-table-store", L"bindless-table-compute",
-                                             L"raster-heap-stride"};
+                                             L"raster-heap-stride", L"large-dispatch",
+                                             L"compute-heap-stride", L"late-pipeline",
+                                             L"raster-sampler-waterfall"};
 const unsigned selftest_scenario_count = static_cast<unsigned>(std::size(selftest_scenarios));
 static_assert(std::size(selftest_scenarios) == std::size(scenarios));
 
@@ -3355,8 +3833,10 @@ std::string run_selftest(const wchar_t* requested, const wchar_t* adapter) {
         if (!all && std::wcscmp(requested, scenario.name)) continue;
         // This one writes nothing until the launcher's compiler has translated it,
         // and mesh-samplers needs its root-aware runtime shader worker.
-        // mixed-lane and raster-heap-stride also need the live compiler.
-        if (all && (!std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
+        // mixed-lane, raster-heap-stride, large-dispatch, compute-heap-stride, late-pipeline and raster-sampler-waterfall
+        // also need the live compiler.
+        // mesh-signature-none needs a host profile without mesh shaders.
+        if (all && (!std::wcscmp(scenario.name, L"mesh-signature-none") || !std::wcscmp(scenario.name, L"wave64-shader") || !std::wcscmp(scenario.name, L"mixed-lane") || !std::wcscmp(scenario.name, L"raster-heap-stride") || !std::wcscmp(scenario.name, L"large-dispatch") || !std::wcscmp(scenario.name, L"compute-heap-stride") || !std::wcscmp(scenario.name, L"late-pipeline") || !std::wcscmp(scenario.name, L"raster-sampler-waterfall") || !std::wcsncmp(scenario.name, L"mesh-sampler", 12) || !std::wcsncmp(scenario.name, L"bindless-", 9)))
             continue;
         const auto name = narrow(scenario.name);
         try {

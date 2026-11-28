@@ -10,5 +10,6 @@ crate-type = ["staticlib"]
 
 [dependencies]
 miniz_oxide = "0.8.9"
+tuxbox-xcrdapi-codec = { path = "codec" }
 windows-core = "0.61"
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_Graphics_Direct3D12", "Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader"] }

@@ -84,7 +84,7 @@ where
         crate::diagnostics::log_once(&ANNOUNCED, || {
             format!(
                 "compute pipelines wait {}s, then return a null pipeline while the driver compile continues ({} at a time)",
-                deadline.as_secs(),
+                deadline.as_secs_f64(),
                 max_live()
             )
         });
@@ -97,14 +97,12 @@ fn pipeline_deadline() -> std::time::Duration {
     *DEADLINE.get_or_init(|| parse_deadline(std::env::var("TUXBOX_PIPELINE_DEADLINE").ok().as_deref()))
 }
 
+/// Whole or fractional seconds. A fraction lets a test make any large compile
+/// miss the deadline.
 fn parse_deadline(text: Option<&str>) -> std::time::Duration {
-    match text {
-        None => std::time::Duration::from_secs(20),
-        Some(text) => match text.parse::<u64>() {
-            Ok(seconds) => std::time::Duration::from_secs(seconds),
-            Err(_) => std::time::Duration::from_secs(20),
-        },
-    }
+    text.and_then(|text| text.trim().parse::<f64>().ok())
+        .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+        .unwrap_or(std::time::Duration::from_secs(20))
 }
 
 fn max_live() -> usize {
@@ -356,6 +354,9 @@ impl PipelineWatch {
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
         flights().push(Flight { id, label: label.to_string(), started, next_due: 5 });
+        if request_trace(label) {
+            crate::diagnostics::log(&format!("CreatePipelineState #{id} {label} started"));
+        }
         Self { id: Some(id), label: label.to_string(), started }
     }
 }
@@ -365,13 +366,21 @@ impl Drop for PipelineWatch {
         let Some(id) = self.id else { return };
         let elapsed = self.started.elapsed().as_secs();
         flights().retain(|flight| flight.id != id);
-        if elapsed >= 5 {
+        if elapsed >= 5 || request_trace(&self.label) {
             crate::diagnostics::log(&format!(
                 "CreatePipelineState #{id} {} finished in {elapsed}s",
                 self.label
             ));
         }
     }
+}
+
+// Opt-in for short, successful pipeline calls too. Ordinary diagnostics
+// continue to report only slow calls, now with exact request attribution.
+fn request_trace(label: &str) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    label.starts_with("CS ") && label.contains(" request=")
+        && *ENABLED.get_or_init(|| std::env::var("TUXBOX_TRACE_PIPELINE_REQUESTS").as_deref() == Ok("1"))
 }
 
 fn flights() -> std::sync::MutexGuard<'static, Vec<Flight>> {

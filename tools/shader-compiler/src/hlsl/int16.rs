@@ -38,11 +38,13 @@ pub(super) fn new_half(ins: &Insn) -> bool {
         | "v_min3_i16" | "v_max3_i16" | "v_med3_i16")
 }
 
-pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
-    if ins.enc != Enc::Vop3 {
-        return Ok(None);
-    }
-    let op = match ins.mnemonic.as_str() {
+/// Whether `expression` translates this mnemonic. It reads the VOP3 operand selects.
+pub(super) fn handles(mnemonic: &str) -> bool {
+    operation(mnemonic).is_some()
+}
+
+fn operation(mnemonic: &str) -> Option<Operation> {
+    Some(match mnemonic {
         // Without clamp the signed and unsigned forms have the same low 16 bits.
         "v_add_nc_u16" | "v_add_nc_i16" | "v_pk_add_u16" | "v_pk_add_i16" => Operation::Add,
         "v_sub_nc_u16" | "v_sub_nc_i16" | "v_pk_sub_i16" | "v_pk_sub_u16" => Operation::Subtract,
@@ -61,8 +63,15 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         "v_min3_i16" => Operation::SignedMin3,
         "v_max3_i16" => Operation::SignedMax3,
         "v_med3_i16" => Operation::SignedMed3,
-        _ => return Ok(None),
-    };
+        _ => return None,
+    })
+}
+
+pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
+    if ins.enc != Enc::Vop3 {
+        return Ok(None);
+    }
+    let Some(op) = operation(&ins.mnemonic) else { return Ok(None) };
     let packed = ins.op >= 0x400;
     let new_packed = matches!(ins.mnemonic.as_str(),
         "v_pk_add_i16" | "v_pk_mad_i16" | "v_pk_mad_u16" | "v_pk_max_u16" | "v_pk_min_u16");

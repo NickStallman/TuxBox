@@ -4,9 +4,13 @@
 Each synthetic wave32 program branches on a lane mask, then runs a reduction
 behind a mask branch, which the translator can only express by branching with
 the whole wave. One program also runs as a ray tracing resolve shader, whose
-interleaved loops go through the block dispatcher. Two more read a lane inside
-a loop that lanes leave at different times: a sum for each distinct key, and a
-read of lanes that have already left. The reference models the console: one program counter per wave,
+interleaved loops go through the block dispatcher, and once with only an EXEC
+guard before its reduction, which the dispatcher keeps as a decision of the
+wave too. Another exchanges lanes in the resolve mode. Others count the lanes
+of a mask, find its first, retire lanes with a write to EXEC, and read the lane
+a mask elects. Two more read a lane inside a loop that lanes leave at different
+times: a sum for each distinct key, and a read of lanes that have already left.
+The reference models the console: one program counter per wave,
 shared scalar registers and per-lane vector writes under EXEC. Only the
 translator's input and output are instrumented. No game data is needed.
 """
@@ -36,6 +40,12 @@ REDUCTION = [0xbe803dc1, 0xd5010002, 0x00020080, 0x4a0404e9, 0xde54c102, 0x4a040
              0xd7600007, 0x00010102, 0xbefe0300]
 OUTPUTS = ("s20", "s21", "v10", "s7")
 COMPARE = f"v_cmp_lt_u32_e32 vcc_lo, 0x{LIMIT:x}, v0"
+# Lanes exchanged in the ray tracing resolve mode: reversed within each quad,
+# then swapped with the neighbour. A lane EXEC has not got gives zero. A scalar
+# write behind a branch on EXEC follows, as in that mode's other program.
+SWIZZLES = ["ds_swizzle_b32 v11, v0 offset:0x801b", "ds_swizzle_b32 v10, v11 offset:0x041f", COMPARE,
+            "s_and_saveexec_b32 s10, vcc_lo", ("branch", "s_cbranch_execz", "done"), "s_mov_b32 s20, 7",
+            ("label", "done"), "s_mov_b32 exec_lo, s10"]
 
 
 def label(name):
@@ -70,6 +80,23 @@ BODIES = {
                  "v_add_nc_u32_e32 v10, 1, v10", label("empty"), "s_mov_b32 exec_lo, s10",
                  "s_add_u32 s22, s22, 1", "s_cmp_lt_u32 s20, 3", branch("s_cbranch_scc1", "outer"),
                  "s_cmp_lt_u32 s22, 6", branch("s_cbranch_scc1", "inner")],
+    # A mask filled behind a branch on a mask, then read as a number: its lanes
+    # counted, its first found, and those below each lane counted.
+    "counted": ["s_mov_b32 s11, 0", COMPARE, branch("s_cbranch_vccz", "none"), "s_and_b32 s11, vcc_lo, exec_lo",
+                label("none"), "s_bcnt1_i32_b32 s20, s11", "s_ff1_i32_b32 s21, s11",
+                "v_mbcnt_lo_u32_b32 v10, s11, 0"],
+    # The lanes a block left out, taken from EXEC and its saved copy at once.
+    "others": [COMPARE, "s_and_saveexec_b32 s10, vcc_lo", "v_mov_b32_e32 v10, 5", "s_andn2_wrexec_b32 s11, s10",
+               branch("s_cbranch_scc0", "done"), "s_mov_b32 s20, 9", "v_mov_b32_e32 v10, 6", label("done"),
+               "s_bcnt1_i32_b32 s21, s11", "s_mov_b32 exec_lo, s10"],
+    # EXEC restored from a register that one path left a number in. Nothing runs
+    # under it before the next restore.
+    "stale": ["s_mov_b32 s10, exec_lo", COMPARE, branch("s_cbranch_vccz", "kept"), "s_mov_b32 s10, 5",
+              label("kept"), "s_mov_b32 exec_lo, s10", "s_mov_b32 exec_lo, s12", "s_mov_b32 s20, 4",
+              "v_mov_b32_e32 v10, s20"],
+    # The first running lane, and the value that lane holds.
+    "first": ["s_and_b32 s11, s12, exec_lo", "s_ff1_i32_b32 s11, s11", "v_readlane_b32 s21, v0, s11",
+              "s_mov_b32 s20, s11"],
 }
 
 
@@ -115,18 +142,20 @@ LANE_READ_BODIES = {
 }
 
 
-def program(body, resolve=False):
+def program(body, resolve=False, guarded=False):
     """Assembler lines and branch positions of one complete program."""
     if body in LANE_READ_BODIES.values():
         return ["s_mov_b32 s12, exec_lo", *body, "s_mov_b32 exec_lo, s12", "s_endpgm"]
+    # No active lane skips the reduction. A branch on VCC around it is what the
+    # targeted guards refuse. One on EXEC they accept as a vote of the wave,
+    # which only a program without interleaved loops keeps.
+    skip = ([branch("s_cbranch_execz", "end")] if guarded
+            else ["v_cmp_eq_u32_e32 vcc_lo, v1, v1", branch("s_cbranch_vccz", "end")])
     return [
         "s_mov_b32 s12, exec_lo",
         # The resolve mode is selected by a compare into an odd scalar register.
         *(["v_cmp_eq_u32_e64 s31, 0, v1"] if resolve else []), *body, "s_mov_b32 exec_lo, s12",
-        # No active lane skips the reduction. A branch on VCC around it is what
-        # the targeted guards refuse.
-        "v_cmp_eq_u32_e32 vcc_lo, v1, v1", branch("s_cbranch_vccz", "end"),
-        ("words", REDUCTION), label("end"), "s_endpgm",
+        *skip, ("words", REDUCTION), label("end"), "s_endpgm",
     ]
 
 
@@ -193,6 +222,10 @@ def model(name, active, values):
     some = any(taken)
     s20 = s21 = 0
     v10 = [0] * len(values)
+    if name == "swizzle":
+        v11 = [values[i ^ 3] if active[i] and active[i ^ 3] else 0 for i in lanes]
+        v10 = [v11[i ^ 1] if active[i] and active[i ^ 1] else 0 for i in lanes]
+        s20, name = 7 * some, "none"
     if name == "vccz":
         s20 = int(some)
         v10 = [s20 if active[i] else 0 for i in lanes]
@@ -221,7 +254,21 @@ def model(name, active, values):
             v10 = [v10[i] + int(taken[i]) for i in lanes]
             s22 += 1
             at = "outer" if s20 < 3 else "inner" if s22 < 6 else None
-    else:
+    elif name == "counted":
+        s20 = sum(taken)
+        s21 = taken.index(True) if some else 0xffffffff
+        v10 = [sum(taken[:i]) if active[i] else 0 for i in lanes]
+    elif name == "others":
+        others = [active[i] and not taken[i] for i in lanes]
+        s20, s21 = 9 * any(others), sum(others)
+        v10 = [5 if taken[i] else 6 if others[i] else 0 for i in lanes]
+    elif name == "stale":
+        s20 = 4
+        v10 = [4 if active[i] else 0 for i in lanes]
+    elif name == "first":
+        s20 = active.index(True) if any(active) else 0xffffffff
+        s21 = values[s20 & (WIDTH - 1)]
+    elif name != "none":
         raise ValueError(name)
     total = sum(v for v, a in zip(values, active) if a) & 0xffffffff if any(active) else 0
     return [(s20, s21, v10[i], total) for i in lanes]
@@ -282,8 +329,10 @@ def main(argv=None):
         trial = Path(tmp)
         expected, shaders = {}, {}
         bodies = BODIES | LANE_READ_BODIES
-        for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True)]:
-            words = words_of(program(bodies[body], resolve), args.llvm_mc)
+        for name, body, resolve in [*((name, name, False) for name in bodies), ("resolve", "dispatch", True),
+                                    ("guarded", "dispatch", False), ("swizzle", "swizzle", True)]:
+            lines = SWIZZLES if body == "swizzle" else bodies[body]
+            words = words_of(program(lines, resolve, name == "guarded"), args.llvm_mc)
             emitted = subprocess.check_output(
                 [args.emitter.resolve(), *(["resolve"] if resolve else []), str(WIDTH),
                  *(f"{word:08x}" for word in words)], text=True, timeout=30)
@@ -300,7 +349,7 @@ def main(argv=None):
                 seed, expected[label_] = seed_and_expected(body, mask, values)
                 (trial / f"{label_}.seed").write_bytes(seed)
                 (trial / f"{label_}.cso").hardlink_to(blob)
-        if not (shaders["dispatch"]["dispatched"] and shaders["resolve"]["dispatched"]):
+        if not all(shaders[name]["dispatched"] for name in ("dispatch", "resolve", "guarded")):
             raise ValueError("the interleaved fixture must use the block dispatcher")
         (trial / "cases.txt").write_text("".join(f"{name} 0 uint 1\n" for name in expected))
         exe, status, fields = run_gpu_guest(

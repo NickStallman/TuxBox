@@ -105,3 +105,17 @@ fn a_write_asks_for_the_barrier_again() {
     order.barrier(BARRIER.SyncAfter, BARRIER.AccessAfter);
     assert!(!order.needs_barrier(true));
 }
+
+#[test]
+fn the_barrier_names_the_writes_each_list_type_takes() {
+    // Measured on the desktop runtime: ACCESS_COMMON before INDIRECT_ARGUMENT
+    // fails Close with E_INVALIDARG, and a compute list refuses graphics writes.
+    let writes = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 | D3D12_BARRIER_ACCESS_COPY_DEST.0;
+    let graphics = D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0 | D3D12_BARRIER_ACCESS_RESOLVE_DEST.0;
+    assert_eq!(barrier(D3D12_COMMAND_LIST_TYPE_COMPUTE).AccessBefore.0, writes);
+    assert_eq!(barrier(D3D12_COMMAND_LIST_TYPE_DIRECT).AccessBefore.0, writes | graphics);
+    for list_type in [D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_LIST_TYPE_COMPUTE] {
+        let barrier = barrier(list_type);
+        assert_eq!((barrier.SyncAfter, barrier.AccessAfter), (BARRIER.SyncAfter, BARRIER.AccessAfter));
+    }
+}

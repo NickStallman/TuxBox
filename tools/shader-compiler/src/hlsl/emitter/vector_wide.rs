@@ -98,7 +98,11 @@ impl<'a> Emitter<'a> {
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_off_f32_i4" | "v_cvt_f32_ubyte0"
             | "v_cvt_f32_ubyte1" | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3");
         let float_source_modifiers = float_alu || m == "v_cvt_f16_f32";
-        if float_source_modifiers || int_to_float || half_int_src {
+        let applies_output = float_source_modifiers || int_to_float || half_int_src;
+        if !is_cmp && sd & 0xe000 != 0 && !applies_output && !clamped_product24(ins) {
+            return Err("unsupported SDWA clamp or output modifier".into());
+        }
+        if applies_output {
             c.enc = Enc::Vop3;
             c.aux.imm = i64::from((sd >> 13) & 1);
             c.aux.imm2 = i64::from((sd >> 14) & 3);
@@ -248,3 +252,7 @@ impl<'a> Emitter<'a> {
         return self.wv(&d, &value);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/hlsl/sdwa.rs"]
+mod tests;

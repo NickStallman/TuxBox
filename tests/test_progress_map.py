@@ -83,30 +83,30 @@ class ProgressMapTests(unittest.TestCase):
                          render_map(root / "evidence"),
                          "Regenerate the map with python tuxbox.py status --svg docs/progress.svg")
 
-    def test_projectscarlett_shader_panel_uses_matching_capture_counts(self):
+    def write_instruction_evidence(self, root):
+        dest = root / "shader-instructions"
+        dest.mkdir(parents=True)
+        (dest / "dxil.json").write_text(json.dumps({"compiled": ["Sop2 0x0 s_add_u32"], "failed": {}}))
+        (dest / "gpu-checks.json").write_text(json.dumps({"adapters": {
+            "AMD 1002:0001": {"instructions": ["v_add_f32", "v_sub_f32"]},
+            "NVIDIA 10de:0001": {"instructions": ["v_add_f32"]}}}))
+        (dest / "recorded-use.json").write_text(json.dumps({"title": "Example 1.0", "instructions": {
+            "s_add_u32": 5, "v_add_f32": 3, "v_sub_f32": 2, "s_nop": 1}}))
+        return dest
+
+    def test_instruction_panel_counts_compiled_and_checked_instructions(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "projectscarlett-startup.json").write_text(json.dumps({"executable_sha256": "title"}))
-            report = root / "projectscarlett-shader-preparation.json"
-            run = {"executable_sha256": "title", "compiler_sha256": "compiler", "log_sha256": "log",
-                   "requests": {"total": 8, "compiled": 3, "unsupported": 4, "failed": 1}}
-            report.write_text(json.dumps(run))
+            self.assertNotIn(">RDNA 2 instructions<", render_map(root))
+            self.write_instruction_evidence(root)
             graphic = render_map(root)
-            self.assertIn("3/8 captured requests compiled", graphic)
-            self.assertIn("4 unsupported · 1 failed", graphic)
-            self.assertIn(">37.5%<", graphic)
-            self.assertIn(">Unmeasured<", graphic)
-            self.assertNotIn("Furthest run", graphic)
-            play = {"executable_sha256": "title", "result": {"exit_code": 5},
-                    "title_crash_report": {"sha256": "report", "game_state": "Game Running", "frame": 10146}}
-            gameplay = root / "projectscarlett-gameplay.json"
-            gameplay.write_text(json.dumps(play))
-            self.assertIn("reached gameplay at frame 10,146, then exited with code 5", render_map(root))
-            gameplay.write_text(json.dumps(dict(play, executable_sha256="other")))
-            self.assertNotIn("Furthest run", render_map(root))
-            for changed in (dict(executable_sha256="other"), dict(requests=dict(run["requests"], total=7))):
-                report.write_text(json.dumps(dict(run, **changed)))
-                self.assertNotIn(">Project Scarlett shader preparation<", render_map(root))
+            # s_add_u32 compiled alone; v_add_f32 and v_sub_f32 ran in a GPU check.
+            self.assertIn(">3/1,085<", graphic)
+            self.assertIn("Used in recorded shaders", graphic)
+            self.assertNotIn("Example 1.0", graphic)
+            # Of the four used, three are converted, and one ran on both vendors.
+            self.assertIn(">3/4<", graphic)
+            self.assertIn(">1/4<", graphic)
 
     def write_library_audit(self, root):
         dest = root / "matrix-awakens"
@@ -158,67 +158,31 @@ class ProgressMapTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Missing evidence"):
                 render_map(root)
 
-    def test_overall_weights_library_behaviors_and_shader_coverage_equally(self):
+    def test_overall_weights_library_behaviors_and_instructions_equally(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_library_audit(root)
-            dest = root / "matrix-awakens"
             # Inventorying extra exports does not create a new required behavior.
             (root / "library-status.json").write_text(json.dumps({"libraries": [
                 {"name": "codec.dll", "export_coverage": {"total": 1000, "verified": []}}]}))
-            archives = {"global": {"member_sha256": "g", "entries": 1},
-                        "material": {"member_sha256": "m", "entries": 3}}
-            (dest / "shader-inventory.json").write_text(json.dumps({"archives": archives}))
-            reports = {}
-            for name, count in [("global", 1), ("material", 2)]:
-                reports[name] = {"archive_sha256": archives[name]["member_sha256"], "compiler_sha256": "tool",
-                                 "stages": {"vertex": {"entries": archives[name]["entries"], "translated": count},
-                                            "pixel": {"entries": 0, "translated": 0},
-                                            "geometry": {"entries": 0, "translated": 0}}}
-            report = dest / "raster-archive-survey.json"
-            report.write_text(json.dumps({"archives": reports}))
+            dest = self.write_instruction_evidence(root)
             graphic = render_map(root)
-            self.assertIn(">62.5%<", graphic)
+            # (1/2 + 3/1,085) / 2
+            self.assertIn(">25.1%<", graphic)
             self.assertIn("Library behaviors · 1/2 verified (50.0%)", graphic)
-            self.assertIn("Shader translation · 3/4 entries (75.0%)", graphic)
-            reports["material"]["archive_sha256"] = "other"
-            report.write_text(json.dumps({"archives": reports}))
-            self.assertIn("Shader translation · Unmeasured", render_map(root))
-            self.assertNotIn(">62.5%<", render_map(root))
+            self.assertIn("RDNA 2 instructions · 3/1,085 (0.3%)", graphic)
+            (dest / "dxil.json").unlink()
+            self.assertIn("RDNA 2 instructions · Unmeasured", render_map(root))
+            self.assertNotIn(">25.1%<", render_map(root))
 
-    def test_frosty_milestones_use_matching_retail_profile_and_tuxbox_run(self):
+    def test_the_map_names_no_game(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "matrix-awakens-launch.json").write_text(json.dumps({
-                "sha256": "game", "progress_receipt": "latest.json"}))
-            receipt = {
-                "title_sha256": "game",
-                "settings": {"graphics_profile": "packaged", "loose_graphics_overrides_in_package": 0,
-                             "ray_tracing": 1, "lumen_hardware_ray_tracing": 1},
-                "runs": {"tuxbox": {"log_sha256": "tuxbox", "verified_milestones": ["load_world", "submit_frame"]},
-                         "control": {"log_sha256": "other", "verified_milestones": ["use_menu", "play_chase"]}},
-                "failure": {"global_shader": 219, "entry": "ExampleCS"},
-            }
-            file = root / "latest.json"
-            file.write_text(json.dumps(receipt))
-            svg = ET.fromstring(render_map(root))
-            labels = [node.text for node in svg.findall(".//{*}text")]
-            self.assertIn("Frosty retail test", labels)
-            self.assertNotIn("25%", labels)
-            self.assertIn("Packaged settings · World loaded · Frame submitted", labels)
-            self.assertNotIn("Menu used", render_map(root))
-            self.assertIn("Blocked at global shader 219 · ExampleCS", labels)
-            for field, value in [("graphics_profile", "reduced"), ("loose_graphics_overrides_in_package", 1),
-                                 ("ray_tracing", 0), ("lumen_hardware_ray_tracing", 0)]:
-                with self.subTest(field=field):
-                    file.write_text(json.dumps(dict(receipt, settings=dict(receipt["settings"], **{field: value}))))
-                    graphic = render_map(root)
-                    self.assertIn("No matching retail run", graphic)
-                    self.assertNotIn("World loaded", graphic)
-                    self.assertNotIn("ExampleCS", graphic)
-            file.write_text(json.dumps(dict(receipt, title_sha256="other")))
-            self.assertIn("No matching retail run", render_map(root))
-            receipt["runs"]["tuxbox"]["verified_milestones"].append("unknown")
-            file.write_text(json.dumps(receipt))
-            with self.assertRaisesRegex(ValueError, "Unknown Frosty milestone"):
-                render_map(root)
+            self.write_library_audit(root)
+            self.write_instruction_evidence(root)
+            (root / "matrix-awakens-launch.json").write_text(json.dumps({"sha256": "game", "progress_receipt": "latest.json"}))
+            (root / "latest.json").write_text(json.dumps({"title_sha256": "game", "runs": {"tuxbox": {
+                "log_sha256": "tuxbox", "verified_milestones": ["load_world"]}}}))
+            graphic = render_map(root)
+            for name in ("Frosty", "Example 1.0", "retail", "Decoded frames reached the game."):
+                self.assertNotIn(name, graphic)

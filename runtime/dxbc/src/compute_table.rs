@@ -155,9 +155,11 @@ fn read_bindings(
         // below confirms that parameter's register and SGPR.
         let raster_constants = multi_table.is_some() && class == 2;
         // A root SRV: its 64-bit address arrives in two SGPRs, and the record
-        // names its root parameter the same way (as mesh_table reads it).
-        let raster_root_srv = multi_table.is_some() && class == 0x100;
-        let table = if stage == 5 || raster_constants || raster_root_srv { location >> 16 }
+        // names its root parameter the same way (as mesh_table reads it). A
+        // compute root can carry one after its tables; the user-data check
+        // below confirms the parameter, as for a raster stage.
+        let root_srv = (multi_table.is_some() || stage == 5 && root.is_some()) && class == 0x100;
+        let table = if stage == 5 || raster_constants || root_srv { location >> 16 }
             else { raster_table.map_or(0, |(table, _)| table) };
         // Root-less raster programs (RAGE) can receive their descriptor table in
         // s9 instead of s8. The descriptor encodings are otherwise identical.
@@ -215,7 +217,7 @@ fn read_bindings(
             // Constants in a later parameter of an extended compute root; the
             // user-data check below confirms parameter, register and size.
             (2, _) if stage == 5 && root.is_some() && location >> 16 >= 2 => (4, 2),
-            (0x100, _) if raster_root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
+            (0x100, _) if root_srv && location & 0xff == 4 && shape == 1 => (ROOT_SRV, 4),
             (0x401, _) => (3, 1),                 // inlined static sampler
             _ => return None,
         };

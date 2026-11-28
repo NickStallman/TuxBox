@@ -38,7 +38,8 @@ fn bit_mask_mode_is_unchanged() {
 fn other_high_offset_bits_and_gds_stay_refused() {
     for (offset, extra) in [(0x8100, 0), (0xe000, 0), (0xffff, 0), (0x801b, 1 << 16), (0x041f, 1 << 17)] {
         let error = swizzle(offset, extra).unwrap_err();
-        assert!(error.contains("unsupported compute DS swizzle encoding"), "{offset:#x}/{extra:#x}: {error}");
+        let reason = if extra == 1 << 17 { "GDS is unsupported" } else { "unsupported compute DS swizzle encoding" };
+        assert!(error.contains(reason), "{offset:#x}/{extra:#x}: {error}");
     }
 }
 
@@ -139,5 +140,23 @@ fn paired_wave64_lowers_quad_and_bitmask_swizzles_without_shared_memory() {
     for (offset, extra) in [(0x8100, 0), (0xe000, 0), (0x801b, 1 << 16), (0x041f, 1 << 17)] {
         let error = translate_paired_wave64(&fixture::shader(offset, extra)).map(|t| t.hlsl).unwrap_err();
         assert!(error.contains("unsupported compute DS swizzle encoding"), "{offset:#x}/{extra:#x}: {error}");
+    }
+}
+
+#[test]
+fn loop_in_whole_console_waves_runs_two_lanes_per_thread() {
+    // A 64-lane console wave branches once for all its lanes. The two-lane form
+    // keeps that, so the exchange needs no barrier and the loop no vote.
+    for threads in [64, 128] {
+        let translated = translate(&fixture::shader_loop_wave64(0x801b, threads)).unwrap();
+        assert_eq!(translated.required_wave_size, Some(32));
+        let hlsl = &translated.hlsl;
+        assert!(hlsl.contains(&format!("[WaveSize(32)]\n[numthreads({}, 1, 1)]", threads / 2)), "{hlsl}");
+        assert!(hlsl.contains("(exec_lo | exec_hi) != 0u"), "{hlsl}");
+        assert!(!hlsl.contains("GroupMemoryBarrierWithGroupSync"), "{hlsl}");
+    }
+    // Part of a console wave, or no sign of its width, stays refused.
+    for shader in [fixture::shader_loop_wave64(0x801b, 32), fixture::shader_loop_wave64(0x801b, 96), fixture::shader_loop_64(0x801b, 0)] {
+        assert_eq!(translate(&shader).map(|t| t.hlsl).unwrap_err(), "compute swizzle inside a loop");
     }
 }

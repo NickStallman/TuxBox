@@ -229,7 +229,7 @@ pub(super) unsafe extern "system" fn dispatch_flagged(list: &List, x: u32, y: u3
 
 fn record_dispatch(list: &List, state: &mut super::Recording, x: u32, y: u32, z: u32) {
     if x.max(y).max(z) > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION {
-        state.error = E_INVALIDARG;
+        record_split_dispatch(list, state, [x, y, z]);
         return;
     }
     let null_usage = state.bindings.null_usage.clone();
@@ -242,6 +242,53 @@ fn record_dispatch(list: &List, state: &mut super::Recording, x: u32, y: u32, z:
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::diagnostics::log_once(&FIRST, || format!("recorded Dispatch list={list:p} groups=({x},{y},{z})"));
     });
+}
+
+/// The most desktop dispatches one console dispatch is split into.
+const MAX_SPLIT_PARTS: usize = 1024;
+
+/// A console dispatch with more groups in a dimension than a desktop dispatch
+/// allows, as several dispatches that each receive the console group ID they
+/// start at (see `tuxbox_dxbc::group_base`). A pipeline that cannot take that
+/// base fails the list, as the dispatch would on its own.
+fn record_split_dispatch(list: &List, state: &mut super::Recording, groups: [u32; 3]) {
+    let refuse = |state: &mut super::Recording, why: &str| {
+        crate::diagnostics::recording_error(format_args!(
+            "compute dispatch of {groups:?} groups exceeds 65,535 in a dimension and cannot be split: {why}"
+        ));
+        state.error = E_INVALIDARG;
+    };
+    let Some(parts) = tuxbox_dxbc::group_base::split(groups, D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION, MAX_SPLIT_PARTS) else {
+        return refuse(state, &format!("it needs more than {MAX_SPLIT_PARTS} dispatches"));
+    };
+    if state.bindings.scene_root().is_some() {
+        return refuse(state, "an inline ray-query pipeline's root does not take the group base");
+    }
+    let Some((pipeline, group_base)) = state.bindings.group_base() else {
+        return refuse(state, "the pipeline does not run a translated console program");
+    };
+    let variant = match group_base.variant() {
+        Ok(variant) => variant,
+        Err(why) => return refuse(state, why),
+    };
+    let (split, root, slot) = (variant.pipeline.clone(), variant.root.clone(), variant.slot);
+    let count = parts.len();
+    state.bindings.split_root = Some(root);
+    // SAFETY: the active native list remains open under its recording lock.
+    state.compute_dispatch(list, move |native| unsafe {
+        native.SetPipelineState(&split);
+        for part in &parts {
+            native.SetComputeRoot32BitConstants(slot, 3, part.base.as_ptr().cast(), 0);
+            let [x, y, z] = part.groups;
+            native.Dispatch(x, y, z);
+        }
+        native.SetPipelineState(&pipeline);
+    });
+    state.bindings.split_root = None;
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || format!(
+        "split compute dispatch list={list:p} groups={groups:?} into {count} dispatches"
+    ));
 }
 
 pub(super) fn buffer_offset(resource: &device::Resource, offset: u64, bytes: u64) -> Option<u64> {

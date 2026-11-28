@@ -20,8 +20,12 @@ VERTEX_CODE=(0x7e0202f3,0x7e0402ff,0x40400000,0x7d840082,0x02080501,
              0x7e1002ff,0x89abcdef,0x7e1202ff,0x3e800000,0x7e1402f0,
              0x7e1602f2,0xf80000cf,0x07060504,0xf8000a0f,0x0b0a0908,0xbf810000)
 
-def vertex(kind=3):
-    code=list(VERTEX_CODE)
+# s_swappc_b64 s[4:5], s[4:5] and s_inst_prefetch 0x3: how the title's vertex programs
+# start, calling the fetch shader whose address the driver puts in s[4:5].
+FETCH_PROLOGUE=(0xbe842104,0xbfa00003)
+
+def vertex(kind=3,fetch=False):
+    code=[*(FETCH_PROLOGUE if fetch else ()),*VERTEX_CODE]
     image=bytearray(0x170)
     def q(at,v):struct.pack_into("<Q",image,at,v)
     q(0,6)

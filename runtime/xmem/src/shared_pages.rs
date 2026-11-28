@@ -5,11 +5,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE,
-    MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION,
-    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
-    SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree,
-    VirtualQuery,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEM_DECOMMIT,
+    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, UnmapViewOfFile2,
+    VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
 };
 use windows_sys::Win32::System::SystemServices::MEM_COALESCE_PLACEHOLDERS;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -45,11 +45,12 @@ pub(super) fn replace_aperture(address: *mut c_void, bytes: usize) -> *mut c_voi
 
 // One pagefile section per batch of XMem physical tokens.
 //
-// The section is committed whole when it is created. Committing through each
-// view instead costs one wineserver request per view under Wine, and each
-// request scans every range committed so far, so loading stalls on wineserver.
-// If the whole commit fails (for example at the commit limit), views fall back
-// to committing their own range.
+// The section is created committed. A SEC_RESERVE section costs a wineserver
+// request for every view commit and for every VirtualQuery of a view, even
+// once all of it is committed, so a title that queries its memory often waits
+// on wineserver. If a committed section cannot be created (for example at the
+// commit limit), a SEC_RESERVE section is committed whole through one view
+// instead, and if that fails too, views commit their own range.
 pub(super) struct Section {
     bytes: u64,
     handle: OnceLock<OwnedHandle>,
@@ -69,20 +70,32 @@ impl Section {
         if let Some(h) = self.handle.get() {
             return Ok(h.as_raw_handle());
         }
-        let h = unsafe {
+        let create = |flags| unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 ptr::null(),
-                PAGE_READWRITE | SEC_RESERVE,
+                PAGE_READWRITE | flags,
                 (self.bytes >> 32) as u32,
                 self.bytes as u32,
                 ptr::null(),
             )
         };
+        // Wine answers VirtualQuery on a view of a SEC_RESERVE section with a
+        // wineserver request, even once every page is committed. Create the
+        // section committed so queries stay local; reserve only if that fails.
+        let mut h = create(0);
+        let whole = !h.is_null();
+        if !whole {
+            h = create(SEC_RESERVE);
+        }
         if h.is_null() {
             return Err(unsafe { GetLastError() });
         }
         if self.handle.set(unsafe { OwnedHandle::from_raw_handle(h) }).is_ok() {
+            if whole {
+                self.committed.store(true, Ordering::Release);
+                return Ok(self.handle.get().unwrap().as_raw_handle());
+            }
             let raw = self.handle.get().unwrap().as_raw_handle();
             self.committed.store(commit_whole(raw, self.bytes as usize), Ordering::Release);
         }
@@ -184,6 +197,74 @@ pub(super) fn unmap(address: usize) -> Result<(), u32> {
         Value: address as _,
     };
     if unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn map_private_range_protect(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
+    let view = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            address as _,
+            bytes,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            protect,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if view.is_null() {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn map_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    map_private_range_protect(address, bytes, PAGE_READWRITE)
+}
+
+pub(super) fn unmap_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    if unsafe { VirtualFree(address as _, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn commit_private_range_protect(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
+    if unsafe { VirtualAlloc(address as _, bytes, MEM_COMMIT, protect) }.is_null() {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn protect_private_range(
+    address: usize,
+    bytes: usize,
+    protect: u32,
+) -> Result<(), u32> {
+    let mut ignored = 0u32;
+    if unsafe { VirtualProtect(address as _, bytes, protect, &mut ignored) } == 0 {
+        Err(unsafe { GetLastError() })
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn decommit_private_range(address: usize, bytes: usize) -> Result<(), u32> {
+    if unsafe { VirtualFree(address as _, bytes, MEM_DECOMMIT) } == 0 {
         Err(unsafe { GetLastError() })
     } else {
         Ok(())

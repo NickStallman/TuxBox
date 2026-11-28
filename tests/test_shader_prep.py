@@ -333,6 +333,7 @@ class ShaderLaunch(unittest.TestCase):
         self.assertEqual(self.run_cli([], game_arguments=["-NullRHI"]), (19, 0, 1))
         self.assertEqual(self.run_cli([], env={"TUXBOX_SHADER_PREP": "0"}), (19, 0, 1))
 
+    @unittest.skipUnless(sys.platform == "linux", "ProjectScarlett runs only offline, which needs Linux")
     def test_scarlett_skips_pregame_compilation(self):
         exe = "game_scarlett_master.exe"
         self.assertEqual(self.run_cli([], exe=exe), (19, 0, 1))

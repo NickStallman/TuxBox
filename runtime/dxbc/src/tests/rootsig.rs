@@ -166,3 +166,82 @@ fn rejects_invalid_offsets_counts_and_short_versioned_records() {
             .is_empty()
     );
 }
+
+
+#[test]
+fn stride_table_variant_appends_volatile_srv_and_shifts_container() {
+    // A minimal v1.1 root signature: one table parameter, one static sampler.
+    let version = 2u32;
+    let params_offset = 24u32;
+    let table_offset = params_offset + 12; // after one header
+    let ranges_offset = table_offset + 8;
+    let samplers_start = ranges_offset + 24; // one v1.1 range (24 bytes)
+    let sampler_size = 52usize;
+    let mut body = Vec::new();
+    body.extend_from_slice(&version.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // num_params
+    body.extend_from_slice(&params_offset.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // num_static_samplers
+    body.extend_from_slice(&samplers_start.to_le_bytes());
+    body.extend_from_slice(&0x41u32.to_le_bytes()); // flags
+    body.extend_from_slice(&0u32.to_le_bytes()); // tag: table
+    body.extend_from_slice(&0u32.to_le_bytes()); // visibility
+    body.extend_from_slice(&table_offset.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes()); // count
+    body.extend_from_slice(&ranges_offset.to_le_bytes());
+    // one v1.1 range: type, num, base, space, flags, offset_in_table
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&[0u8; 52]); // one zero sampler
+
+    let rtso_tag = 32 + 8; // header (32) + two directory entries (2*4)
+    let mut shader = Vec::new();
+    shader.extend_from_slice(b"DXBC");
+    shader.extend_from_slice(&[0u8; 16]); // digest
+    shader.extend_from_slice(&1u32.to_le_bytes()); // container version
+    shader.extend_from_slice(&0u32.to_le_bytes()); // total size placeholder
+    shader.extend_from_slice(&2u32.to_le_bytes()); // two chunks
+    shader.extend_from_slice(&(rtso_tag as u32).to_le_bytes()); // RTS0 directory entry
+    shader.extend_from_slice(&((rtso_tag + 8 + body.len()) as u32).to_le_bytes()); // ACCC entry (placeholder)
+    shader.extend_from_slice(b"RTS0");
+    shader.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    shader.extend_from_slice(&body);
+    shader.extend_from_slice(b"ACCC");
+    shader.extend_from_slice(&24u32.to_le_bytes());
+    shader.extend_from_slice(&[0u8; 24]);
+    let second_tag = rtso_tag + 8 + body.len();
+    // Patch the second directory entry (after the RTS0 tag) and the header's total size.
+    shader[36..40].copy_from_slice(&(second_tag as u32).to_le_bytes());
+    let total = shader.len();
+    shader[24..28].copy_from_slice(&(total as u32).to_le_bytes());
+    let original_size = shader.len();
+
+    let variant = stride_table_variant(&shader).expect("variant builds");
+    // One extra header (12) + one extra stride body (12 for v1.1).
+    assert_eq!(variant.len(), original_size + 24);
+    assert_eq!(u32::from_le_bytes(variant[24..28].try_into().unwrap()) as usize, variant.len());
+
+    let container = crate::Dxbc::parse(&variant).expect("variant parses");
+    let chunk = container.chunk(b"RTS0").expect("RTS0 survives");
+    let body_bytes = &variant[chunk.offset..chunk.offset + chunk.size];
+    let root = parse_rts0(body_bytes).expect("variant's RTS0 parses");
+    assert_eq!(root.num_static_samplers, 1);
+    assert_eq!(root.params.len(), 2);
+    match &root.params[1].kind {
+        RootParamKind::Descriptor { register, space, .. } => {
+            assert_eq!(*register, 1);
+            assert_eq!(*space, 32766);
+        }
+        other => panic!("last param is a descriptor, got {other:?}"),
+    }
+    match &root.params[0].kind {
+        RootParamKind::Table(ranges) => assert_eq!(ranges.len(), 1),
+        other => panic!("first param is a table, got {other:?}"),
+    }
+    let second = container.chunks.iter().find(|c| c.fourcc == *b"ACCC").unwrap();
+    assert_eq!(second.offset, second_tag + 24 + 8); // tag+8, not tag
+}

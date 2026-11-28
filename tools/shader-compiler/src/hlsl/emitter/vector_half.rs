@@ -9,7 +9,10 @@ impl<'a> Emitter<'a> {
         //   OPSEL_HI bit i (dword1[28:27], dword0[14] for i = 2) = 0 -> 32-bit float,
         //                                                         1 -> 16-bit float;
         //   OPSEL bit i (dword0[13:11]) picks the high half when the source is 16-bit;
-        //   NEG bit i (dword1[31:29]) negates, NEG_HI bit i (dword0[10:8]) takes |x|.
+        //   NEG bit i (dword1[31:29]) negates, NEG_HI bit i (dword0[10:8]) takes |x|;
+        //   CLAMP (dword0[15]) saturates the result before any narrowing.
+        // An inline float constant read as a 16-bit source is the half-float of its value.
+        // Clamp and the fused form found by Nick Stallman's GPU checks (#333).
         let (w0, w1) = (ins.raw[0], ins.raw.get(1).copied().unwrap_or(0));
         let opsel = (w0 >> 11) & 7;
         let opsel_hi = ((w1 >> 27) & 3) | (((w0 >> 14) & 1) << 2);
@@ -18,7 +21,10 @@ impl<'a> Emitter<'a> {
         for i in 0..3 {
             let x = r(&s[i])?;
             let mut e = if (opsel_hi >> i) & 1 != 0 {
-                if (opsel >> i) & 1 != 0 { format!("f16tof32(({x}) >> 16)") } else { format!("f16tof32(({x}) & 0xffffu)") }
+                if let Opnd::ConstF32(value) = s[i] {
+                    if (opsel >> i) & 1 != 0 { return Err("high-half selection on inline float".into()); }
+                    f(&Opnd::ConstF32(inline_half_value(value)))?
+                } else if (opsel >> i) & 1 != 0 { format!("f16tof32(({x}) >> 16)") } else { format!("f16tof32(({x}) & 0xffffu)") }
             } else {
                 format!("asfloat({x})")
             };
@@ -30,7 +36,10 @@ impl<'a> Emitter<'a> {
             }
             v.push(e);
         }
-        let e = format!("{} * {} + {}", v[0], v[1], v[2]);
+        let mut e = format!("mad({}, {}, {})", v[0], v[1], v[2]);
+        if w0 & 0x8000 != 0 {
+            e = format!("saturate({e})");
+        }
         return match m.as_str() {
             "v_fma_mix_f32" => self.wv(&d, &format!("asuint({e})")),
             // The f16 result replaces one half of the destination; the other half is kept.
@@ -178,3 +187,7 @@ impl<'a> Emitter<'a> {
         return self.wv(&d, &format!("(({} & 0xffff0000u) | {bits})", r(&d)?));
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/hlsl/fma_mix.rs"]
+mod tests;

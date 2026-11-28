@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "runtime/acphal", "runtime/bvh", "runtime/d3d12", "runtime/dxbc", "runtime/dxc", "runtime/gameinput",
-    "runtime/xapu", "runtime/xg", "runtime/xcrdapi", "runtime/xg-layout", "runtime/xgameruntime", "runtime/xmem", "runtime/xmem/http", "tools/pipeline-prep",
+    "runtime/xapu", "runtime/xg", "runtime/xcrdapi", "runtime/xcrdapi/codec", "runtime/xg-layout", "runtime/xgameruntime", "runtime/xmem", "runtime/xmem/http", "tools/pipeline-prep",
 ]
 resolver = "3"
 

@@ -161,6 +161,8 @@ def main():
         dxc = args.windows_dxc.expanduser().resolve() if args.windows_dxc else None
         return run_checks(gpu=not args.no_gpu, host_options=options, baseline=args.baseline, windows_dxc=dxc)
     if args.command == "status":
+        # The tables are redirected into Markdown files, which are UTF-8 whatever the console's code page.
+        sys.stdout.reconfigure(encoding="utf-8")
         evidence = Path(__file__).resolve().parent / "evidence"
         if args.svg:
             write_map(evidence, args.svg)

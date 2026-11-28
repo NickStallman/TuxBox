@@ -37,6 +37,21 @@ pub fn shader_loop_64(offset: u32, word0_extra: u32) -> ShaderExtract {
     build(words.to_vec(), [0, 64, 1, 1])
 }
 
+/// The exchange in a loop that retires lanes from a two-word EXEC, as only a
+/// 64-lane console wave keeps it. `threads` is the group size.
+pub fn shader_loop_wave64(offset: u32, threads: u32) -> ShaderExtract {
+    let words = [
+        0xbe8a_047e,           // s_mov_b64 s[10:11], exec
+        0xd8d4_0000 | offset,
+        0x0000_0001,
+        0xbe8a_3a0a,           // s_andn2_wrexec_b64 s[10:11], s[10:11]
+        0xbf89_fffc,           // s_cbranch_execnz -> 0x04 (back-edge)
+        0xbf8c_c07f,           // s_waitcnt
+        0xbf81_0000,           // s_endpgm
+    ];
+    build(words.to_vec(), [0, threads, 1, 1])
+}
+
 /// A loop whose head is entered through a per-thread EXEC-empty exit: the guest
 /// may leave the loop from one thread while others stay. One host wave, one
 /// exchange, one unconditional s_branch back-edge.

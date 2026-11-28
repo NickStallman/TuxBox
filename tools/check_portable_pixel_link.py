@@ -42,11 +42,13 @@ def run(argv=None):
     rows=[]
     with TemporaryDirectory(dir=a.work) as tmp:
         trial=Path(tmp)
-        for producer,ptype in TYPES.items():
-            native=trial/f"vertex{producer}.dxbc"
-            native.write_bytes(vertex(producer))
+        # The last starts with a call of the fetch shader, which the input signature replaces.
+        for producer,ptype,fetch in [(p,t,False) for p,t in TYPES.items()]+[(3,"float",True)]:
+            native=trial/f"vertex{producer}{'-fetch' if fetch else ''}.dxbc"
+            native.write_bytes(vertex(producer,fetch))
             for consumer,ctype in TYPES.items():
-                name=f"p{producer}c{consumer}"
+                if fetch and consumer!=3:continue
+                name=f"p{producer}c{consumer}"+("-fetch" if fetch else "")
                 ps=trial/(name+".hlsl")
                 bits="v" if consumer==1 else "asuint(v)"
                 ps.write_text(f"float4 main(nointerpolation {ctype}4 v:TEXCOORD0):SV_Target {{ uint4 b={bits}; return float4(b.x==0x89abcdefu?1:0,asfloat(b.yzw)); }}")
@@ -62,7 +64,7 @@ def run(argv=None):
                 blob=trial/("v"+name+".cso")
                 subprocess.run([a.dxc,"-T",profile.read_text(),"-E","main","-O3","-Fo",blob,vs],check=True,capture_output=True,timeout=30)
                 subprocess.run([a.dxv,blob],check=True,capture_output=True,timeout=30)
-                rows.append(dict(case=name,producer=ptype,consumer=ctype,vertex_sha256=sha(blob),pixel_sha256=sha(pixel)))
+                rows.append(dict(case=name,producer=ptype,consumer=ctype,fetch=fetch,vertex_sha256=sha(blob),pixel_sha256=sha(pixel)))
         # A link cache entry must be specific to the actually bound pixel
         # binary. Reject a mismatched original/actual consumer before emit.
         wrong=trial/"wrong.hlsl"

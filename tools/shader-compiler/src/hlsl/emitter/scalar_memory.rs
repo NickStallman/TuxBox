@@ -82,7 +82,12 @@ impl<'a> Emitter<'a> {
                 return Ok(());
             }
             self.line("// (descriptor fetch from root table — resolved statically)");
+            self.emit_texture_size(idx)?;
+            self.emit_buffer_count(idx)?;
             return Ok(());
+        }
+        if !(8..=12).contains(&ins.op) {
+            return Err("unsupported scalar memory instruction".into());
         }
         let n = 1u32 << (ins.op - 8);
         let base = sreg_num(&d.ok_or("no dst")?).ok_or("bad dst")?;
@@ -185,6 +190,10 @@ impl<'a> Emitter<'a> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
         let d = ins.dst.first().cloned();
+        // LDS (bit 13) sends the loaded data to group shared memory instead of registers.
+        if ins.raw[0] & (1 << 13) != 0 {
+            return Err("FLAT LDS (load to LDS) unsupported".into());
+        }
         match ins.enc {
             Enc::Flat if m == "flat_load_ushort" => {
                 code_table::halfword(&self.insns, idx, self.ex.isa.len(), self.ex.isa_data.len())

@@ -2,11 +2,29 @@
 use super::*;
 
 impl<'a> Emitter<'a> {
+    /// The host lane of the first invocation whose guest EXEC bit is set, or
+    /// 0xffffffff when there is none. A ballot, not `WaveActiveMin` over lane
+    /// indices: on an RTX 5090 that minimum, in a wave whose lanes disagree,
+    /// lost the device (Xid 109, CTX SWITCH TIMEOUT). The ballot's second word
+    /// holds lanes 32-63 of a 64-lane host wave.
+    pub(in crate::hlsl) fn first_active_lane(&mut self) -> String {
+        let t = self.tmp;
+        self.tmp += 1;
+        self.line(&format!("uint4 t{t}b = WaveActiveBallot((exec_lo & 1u) != 0u);"));
+        self.line(&format!(
+            "uint t{t} = t{t}b.x != 0u ? firstbitlow(t{t}b.x) : (t{t}b.y != 0u ? 32u + firstbitlow(t{t}b.y) : 0xffffffffu);"
+        ));
+        format!("t{t}")
+    }
+
     /// Broadcast the first active lane to a scalar register.
     pub(in crate::hlsl) fn emit_readfirstlane(&mut self, s: &[Opnd], d: Opnd) -> Result<(), String> {
         let value = r(&s[0])?;
+        // A heap index read from a wave with no active lane becomes slot 0.
+        let index = self.heap_index_reads.contains(&self.cur_idx);
         if self.resolve_wave32 {
-            return self.ws(&d, &format!("WaveReadLaneAt({value}, exec_lo == 0u ? 0u : uint(firstbitlow(exec_lo)))"));
+            let read = format!("WaveReadLaneAt({value}, exec_lo == 0u ? 0u : uint(firstbitlow(exec_lo)))");
+            return self.ws(&d, &if index { format!("exec_lo == 0u ? 0u : {read}") } else { read });
         }
         if self.ex.stage == Stage::Mesh || (self.is_cs && compute_group(self.ex) == [1, 1, 1]) {
             return self.ws(&d, &value);
@@ -19,11 +37,12 @@ impl<'a> Emitter<'a> {
         }
         // Scalar writes reach every invocation. Select the first lane whose guest
         // EXEC bit is set, even when the executing host wave also has masked lanes.
-        let t = self.tmp;
-        self.tmp += 1;
         self.line("#if __SHADER_TARGET_MAJOR >= 6");
-        self.line(&format!("uint t{t} = WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu);"));
-        self.ws(&d, &format!("WaveReadLaneAt({value}, t{t} == 0xffffffffu ? 0u : t{t})"))?;
+        // The lane comes from a ballot (the first-lane minimum lost an NVIDIA device).
+        // A heap index read this way is 0 when the wave has no active lane.
+        let t = self.first_active_lane();
+        let read = format!("WaveReadLaneAt({value}, {t} == 0xffffffffu ? 0u : {t})");
+        self.ws(&d, &if index { format!("{t} == 0xffffffffu ? 0u : {read}") } else { read })?;
         self.line("#else");
         self.ws(&d, &value)?;
         self.line("#endif");

@@ -10,12 +10,13 @@ import subprocess
 import sys
 from contextlib import nullcontext
 
-from .backend_log import game_diagnostics
+from .backend_log import PROTON_APP_ID, game_diagnostics
 from .console_cbv import configure_console_cbv
 from .mangohud import performance_capture
 from .pipeline_profile import pipeline_capture
 from .runtime_shaders import runtime_shader_compiler
 from .shader_prep import SOURCE_CACHE
+from .vkd3d_cache import merge_pipeline_cache
 
 
 # The Proton distribution used when none is selected. Its dxil-spirv converts
@@ -32,6 +33,15 @@ OFFLINE_EXECUTABLES = ("game_scarlett_master.exe",)
 # about 5 GB, so nothing written later was found again. Keep each file small
 # enough to stay indexed.
 NVIDIA_CACHE_BYTES = 4 << 30
+
+# A launch starts a new cache file once the current one holds this much, which
+# leaves one launch 3 GiB before the file's 32-bit index is full.
+NVIDIA_CACHE_ROTATE_BYTES = 1 << 30
+NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)[0-9]")
+
+# Room for the driver's compiled shaders on Mesa (RADV, ANV, NVK). One
+# ProjectScarlett boot on RADV writes about 1.2 GB, over Mesa's 1 GB default.
+MESA_CACHE_SIZE = "4G"
 
 
 def requires_offline(executable):
@@ -322,6 +332,72 @@ def report_unindexed_nvidia_cache(cache, report):
                "while no game is running to let the driver start a new cache.")
 
 
+def rotate_nvidia_shader_cache(env, cache):
+    """Write this launch's pipelines to a file with room left, and read the others.
+
+    The driver's index addresses a cache file with 32-bit offsets, so a file
+    stops taking new pipelines at 4 GiB and every later launch compiles them
+    again. Each launch writes to a numbered file of TuxBox's own, starts the
+    next once that one holds NVIDIA_CACHE_ROTATE_BYTES, and has the driver read
+    every other file. Nothing is moved or deleted. Returns the name written and
+    how many files are only read, or None when the environment names its own.
+    """
+    if env.get("__GL_SHADER_DISK_CACHE_APP_NAME") or env.get("__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"):
+        return None
+    sizes = {}
+    try:
+        for blob in (Path(cache) / "GLCache").glob("*/*/*.bin"):
+            size = blob.stat().st_size
+            if size > NVIDIA_CACHE_HEADER and ";" not in blob.stem:
+                sizes[blob.stem] = max(size, sizes.get(blob.stem, 0))
+    except OSError:
+        return None
+    # The driver appends one digit to the name it is given, and can keep
+    # several such files: a ProjectScarlett launch filled the one ending in 2.
+    largest = {}
+    for name, size in sizes.items():
+        if match := NVIDIA_CACHE_FILE.fullmatch(name):
+            largest[int(match[1])] = max(size, largest.get(int(match[1]), 0))
+    number = max(largest, default=1)
+    if largest.get(number, 0) >= NVIDIA_CACHE_ROTATE_BYTES:
+        number += 1
+    older = sorted(name for name in sizes
+                   if not ((match := NVIDIA_CACHE_FILE.fullmatch(name)) and int(match[1]) == number))
+    env["__GL_SHADER_DISK_CACHE_APP_NAME"] = f"tuxbox{number}"
+    if older:
+        env["__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"] = ";".join(older)
+    return f"tuxbox{number}", len(older)
+
+
+def keep_nvidia_shader_cache(env):
+    """Stop NVIDIA's driver deleting an exported cache folder.
+
+    Without SKIP_CLEANUP, any process given the path checks the whole folder
+    against the default cap at startup. Past it, the driver deletes every file
+    that no running process holds, including the title's pipelines.
+    """
+    if env.get("__GL_SHADER_DISK_CACHE_PATH") and env.get("__GL_SHADER_DISK_CACHE") != "0":
+        env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
+        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+
+
+# glibc gives each busy thread its own arena, up to 8 per CPU, and a title
+# compiling pipelines on dozens of threads leaves free memory spread across all
+# of them. A ProjectScarlett launch with the defaults held 22.75 GiB in 371
+# arena heaps by 200 s; one with these reached its loading screen.
+GLIBC_MALLOC_LIMITS = {
+    "MALLOC_ARENA_MAX": "8",
+    "MALLOC_MMAP_THRESHOLD_": str(1 << 20),
+    "MALLOC_TRIM_THRESHOLD_": str(8 << 20),
+}
+
+
+def limit_malloc_growth(env):
+    """Bound what the C library keeps beyond what the title and driver use."""
+    for name, value in GLIBC_MALLOC_LIMITS.items():
+        env.setdefault(name, value)
+
+
 def configure_nvidia_shader_cache(env, report=None):
     """Keep this prefix's compiled GPU pipelines for the next launch.
 
@@ -338,8 +414,7 @@ def configure_nvidia_shader_cache(env, report=None):
         return
     explicit = env.get("__GL_SHADER_DISK_CACHE_PATH")
     if explicit:
-        env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
-        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+        keep_nvidia_shader_cache(env)
         if report:
             report(f"NVIDIA shader cache: {explicit} (path set by the environment)")
             report_unindexed_nvidia_cache(explicit, report)
@@ -361,9 +436,48 @@ def configure_nvidia_shader_cache(env, report=None):
     # The driver's default cap is far smaller than what one Scarlett boot
     # writes, so give this directory room of its own.
     env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(NVIDIA_CACHE_BYTES))
+    rotated = rotate_nvidia_shader_cache(env, cache)
     if report:
-        report(f"NVIDIA shader cache: {cache}")
-        report_unindexed_nvidia_cache(cache, report)
+        if rotated:
+            report(f"NVIDIA shader cache: {cache} (writing {rotated[0]}, also reading {rotated[1]} earlier files)")
+        else:
+            report(f"NVIDIA shader cache: {cache}")
+            report_unindexed_nvidia_cache(cache, report)
+
+
+def configure_mesa_shader_cache(env, report=None):
+    """Keep this prefix's compiled Mesa shaders for the next launch.
+
+    Mesa stores them in ~/.cache/mesa_shader_cache, shared by every program on
+    the desktop and capped at 1 GB. A desktop session's own GPU work then
+    evicts the title's shaders, and the next launch compiles them again, which
+    takes about half an hour for ProjectScarlett. A prefix-local directory is
+    the cache Steam gives each title. A disabled cache and an explicit
+    directory are kept; an explicit directory still gets room unless a size is
+    set.
+    """
+    if env.get("MESA_SHADER_CACHE_DISABLE", "").lower() in ("1", "true", "yes"):
+        return
+    explicit = env.get("MESA_SHADER_CACHE_DIR")
+    if explicit:
+        env.setdefault("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE)
+        if report:
+            report(f"Mesa shader cache: {explicit} (path set by the environment)")
+        return
+    prefix = env.get("WINEPREFIX")
+    if not prefix:
+        return
+    cache = Path(prefix) / "shadercache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if report:
+            report(f"Mesa shader cache stays in the default directory: {exc}")
+        return
+    env["MESA_SHADER_CACHE_DIR"] = str(cache)
+    env.setdefault("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE)
+    if report:
+        report(f"Mesa shader cache: {cache}")
 
 
 def configure_pipeline_cache(env, prefix):
@@ -404,7 +518,7 @@ class Host:
             if not (installation / "proton").is_file():
                 raise ValueError(f"Missing Proton distribution launcher in {installation}")
             tool = "umu-run"
-            self.env.update(PROTONPATH=str(installation), GAMEID="umu-default")
+            self.env.update(PROTONPATH=str(installation), GAMEID=f"umu-{PROTON_APP_ID}")
             version = installation / "version"
             self.version = version.read_text().strip() if version.is_file() else installation.name
             prefix_name = installation.name
@@ -427,6 +541,8 @@ class Host:
             seed_shader_cache(prefix, lambda line: print(f"tuxbox: {line}", file=sys.stderr))
         self.env["WINEPREFIX"] = str(prefix)
         configure_pipeline_cache(self.env, prefix)
+        # Before any GPU work, so Frosty's pipeline preparation fills the cache the title reads.
+        configure_mesa_shader_cache(self.env)
         self.command = [executable]
         if offline:
             self.isolate_network()
@@ -512,7 +628,9 @@ class Host:
                     log.status(f"The package is not mapped to G: because {drive} is not a drive link")
         try:
             if self.backend in ("proton", "wine"):
+                limit_malloc_growth(env)
                 configure_nvidia_shader_cache(env, log.status)
+                merge_pipeline_cache(env, executable, log.status)
             if "-nullrhi" not in (arg.lower() for arg in arguments):
                 configure_console_cbv(self.backend, env, executable, log.status)
             capture = performance_capture(self.backend, env, executable, log) if mangohud else nullcontext()

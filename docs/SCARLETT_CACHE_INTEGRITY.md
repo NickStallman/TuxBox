@@ -32,11 +32,50 @@ parallel execution and completion-order progress, and keep the
 existing sorted source list. This bounds Future/task allocation,
 not total process memory or DXC working sets.
 
+## Runtime caches of several compiler builds
+
+The runtime cache directory is named after the compiler fingerprint, so
+each branch build gets its own and switching back is a warm hit. Nothing
+removed a cache whose build was gone: after one branch hop the prefix in
+use held two of them, 706 MB and 1.4 GB. Request keys carry no
+translator version, so two builds hold the same keys and can refuse the
+same key for different reasons. Every reader of
+tuxbox_shader_cache/runtime merged both directories, which reported 40
+pipelines (6.1 % of 658 not delivered) as "conflicting refusal reasons"
+and hid six real lane-read refusals behind them. Merging was the fault,
+not the older cache: deleting the directory would have hidden it for one
+run and brought it back at the next branch hop.
+
+Keep the running build's cache and the two most recently used others.
+The launcher claims its cache with a shared flock on `in-use` in the
+fingerprint directory for the life of the process, so launchers of one
+build use it together. Retention never removes a cache another process
+holds, so two branches can compile at once and the next launch trims
+what is left. Prelaunch preparation and the live worker run in one
+process and share one claim. `last-used` records when each
+cache ran, because rewriting a file inside a directory moves that
+directory's timestamp as well; a cache from before the marker sorts by
+its directory time. A directory that cannot be removed fails that one
+removal and leaves the launch alone.
+
+rank_pipeline_failures.py ranks the newest runtime cache by default and
+merges every cache only when --all-runtime-caches is given.
+
 ## Validation
 
 239 Python tests pass, including corrupt/wrong-stage cache entries,
 cold stage mismatch, FIFO/symlink/oversized input, concurrent same-key
 publication, unrelated-key progress, lock release, and bounded queue.
+The retention change above is covered by 463 Python tests (27 skipped by
+platform), including LRU eviction, a current cache kept while oldest, a
+cache held by another launcher kept, directory-time fallback without a
+marker, one claim shared by preparation and the live worker, and the
+ranking tool ignoring an older build's reasons. `check --no-gpu` passed
+all six gates. On the ProjectScarlett prefix measured that day, with the
+older 706 MB cache still on disk, the ranking read 658 pipelines with 0
+conflicts where merging both caches read 40; --all-runtime-caches still
+reproduces the merge. Host was RADV on 1002:7480 (RX 7600); no NVIDIA run
+and no game launch.
 The existing mock fixture had incorrectly returned a pixel shader for
 a geometry profile; correct its stage and align the mock DXIL words.
 

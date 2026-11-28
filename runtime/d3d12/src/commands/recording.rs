@@ -526,7 +526,11 @@ impl Recording {
             return;
         }
         if self.bindings.scene_root().is_none() {
-            dispatch();
+            match self.bindings.split_root.clone() {
+                // A split dispatch extends the bound root (see `compute::record_split_dispatch`).
+                Some(root) => unsafe { self.bindings.dispatch_with_root(&self.active.native, &root, dispatch) },
+                None => dispatch(),
+            }
             return;
         }
         let result = self.inline_scenes(list).map(|(vas, geometry)| {

@@ -6,9 +6,8 @@ import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
-from xml.etree import ElementTree as ET
 
-from project_tuxbox.progress_map import render_map, shader_table
+from project_tuxbox.progress_map import shader_table
 from project_tuxbox.shader_inventory import ENTRY, MAP, TITLE, inventory, parse_tables, use_frontend_survey
 from project_tuxbox.inspect import digest
 
@@ -108,8 +107,6 @@ class ShaderInventoryTests(unittest.TestCase):
             evidence = root / "evidence/matrix-awakens"
             evidence.mkdir(parents=True)
             (evidence / "shader-inventory.json").write_text(json.dumps(result))
-            svg = ET.fromstring(render_map(evidence.parent))
-            self.assertIn("RDNA 2 shader translation", [e.text for e in svg.findall(".//{*}text")])
             self.assertIn(absent, shader_table(evidence.parent))
 
     def test_mesh_pipeline_counts_require_matching_archive_and_compiler(self):

@@ -21,10 +21,32 @@ from tools.frosty_gpu_guest import run_gpu_guest
 
 SRC = ROOT / "tools/reference/mesh"
 COUNTS = (3, 67, 128, 0, 129)
-CASES = tuple(f"{name}-{count}" for count in COUNTS for name in ("plain", "swizzle")) + ("bad-index", "half-3", "half-67", "half-128")
+CASES = tuple(f"{name}-{count}" for count in COUNTS for name in ("plain", "swizzle")) + ("bad-index", "half-3", "half-67", "half-128",
+                                                                                         "loop-3", "loop-67", "loop-128")
+
+# The two 64-lane waves of a group run a loop over remaining lanes 1 and 9
+# times. Its exit votes over the wave, and on a 32-lane host that vote meets
+# the whole group at barriers. A wrong count moves the triangle off the grid.
+# The VCC branch, never taken, makes the translation vote over guest waves.
+LOOP = """v_cmp_lt_u32 vcc, 0x3ff, v1
+s_cbranch_vccnz 1
+s_nop 0
+s_lshl_b32 s46, s1, 3
+s_mov_b32 s47, 0
+s_mov_b64 s[44:45], exec
+s_add_u32 s47, s47, 1
+s_cmp_gt_u32 s47, s46
+s_cselect_b64 vcc, exec, 0
+s_andn2_b64 s[44:45], s[44:45], vcc
+s_cbranch_scc1 -5
+s_sub_u32 s48, s47, s46
+s_cmp_eq_u32 s48, 1
+s_cselect_b32 s49, 0, 2.0
+v_add_f32 v21, s49, v21
+s_cmp_eq_u32 s20, 0"""
 
 
-def program(count, swizzle=False, bad_index=False, half=False):
+def program(count, swizzle=False, bad_index=False, half=False, loop=False):
     first = {67: 64, 128: 125}.get(count, 0)
     src = (SRC / "translated_shared_count.s").read_text()
     src = "\n".join(line for line in src.splitlines() if not line.startswith("//"))
@@ -50,6 +72,8 @@ def program(count, swizzle=False, bad_index=False, half=False):
             "v_cvt_f32_f16 v7, v7\ns_mov_b64 exec, s[44:45]\n"
             "s_cmp_eq_u32 s20, 0")
         src = src.replace("exp pos0 v21,v22,v23,v24 done", "exp pos0 v7,v22,v23,v24 done")
+    if loop:
+        src = src.replace("s_cmp_eq_u32 s20, 0", LOOP)
     return src + "\n"
 
 
@@ -105,7 +129,8 @@ def main():
             bad = case == "bad-index"
             count = 3 if bad else int(case.split("-")[1])
             source = trial / (case + ".dxbc")
-            source.write_bytes(shader(assemble(a.llvm_mc, program(count, case.startswith("swizzle"), bad, case.startswith("half")))))
+            source.write_bytes(shader(assemble(a.llvm_mc, program(count, case.startswith("swizzle"), bad, case.startswith("half"),
+                                                                  case.startswith("loop")))))
             hlsl = trial / (case + ".hlsl")
             profile = trial / (case + ".profile")
             dxil = trial / (case + ".cso")

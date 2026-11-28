@@ -75,7 +75,7 @@ fn instrument(hlsl: &str, lanes: u32, end_marker: &str, result_reg: &str) -> Str
 
 fn main() {
     let case = std::env::args().nth(1).expect("case name");
-    let mixed_lane = matches!(case.as_str(), "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec");
+    let mixed_lane = matches!(case.as_str(), "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec" | "wave32_mixed_lds_dpp_11");
     let (group, words, result_reg, expect_wave32): ([u32; 3], Vec<u32>, &str, bool) = match case.as_str() {
         "wave32_active_0" => {
             let [r0, r1] = readlane(7, 1, 0);
@@ -275,8 +275,8 @@ fn main() {
         }
         "wave64_swizzle_branch_dyn_63" => {
             // Wave64 [64, 1, 1] ds_swizzle_b32 + dynamic SGPR v_readlane_b32 inside a forward
-            // s_cbranch_execz skip branch where lane 63 skips the readlane.
-            // Active lanes 0..62 MUST receive lane 63's original pre-mask v1 (not 0).
+            // s_cbranch_execz skip branch that lane 63 is not active for.
+            // Every lane MUST receive lane 63's original pre-mask v1 (not 0) in s7.
             let [r0, r1] = readlane_sgpr(7, 1, 5);
             (
                 [64, 1, 1],
@@ -336,15 +336,36 @@ fn main() {
                 false,
             )
         }
-        "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec" => {
+        "wave32_mixed_dynamic_11" | "wave32_mixed_empty_exec" | "wave32_mixed_lds_dpp_11" => {
             // Assemble for gfx1030 wave32. Flatten the 2D group, seed v9 with
             // distinct values, and let the first active lane choose (12 + 63)
             // & 31 = 11. The read and write both see lane 11 with EXEC clear.
             // The empty-mask case must skip the lane write and keep s7.
-            let threshold = if case == "wave32_mixed_dynamic_11" { 12 } else { 32 };
+            let threshold = if case == "wave32_mixed_empty_exec" { 32 } else { 12 };
+            // The LDS and DPP case then gives every lane its neighbour's v6 through
+            // group memory and a quad permute, and long-jumps over a move that would
+            // clear the result: v15 = v6 ^ (lds << 1) ^ (dpp << 2).
+            let extra: &[u32] = if case == "wave32_mixed_lds_dpp_11" { &[
+                0x3414_0882,              // v_lshlrev_b32 v10, 2, v4
+                0xd834_0000, 0x0000_060a, // ds_write_b32 v10, v6
+                0x3a16_1484,              // v_xor_b32 v11, 4, v10
+                0xbf8c_c07f,              // s_waitcnt lgkmcnt(0)
+                0xd8d8_0000, 0x0c00_000b, // ds_read_b32 v12, v11
+                0x7e1a_02fa, 0xff0c_b106, // v_mov_b32_dpp v13, v6 quad_perm:[1,0,3,2] bound_ctrl:1 fi:1
+                0xbf8c_c07f,              // s_waitcnt lgkmcnt(0)
+                0x3418_1881,              // v_lshlrev_b32 v12, 1, v12
+                0x341a_1a82,              // v_lshlrev_b32 v13, 2, v13
+                0x3a1e_1b0c,              // v_xor_b32 v15, v12, v13
+                0xbe94_1f00,              // s_getpc_b64 s[20:21]
+                0x8014_9014,              // s_add_u32 s20, s20, 16
+                0x8215_8015,              // s_addc_u32 s21, s21, 0
+                0xbe80_2014,              // s_setpc_b64 s[20:21]
+                0x7e1e_0280,              // v_mov_b32 v15, 0 (jumped over)
+                0x3a1e_0d0f,              // v_xor_b32 v15, v15, v6
+            ] } else { &[] };
             (
                 [8, 4, 1],
-                vec![
+                [vec![
                     0x3408_0283,             // v_lshlrev_b32 v4, 3, v1
                     0x3808_0900,             // v_or_b32 v4, v0, v4
                     0x4a12_0891,             // v_add_nc_u32 v9, 17, v4
@@ -359,9 +380,8 @@ fn main() {
                     0xd760_0007, 0x0200_0f09, // v_readlane_b32 s7, v9, s7
                     0xbefe_0304,             // done: s_mov_b32 exec_lo, s4
                     0x3a0c_1207,             // v_xor_b32 v6, s7, v9
-                    0xbf81_0000,             // s_endpgm
-                ],
-                "v6",
+                ], extra.to_vec(), vec![0xbf81_0000]].concat(), // s_endpgm
+                if extra.is_empty() { "v6" } else { "v15" },
                 true,
             )
         }
@@ -374,6 +394,9 @@ fn main() {
     if check_wave {
         if expect_wave32 {
             assert_eq!(tr.required_wave_size, Some(32), "{case} must use WaveSize(32)");
+        } else if case == "wave64_swizzle_branch_dyn_63" {
+            // Its EXECZ branch is decided by the whole wave, which needs the guest's width.
+            assert_eq!(tr.required_wave_size, Some(64), "{case} must use WaveSize(64)");
         } else {
             assert_eq!(tr.required_wave_size, None, "{case} must be portable (no WaveSize)");
         }

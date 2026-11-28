@@ -7,7 +7,14 @@ import struct
 import tempfile
 
 from project_tuxbox.verify import (
-    lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem, xauthority_entry)
+    _xwayland, guid_receipt, lanes_imports, missing_provider_imports, private_x_server, screen_capture_problem,
+    splash_skip_reason, xauthority_entry)
+
+
+class SplashSkipTests(unittest.TestCase):
+    def test_only_software_presentation_skips_the_splash(self):
+        self.assertIsNone(splash_skip_reason({}))
+        self.assertIn("software", splash_skip_reason({"MESA_VK_WSI_DEBUG": "sw"}))
 
 
 class PrivateXServerTests(unittest.TestCase):
@@ -76,6 +83,19 @@ class PrivateXServerTests(unittest.TestCase):
                 self.assertEqual(server[2], {})
             probe.assert_not_called()
         self.assertEqual(started, [()])
+
+    def test_xwayland_keeps_out_of_the_guest_driver_cache(self):
+        # With the guest's cache path and the driver's default cleanup, the server's
+        # own driver deletes every unlocked file there once the folder passes its cap.
+        environment = {"WAYLAND_DISPLAY": "wayland-0", "__GL_SHADER_DISK_CACHE_PATH": "/caches/nv",
+                       "__GL_SHADER_DISK_CACHE_SIZE": "4294967296"}
+        with mock.patch.dict("project_tuxbox.verify.os.environ", environment, clear=True), \
+             mock.patch("project_tuxbox.verify.subprocess.Popen") as start:
+            with _xwayland("/usr/bin/Xwayland", 5, "/tmp/auth", "640x480", 0) as server:
+                self.assertIsNone(server)
+        passed = start.call_args.kwargs["env"]
+        self.assertNotIn("__GL_SHADER_DISK_CACHE_PATH", passed)
+        self.assertEqual(passed["WAYLAND_DISPLAY"], "wayland-0")
 
 class ScreenCaptureTests(unittest.TestCase):
     def test_only_an_x_display_on_linux_is_probed(self):
@@ -146,6 +166,20 @@ class ProviderImportTests(unittest.TestCase):
                 missing_provider_imports(modules, Path("xmem.dll"), ("XMemAllocDefault", "XMemFreeDefault")),
                 ["XMemAllocDefault", "XMemFreeDefault"])
         self.assertEqual(missing_provider_imports(modules, Path("GameInput.dll"), ("#1",)), ["#1"])
+
+
+class GuidReceiptTests(unittest.TestCase):
+    def test_named_identifier_imports_are_counted(self):
+        modules = [{"module": "d3d12_xs.dll", "symbols": ["IID_ID3D12Device", "WKPDID_D3DDebugObjectName",
+                                                          "D3D12XboxCreateDevice"]}]
+        self.assertEqual(guid_receipt(modules, Path("d3d12_xs.dll")), "d3d12-guids PASS identifiers=2 bytes=32")
+
+    def test_identifiers_imported_by_ordinal_resolve_against_the_provider(self):
+        # MSVC's link.exe imports the identifiers by ordinal; lld-link and MinGW import them by name.
+        modules = [{"module": "D3D12_XS.DLL", "symbols": ["#23", "#54", "#7"]}]
+        table = ({23: {"IID_ID3D12Device"}, 54: {"WKPDID_D3DDebugObjectName"}, 7: {"D3D12XboxCreateDevice"}}, set())
+        with mock.patch("project_tuxbox.verify.export_table", return_value=table):
+            self.assertEqual(guid_receipt(modules, Path("d3d12_xs.dll")), "d3d12-guids PASS identifiers=2 bytes=32")
 
 
 class MeshWorkerReceiptTests(unittest.TestCase):

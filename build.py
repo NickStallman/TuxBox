@@ -4,9 +4,11 @@ import functools
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 
 ROOT = Path(__file__).resolve().parent
@@ -76,6 +78,15 @@ class Toolchain:
                         *flags, f"/out:{output.name}", *self.libraries, *inputs],
                        cwd=output.parent, check=True)
         print(output, flush=True)
+
+
+def solid_png(width, height, rgb):
+    """An 8-bit RGB PNG of one colour."""
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = (b"\0" + bytes(rgb) * width) * height
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
 DXC_HELP = ("Use a Microsoft DXC release: set DXC (or pass --dxc PATH to build.py). "
@@ -273,9 +284,20 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         rgb10 = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_RGB10")
         tools.link(out / "xbox-frame-rgb10.exe", rgb10, display, "d3d12_xs.lib", "dxgi.lib",
                    "user32.lib", "gdi32.lib", "kernel32.lib")
+        planes = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_PLANES")
+        tools.link(out / "xbox-frame-planes.exe", planes, display, "d3d12_xs.lib", "dxgi.lib",
+                   "user32.lib", "gdi32.lib", "kernel32.lib")
         size = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_RGB10", "/DGUEST_FRAME_4K")
         tools.link(out / "xbox-frame-4k.exe", size, display, "d3d12_xs.lib", "dxgi.lib",
                    "user32.lib", "gdi32.lib", "kernel32.lib")
+        # The package splash the 4K guest's splash mode expects beside it
+        # (frame_present.cpp): a 64x36 image on a declared background.
+        splash = out / "splash"
+        splash.mkdir(exist_ok=True)
+        (splash / "MicrosoftGame.Config").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n<!-- Synthetic package splash fixture for Project TuxBox. -->\n'
+            '<Game configVersion="1">\n  <ShellVisuals SplashScreenImage="splash.png" BackgroundColor="#5A1E78"/>\n</Game>\n')
+        (splash / "splash.png").write_bytes(solid_png(64, 36, (0x30, 0xc0, 0x90)))
         negative = tools.compile(src / "frame_negative.cpp", out, "/W4", "/WX")
         tools.link(out / "xbox-frame-negative.exe", negative, "d3d12_xs.lib", "dxgi.lib", "kernel32.lib")
         for shader, entry, profile, header, variable in (

@@ -90,3 +90,70 @@ fn group_shared_accesses_are_checked_against_the_declared_size() {
     }
     assert!(checked > 0, "no host profile translated the shared-memory program");
 }
+
+/// A group of 32 threads fills lanes 0..32 of one console wave. A sum over the
+/// whole wave reads the lanes that never start, so each host thread keeps one.
+#[test]
+fn a_group_of_32_threads_runs_as_the_lower_half_of_a_console_wave() {
+    let &(_, _, words) = programs::PROGRAMS.iter().find(|program| program.0 == "lane-sum-half-wave").unwrap();
+    for translated in [translate(&program(32, words)), translate_for_wave32_host(&program(32, words))] {
+        let translated = translated.unwrap();
+        assert_eq!(translated.required_wave_size, Some(32));
+        let hlsl = &translated.hlsl;
+        assert!(hlsl.contains("[WaveSize(32)]\n[numthreads(32, 1, 1)]"), "{hlsl}");
+        // The upper lanes start outside EXEC and are read as lanes of their own.
+        assert!(hlsl.contains("exec_lo = 0xffffffffu, exec_hi = 0u,"), "{hlsl}");
+        assert!(hlsl.contains("WaveReadLaneAt(v2__[1], tb_leader - 32u)"), "{hlsl}");
+    }
+    // Other incomplete waves have no host wave that holds exactly their lanes.
+    for threads in [16, 48, 96] {
+        assert_eq!(translate(&program(threads, words)).map(|t| t.hlsl).unwrap_err(),
+            "wave operation requires complete 64-lane compute waves");
+    }
+    // A whole wave keeps its two-lane form: every lane starts active.
+    let whole = translate_paired_wave64(&program(64, words)).unwrap().hlsl;
+    assert!(whole.contains("[numthreads(32, 1, 1)]") && whole.contains("exec_hi = 0xffffffffu,"), "{whole}");
+}
+
+/// `v_permlanex16_b32 v4, v3, -1, -1` with rows 1 and 3 active, as a prefix sum
+/// over a wave hands each row's total to the next:
+/// s_or_saveexec_b64 s[10:11], -1; s_mov_b32 exec_lo, 0xffff0000; s_mov_b32 exec_hi, 0xffff0000;
+/// the permute; s_mov_b64 exec, s[10:11].
+fn row_permute(op_sel: u32) -> ShaderExtract {
+    program(64, &[0xbe8a25c1, 0xbefe03ff, 0xffff0000, 0xbeff03ff, 0xffff0000, 0xd7780004 | op_sel << 11, 0x03058303,
+        0xbefe040a, 0xbf810000])
+}
+
+#[test]
+fn a_row_permute_treats_an_inactive_source_as_its_modifiers_say() {
+    let hlsl = |op_sel| translate_paired_wave64(&row_permute(op_sel)).map(|t| t.hlsl);
+    // Neither modifier: the destination keeps its value.
+    assert!(hlsl(0).unwrap().contains(" && (((tb_from0 < 32u ? exec_lo : exec_hi) >> (tb_from0 & 31u)) & 1u) != 0u) v4__[0] = tbp_0;"));
+    // Fetch inactive, with and without the bit the console compiler also sets.
+    for op_sel in [1, 9] {
+        let hlsl = hlsl(op_sel).unwrap();
+        assert!(hlsl.contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v4__[0] = tbp_0;"), "{hlsl}");
+        assert!(hlsl.contains("if (((exec_hi >> tb_pair) & 1u) != 0u) v4__[1] = tbp_1;"), "{hlsl}");
+    }
+    // Bound control: an inactive source supplies zero.
+    assert!(hlsl(2).unwrap().contains(" != 0u ? tbp_1 : 0u;"));
+    // Fetch inactive wins over bound control.
+    assert!(hlsl(3).unwrap().contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v4__[0] = tbp_0;"));
+    assert_eq!(hlsl(4).unwrap_err(), "paired wave64: permlane modifiers [v_permlanex16_b32 @ 0x14]");
+}
+
+/// s_mov_b32 m0, s20; v_movrels_b32 v10, v20; v_movreld_b32 v24, v0; v_movrelsd_b32 v30, v20.
+#[test]
+fn register_relative_moves_index_one_table_of_lane_pairs() {
+    let hlsl = translate_paired_wave64(&program(64, &[0xbefc0314, 0x7e148714, 0x7e308500, 0x7e3c8914, 0xbf810000])).unwrap().hlsl;
+    assert!(hlsl.contains("uint tb_v[256][2] = (uint[256][2])0;") && hlsl.contains("#define v10__ tb_v[10]"), "{hlsl}");
+    // Source plus M0, destination plus M0, and both.
+    assert!(hlsl.contains("uint tbr_1 = tb_v[(20u + m0) & 255u][1];"), "{hlsl}");
+    assert!(hlsl.contains("if (((exec_lo >> tb_pair) & 1u) != 0u) v10__[0] = tbr_0;"), "{hlsl}");
+    assert!(hlsl.contains("uint tbr_0 = v0__[0];"), "{hlsl}");
+    assert!(hlsl.contains("if (((exec_hi >> tb_pair) & 1u) != 0u) tb_v[(24u + m0) & 255u][1] = tbr_1;"), "{hlsl}");
+    assert!(hlsl.contains("tb_v[(30u + m0) & 255u][0] = tbr_0;"), "{hlsl}");
+    // A program without such a move keeps separate registers.
+    let plain = translate_paired_wave64(&program(64, &[0x7e140300, 0xbf810000])).unwrap().hlsl;
+    assert!(!plain.contains("tb_v"), "{plain}");
+}

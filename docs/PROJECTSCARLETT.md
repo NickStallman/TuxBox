@@ -218,29 +218,39 @@ matched across configurations. See `--help` for reproduction arguments and
 
 
 
-### Experimental persistent DXC
+### DXC helper
 
-On Linux, build the helper against the same Microsoft DXC release used by
-TuxBox. Set `DXC_ROOT` to the extracted release directory.
+On Linux, launch-time preparation and the live worker compile through a small
+helper, `tools/dxc_worker.cpp`. It runs DXC's own stages and passes, except
+correlated value propagation, which takes about a quarter of DXC's time on
+translated programs and changes very little in them. On 1,500 recorded
+ProjectScarlett requests, 16 at a time, a cold compile took 51 s instead of
+60 s.
 
-```sh
-mkdir -p build
-c++ -std=c++17 -O2 -isystem "$DXC_ROOT/include" tools/dxc_worker.cpp \
-    -L "$DXC_ROOT/lib" -ldxcompiler -o build/dxc-worker
-export TUXBOX_PERSISTENT_DXC="$PWD/build/dxc-worker"
-```
+The launcher builds the helper into `build/dxc-helper` the first time it is
+needed. That takes a C++ compiler and a Microsoft DXC 1.9.2609 release with
+its headers and library, as the staged toolchain has. Without them, or with
+another release, the launcher says why and uses the `dxc` command line. Set
+`TUXBOX_PERSISTENT_DXC=0` to always use the command line, or give it the path
+of a helper you built.
 
-The live worker starts helpers on demand for optimized `cs_6_0` requests.
+The helper's output differs from the command line's in two ways besides the
+skipped pass. It keeps resource and value names that `dxc` strips, so the
+files are about 38% larger, and its container digest is left empty. DXC's
+first stage does not hand a program's `[WaveSize]` to the later passes, so
+the helper writes it back.
+
 Each helper handles one request at a time and stays open for the session.
 The worker retries once if a helper exits during compilation and falls
-back to the CLI if the helper or validation fails. Each newly compiled
-result still passes DXV before publication. The CLI handles other profiles
-and slow requests. The experimental cache identity includes the helper
-binary. Unset `TUXBOX_PERSISTENT_DXC` to use the default CLI.
+back to the command line if the helper cannot build a program or validation
+fails. A compile that runs out of time is treated as a slow command line
+compile. Each newly compiled result still passes DXV before publication. `-O0`
+compiles always use the command line. The cache identity includes the helper
+binary, so turning it on or off compiles into a separate cache.
 
 For a synthetic comparison, run the worker benchmark described above
-with `--jobs 4` and add `--dxc-helper build/dxc-worker` for the experimental
-variant. Give each run a fresh output path. Compare per-request SHA-256
+with `--jobs 4` and add `--dxc-helper` with the built helper's path for the
+second run. Give each run a fresh output path. Compare per-request SHA-256
 values and latency.
 
 ## Prepare shaders after an update
@@ -877,3 +887,55 @@ unless the staged file matches the local build. This does not rebuild or
 replace a DLL, prove which source revision produced the local build, or
 inspect modules actually loaded by Wine. Record the build revision and
 driver separately.
+
+### Identify a slow slot-62 compute pipeline request
+
+With diagnostic logging enabled, slow `CreatePipelineState #N CS ...`
+messages include `request=<key> bytes=<size>`. The short CS hash still
+identifies the original guest program, while the full request key names
+the actual selected translation (`<key>.cso` in the shader cache), including
+a root-specific request or its `_w32` variant. `request=original` means the
+original bytecode was passed to the host, not a translated cache entry.
+Set `TUXBOX_TRACE_PIPELINE_REQUESTS=1` to also record starts and finishes of
+short attempts. The identifier after `#` is local to the process.
+Times include any compile-slot wait and the host pipeline call; they do not
+isolate the driver. This currently covers the Xbox slot-62 compute factory,
+not all graphics or pipeline-stream paths. Share keys and sizes only, not
+title shader files or private raw logs.
+
+
+To test the memory-pressure hypothesis in issue #231, sample the actual
+guest process (not the UMU parent) during the cold launch:
+
+```sh
+python tools/sample_process_cpu.py PID --seconds 300 --interval 1 --output cold-memory.jsonl
+```
+
+The samples share the existing UTC nanosecond timestamp and include host
+available RAM, total/free/used swap, guest RSS, peak RSS and guest swap in
+KiB. Missing fields are null. Compare timestamps with the pipeline log;
+neither a large swap value nor a slow pipeline alone establishes causation.
+The sampler does not attribute host memory to individual driver threads.
+Keep detailed samples local; share aggregate memory observations.
+
+### Investigating compute loop guards after a device loss
+
+Compare the exact same recorded requests against two xshader builds without
+executing title programs or modifying a cache:
+
+```sh
+python tools/audit_shader_guards.py REQUESTS --baseline OLD_XSHADER --candidate NEW_XSHADER --json guard-summary.json
+```
+
+This reports the number of compute translations with the generic structured
+loop guard (65,536) or block dispatcher guard (1,000,000), including newly
+admitted compute programs. It also counts dispatchers without that generic
+guard, and persistent PC-range dispatchers separately. The range check is
+not an iteration limit. The report includes aggregate before/after shape
+transitions, including existing compute translations that gain or lose a
+generic guard. Both emitters use private digest-verified
+copies of each input, with the original request mode (including `.wave32`).
+Use `--select` with an exact local worklist, or `--include-keys` for local
+per-request attribution. The default report omits request keys and paths.
+These are static emitted sites, not executed iterations, timing or evidence
+that a particular loop caused a GPU fault. Keep per-request reports private.

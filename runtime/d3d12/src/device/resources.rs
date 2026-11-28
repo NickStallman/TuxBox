@@ -382,6 +382,9 @@ pub(super) unsafe extern "system" fn create_resource<const EXTENDED: bool>(
     } {
         return error.code();
     }
+    if let Some(native) = native.as_ref() {
+        heap::mark_committed(native, flags);
+    }
     if linear_readback {
         return unsafe { depth::wrap::<true>(this, heap, desc, None, initial, native, out) };
     }

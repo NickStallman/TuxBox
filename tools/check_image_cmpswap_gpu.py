@@ -141,7 +141,7 @@ def main(argv=None):
             source = trial / f"{name}.hlsl"
             source.write_text(instrument(emitted))
             blob = trial / f"{name}.cso"
-            subprocess.run([args.dxc, "-T", "cs_6_0", "-E", "main", "-Fo", blob, source], check=True, timeout=30,
+            subprocess.run([args.dxc, "-T", "cs_6_6", "-E", "main", "-Fo", blob, source], check=True, timeout=30,
                            capture_output=True)
             subprocess.run([args.dxv, blob], check=True, timeout=30, capture_output=True)
             shaders[name] = dict(hlsl_sha256=digest(source), dxil_sha256=digest(blob))

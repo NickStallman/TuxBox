@@ -1,6 +1,6 @@
 # Where to improve
 
-Open areas that need work, with what is known and a useful next step. [Progress](PROGRESS.md) records what works today. If you start on one, say so in an issue so effort isn't doubled. Measurements below are from ProjectScarlett 1.0.2.1 on a Ryzen with 16 threads, 32 GB of memory and an RTX 4070 Ti SUPER, unless noted.
+Open areas that need work, with what is known and a useful next step. [Progress](PROGRESS.md) records what works today. If you start on one, say so in an issue so effort isn't doubled. The [roadmap](ROADMAP.md) breaks shader translation and a project-wide audit into numbered tasks. Measurements below are from ProjectScarlett 1.0.2.1 on a Ryzen with 16 threads, 32 GB of memory and an RTX 4070 Ti SUPER, unless noted.
 
 ## Memory
 

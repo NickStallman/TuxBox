@@ -41,9 +41,13 @@ impl<'a> Emitter<'a> {
             // Dataflow key of a scalar location: SGPR number, or 1000+ for a lane-spill slot.
             let sg = |o: &Opnd| match o {
                 Opnd::Sgpr(n) => Some(*n as u16),
+                Opnd::VccLo => Some(106),
+                Opnd::VccHi => Some(107),
                 Opnd::Temp(n) if *n >= LANE_TEMP_BASE => Some(1000 + (*n - LANE_TEMP_BASE)),
                 _ => None,
             };
+            self.step_texture_size(insns, idx, sym)?;
+            self.note_buffer_count(insns, idx, sym);
             if self.mesh_bindings.is_some() && ins.mnemonic != "v_nop" {
                 for (i, source) in ins.src.iter().enumerate() {
                     let Some(Sym::MeshRawAddress { word, .. }) = sg(source).and_then(|s| sym.get(&s)) else {
@@ -229,6 +233,16 @@ impl<'a> Emitter<'a> {
                         sym.insert(2000 + *v as u16, heap_value.unwrap());
                     }
                 }
+                // A word of a heap descriptor copied to every active lane. The read that
+                // `descriptor_broadcast` proved returns this copy brings it back.
+                Enc::Vop1 if self.descriptor_copies.contains(&idx) => {
+                    if let (Some(Opnd::Vgpr(v)), Some(source)) = (ins.dst.first(), ins.src.first().and_then(sg)) {
+                        match sym.get(&source).copied().filter(|s| broadcast_word(*s)) {
+                            Some(word) => sym.insert(2000 + *v as u16, word),
+                            None => sym.remove(&(2000 + *v as u16)),
+                        };
+                    }
+                }
                 Enc::Vop2 | Enc::Vop3
                     if matches!(ins.mnemonic.as_str(), "v_add_co_u32" | "v_add_nc_u32")
                         && ins.src.iter().any(|o| sg(o).map(|s| sym.get(&s) == Some(&Sym::Code)).unwrap_or(false)) =>
@@ -244,8 +258,19 @@ impl<'a> Emitter<'a> {
                             .filter(|s| matches!(s, Sym::HeapOffset | Sym::HeapSamplerOffset)),
                         _ => None,
                     };
+                    let word = match ins.src.first() {
+                        Some(Opnd::Vgpr(v)) if self.descriptor_reads.contains(&idx) => sym.get(&(2000 + *v as u16)).copied()
+                            .filter(|s| broadcast_word(*s)),
+                        _ => None,
+                    };
+                    // Judged again on each visit: the last one sees the block's final state.
+                    if matches!(word, Some(Sym::HeapDescriptor(..) | Sym::HeapSamplerIndex(_))) {
+                        self.heap_index_reads.insert(idx);
+                    } else {
+                        self.heap_index_reads.remove(&idx);
+                    }
                     if let Some(d) = ins.dst.first().and_then(sg) {
-                        if let Some(heap) = heap {
+                        if let Some(heap) = heap.or(word) {
                             // readfirstlane copies one lane's byte offset into an SGPR.
                             // Later uses index ResourceDescriptorHeap[sN]: the SGPR is
                             // uniform until something writes it, which rebinds the handle.
@@ -307,6 +332,15 @@ impl<'a> Emitter<'a> {
                             ))
                         }
                     };
+                    // A root descriptor's address is not a table pointer: a load
+                    // through it reads the buffer's own words, and treating it as
+                    // a descriptor fetch would leave the destination unwritten.
+                    if root_address_sgprs(self.ex).contains(&table) {
+                        return Err(format!(
+                            "s_load at {:#x}: base s{table} is a root descriptor address, not a table pointer",
+                            ins.offset
+                        ));
+                    }
                     if (ins.raw.get(1).copied().unwrap_or(0) >> 25) != 0x7d {
                         let soff = (ins.raw[1] >> 25) as u16;
                         // A pixel wave includes helper lanes, which host wave intrinsics skip:
@@ -393,6 +427,11 @@ impl<'a> Emitter<'a> {
                         self.dsel_loads.insert(idx, (d, ((table as u32) << 24) | off));
                         written.insert(d + k as u16);
                     }
+                }
+                // Only the loads read a descriptor. Scratch loads, cache controls,
+                // timers and probes share the encoding.
+                Enc::Smem if !(8..=12).contains(&ins.op) => {
+                    return Err(format!("unsupported scalar memory instruction at {:#x}", ins.offset));
                 }
                 Enc::Smem => {
                     let n = 1u32 << (ins.op - 8);
@@ -661,4 +700,11 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
+}
+
+/// A descriptor word a proven waterfall copy carries to its read: one fetched at a
+/// run-time heap index, or one loaded from a table at a known offset. The read is
+/// a word of the same descriptor only if every copy reaching it held that word.
+fn broadcast_word(s: Sym) -> bool {
+    heap_origins::tracked(s) || matches!(s, Sym::Desc { .. })
 }

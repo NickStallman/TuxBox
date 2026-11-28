@@ -72,7 +72,7 @@ python tuxbox.py check --proton PROTON --prefix PREFIX --windows-dxc DXC/bin/x64
 
 A change to what the translator emits for 64-lane programs also shows in a [recorded set of outputs](tools/shader-compiler/src/tests/hlsl/host_profiles.txt) for each [host profile](docs/USAGE.md#host-profile). The test names the profile affected. Include the updated record, and say in the pull request why that profile changed.
 
-With the same options it runs the [shader translator checks](tools/check_translator_gpu.py): synthetic console programs translated, run on the GPU and compared word for word with a reference model. They also need `llvm-mc` from LLVM. When you add or fix an instruction, add it to one of these checks.
+With the same options it runs the [shader translator checks](tools/check_translator_gpu.py): synthetic console programs translated, run on the GPU and compared word for word with a reference model. They also need `llvm-mc` from LLVM. When you add or fix an instruction, add it to one of these checks. The [shader harness](docs/SHADER_HARNESS.md) compares a translator change with `main` over recorded shaders, runs these checks on each card and lists instructions that no check covers.
 
 Put the commands you ran, their results, and your GPU, driver and backend in the pull request. Pass `--backend`, `--proton`, `--prefix` or `--adapter` as for `tuxbox.py run`. Results are saved in `build/check/results.json`.
 
@@ -100,10 +100,11 @@ python -m unittest discover -s tests -q
 cargo test --locked --target x86_64-unknown-linux-gnu --manifest-path tools/shader-compiler/Cargo.toml
 cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-dxbc --features native-bindings
 cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xg-layout
+cargo test --locked --target x86_64-unknown-linux-gnu -p tuxbox-xcrdapi-codec
 cargo check --locked --target x86_64-pc-windows-msvc -p tuxbox-d3d12
 ```
 
-The D3D12 command typechecks the Windows provider. The Python tests check that `docs/progress.svg` and `docs/RESULTS.md` match the recorded evidence.
+The D3D12 command typechecks the Windows provider. The Python tests check that `docs/progress.svg` and `docs/RESULTS.md` match the recorded evidence, and that [`docs/INSTRUCTIONS.md`](docs/SHADER_HARNESS.md#the-instruction-inventory) matches the translator's record of each instruction.
 
 ## Evidence
 

@@ -36,6 +36,11 @@ constexpr std::array<float, 4> unorm(const Color& c) {
     return {c[0] / 255.f, c[1] / 255.f, c[2] / 255.f, c[3] / 255.f};
 }
 constexpr std::array<float, 4> first_rgba = unorm(first), second_rgba = unorm(second);
+#ifdef GUEST_FRAME_PLANES
+// The second plane: transparent, with an opaque square over the inset.
+constexpr Color overlay_color{38, 214, 96, 255};
+constexpr std::array<float, 4> clear_rgba{}, overlay_rgba = unorm(overlay_color);
+#endif
 constexpr UINT64 guard = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
 constexpr UINT64 interval = ((guard + height * pitch + guard - 1) / guard) * guard;
 constexpr SIZE_T bytes = 2 * interval + guard;
@@ -185,7 +190,11 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
 
     D3D12_DESCRIPTOR_HEAP_DESC view_desc{};
     view_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+#ifdef GUEST_FRAME_PLANES
+    view_desc.NumDescriptors = 4;
+#else
     view_desc.NumDescriptors = 3;
+#endif
     ComPtr<ID3D12DescriptorHeap> view;
     check(device->CreateDescriptorHeap(&view_desc, IID_PPV_ARGS(&view)), "create RTV heap");
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv{method<CpuHandle>(view.Get(), 9)(view.Get())};
@@ -220,6 +229,26 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
         }
         record(lists[i].Get(), view.Get(), texture.Get(), readback.Get(), i);
     }
+    ID3D12Resource* overlay = nullptr;
+#ifdef GUEST_FRAME_PLANES
+    // A full-size second plane: clear it transparent and draw an opaque inset.
+    auto overlay_texture = resource(device.Get(), true);
+    overlay = overlay_texture.Get();
+    ComPtr<ID3D12CommandAllocator> overlay_alloc;
+    ComPtr<ID3D12GraphicsCommandList> overlay_list;
+    check(device->CreateCommandAllocator(desc.Type, IID_PPV_ARGS(&overlay_alloc)), "create overlay allocator");
+    check(method<CreateList>(device.Get(), 73)(device.Get(), params, overlay_alloc.Get(), nullptr,
+          IID_PPV_ARGS(&overlay_list)), "overlay list slot 73");
+    const D3D12_CPU_DESCRIPTOR_HANDLE overlay_rtv{rtv.ptr + 3ULL * stride};
+    device->CreateRenderTargetView(overlay, nullptr, overlay_rtv);
+    transition(overlay_list.Get(), overlay, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    method<Clear>(overlay_list.Get(), 52)(overlay_list.Get(), overlay_rtv, clear_rgba.data(), 0, nullptr);
+    method<Clear>(overlay_list.Get(), 52)(overlay_list.Get(), overlay_rtv, overlay_rgba.data(), 1, &inset);
+    transition(overlay_list.Get(), overlay, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+    check(overlay_list->Close(), "close overlay list");
+    ID3D12CommandList* overlay_batch[] = {overlay_list.Get()};
+    queue->ExecuteCommandLists(1, overlay_batch);
+#endif
     std::unique_ptr<tuxbox_test::DisplayCheck> display;
     if (present) display = std::make_unique<tuxbox_test::DisplayCheck>(width, height, window_mode);
     // Keep both lists/allocators alive until their queue reaches its final fence.
@@ -227,9 +256,13 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
         ID3D12CommandList* batch[] = {lists[i].Get()};
         queue->ExecuteCommandLists(1, batch);
         if (display) {
+#ifdef GUEST_FRAME_PLANES
+            const auto& center = overlay_color;
+#else
             const auto& center = i ? second : first;
+#endif
             display->verify(queue.Get(), texture.Get(), i + 1, RGB(first[0], first[1], first[2]),
-                            RGB(center[0], center[1], center[2]));
+                            RGB(center[0], center[1], center[2]), overlay);
         }
         check(queue->Signal(fence.Get(), i + 1), "signal guest queue");
     }
@@ -238,13 +271,14 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
     try { check_snapshots(static_cast<const BYTE*>(mapped)); }
     catch (...) { readback->Unmap(0, &empty); throw; }
     readback->Unmap(0, &empty);
-    char receipt[196];
+    char receipt[208];
     constexpr UINT pixels = 2 * width * height;
     constexpr UINT inset_pixels = (inset.right - inset.left) * (inset.bottom - inset.top);
     std::snprintf(receipt, sizeof(receipt),
-                  "xbox-frame PASS pci=%04x:%04x submissions=2 snapshots=2 pixels=%u/%u inset=%u guards=3 fence=2 compute_fence=7%s%s",
+                  "xbox-frame PASS pci=%04x:%04x submissions=2 snapshots=2 pixels=%u/%u inset=%u guards=3 fence=2 compute_fence=7%s%s%s",
                   selected.VendorId, selected.DeviceId, pixels, pixels, inset_pixels,
-                  format == DXGI_FORMAT_R10G10B10A2_UNORM ? " format=rgb10a2" : "", present ? " displayed=2/2" : "");
+                  format == DXGI_FORMAT_R10G10B10A2_UNORM ? " format=rgb10a2" : "", present ? " displayed=2/2" : "",
+                  present && overlay ? " planes=2" : "");
     return display ? receipt + display->sizing() : receipt;
 }
 }
@@ -252,7 +286,8 @@ std::string run(const wchar_t* adapter, bool present, const wchar_t* window_mode
 int wmain(int argc, wchar_t** argv) {
     const wchar_t* mode = nullptr;
 #ifdef GUEST_FRAME_4K
-    if (argc < 2 || (wcscmp(argv[1], L"owned") && wcscmp(argv[1], L"oversized") && wcscmp(argv[1], L"fit")))
+    if (argc < 2 || (wcscmp(argv[1], L"owned") && wcscmp(argv[1], L"oversized") && wcscmp(argv[1], L"fit") &&
+                     wcscmp(argv[1], L"splash")))
         return 2;
     mode = argv[1];
     --argc;

@@ -4,8 +4,8 @@ use crate::commands::page_mapping::GPU_APERTURE;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_NOTIMPL, ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, SetLastError,
-    WAIT_OBJECT_0,
+    E_INVALIDARG, E_NOTIMPL, ERROR_INVALID_ADDRESS, ERROR_MORE_DATA, ERROR_NOT_FOUND,
+    ERROR_NOT_SUPPORTED, SetLastError, WAIT_OBJECT_0,
 };
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -448,6 +448,7 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
             ],
         ),
     ]);
+    let pools = PagePools::default();
     let init_transition = Mutex::new(None);
     let import = |guest: &Region, offset: u64, width: u64| {
         let size = (offset + width).next_multiple_of(PAGE);
@@ -461,6 +462,7 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
         };
         super::super::import::import_scattered_buffer(
             &native,
+            &pools,
             &init_transition,
             offset,
             &desc,
@@ -542,5 +544,257 @@ fn scattered_alias_imports_through_reserved_buffer_and_aliases_cpu_and_gpu() {
     submit(&device, |list| unsafe {
         list.CopyBufferRegion(&readback, 0, &upload, 0, 16);
     });
+    drop(xmem);
+}
+
+#[test]
+fn placed_resource_keeps_backing_hold_alive_after_imported_heap_drops() {
+    let Some(device) = hardware_device() else { return };
+    let home = Region::private(PAGE as usize);
+    let guest = Region::reserved(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), home.address())]);
+
+    let pools = PagePools::default();
+    let backing = acquire(guest.address(), PAGE).unwrap();
+    let pin = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_first = pools.import(&device, guest.address(), backing, PAGE, pin, "test", false).unwrap();
+    let via_first = placed(&device, &heap_first.native);
+    super::super::attach_import(&via_first, &heap_first).unwrap();
+
+    drop(heap_first);
+    assert_eq!(
+        RELEASED.load(Ordering::Acquire),
+        0,
+        "placed resource must keep the BackingGuard hold alive through ID3D12Heap"
+    );
+
+    drop(via_first);
+    assert_eq!(RELEASED.load(Ordering::Acquire), 1);
+    drop(xmem);
+}
+
+#[test]
+fn adjacent_placeholder_private_spans_import_check() {
+    use windows::Win32::System::Memory::{
+        MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER,
+        VIRTUAL_FREE_TYPE, VirtualAlloc2,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let Some(device) = hardware_device() else { return };
+    let process = unsafe { GetCurrentProcess() };
+    let base = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            None,
+            (2 * PAGE) as usize,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS.0,
+            None,
+        )
+    };
+    assert!(!base.is_null());
+    unsafe { VirtualFree(base, PAGE as usize, VIRTUAL_FREE_TYPE(MEM_RELEASE.0 | MEM_PRESERVE_PLACEHOLDER.0)) }.unwrap();
+    let page0 = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            Some(base),
+            PAGE as usize,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE.0,
+            None,
+        )
+    };
+    assert_eq!(page0, base);
+    let page1_addr = unsafe { base.cast::<u8>().add(PAGE as usize) };
+    let page1 = unsafe {
+        VirtualAlloc2(
+            Some(process),
+            Some(page1_addr.cast()),
+            PAGE as usize,
+            MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE.0,
+            None,
+        )
+    };
+    assert_eq!(page1, page1_addr.cast());
+
+    let p0_words = unsafe { core::slice::from_raw_parts_mut(page0.cast::<u32>(), 4) };
+    let p1_words = unsafe { core::slice::from_raw_parts_mut(page1.cast::<u32>(), 4) };
+    p0_words.copy_from_slice(&[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+    p1_words.copy_from_slice(&[0x2020_0001, 0x2020_0002, 0x2020_0003, 0x2020_0004]);
+
+    let heap = unsafe { device.OpenExistingHeapFromAddress1::<ID3D12Heap>(page0, (2 * PAGE) as usize) }
+        .expect("adjacent placeholder PrivateSpans import as one heap");
+    let mut res: Option<ID3D12Resource> = None;
+    unsafe {
+        device.CreatePlacedResource(
+            &heap,
+            0,
+            &buffer_desc(2 * PAGE),
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut res,
+        )
+    }
+    .unwrap();
+    let res = res.unwrap();
+    let readback = committed(&device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    submit(&device, |list| unsafe {
+        list.CopyBufferRegion(&readback, 0, &res, 0, 16);
+        list.CopyBufferRegion(&readback, 16, &res, PAGE, 16);
+    });
+    let mut out = core::ptr::null_mut();
+    unsafe { readback.Map(0, None, Some(&mut out)) }.unwrap();
+    let seen = unsafe { core::slice::from_raw_parts(out.cast::<u32>(), 8) };
+    assert_eq!(
+        seen,
+        &[
+            0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004,
+            0x2020_0001, 0x2020_0002, 0x2020_0003, 0x2020_0004,
+        ]
+    );
+    drop((res, readback, heap));
+
+    let _ = unsafe { VirtualFree(page0, 0, MEM_RELEASE) };
+    let _ = unsafe { VirtualFree(page1, 0, MEM_RELEASE) };
+}
+
+#[test]
+fn retire_range_invalidates_imported_heap_and_prevents_cache_reuse() {
+    let Some(device) = hardware_device() else { return };
+    let home_a = Region::private(PAGE as usize);
+    let home_b = Region::private(PAGE as usize);
+    let guest = Region::reserved(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), home_a.address())]);
+
+    let pools = PagePools::default();
+    let backing_a = acquire(guest.address(), PAGE).unwrap();
+    let pin_a = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_a = pools
+        .import(&device, guest.address(), backing_a, PAGE, pin_a, "test", false)
+        .unwrap();
+    assert!(heap_a.is_live());
+
+    unsafe { crate::commands::page_mapping::retire_from_xmem(guest.address(), PAGE) };
+    assert!(!heap_a.is_live());
+    assert!(!heap_a.reusable_for(home_a.address()));
+
+    *MAP.lock().unwrap() = vec![(guest.address(), home_b.address())];
+    let backing_b = acquire(guest.address(), PAGE).unwrap();
+    let pin_b = GPU_APERTURE.pin(guest.address(), PAGE).unwrap();
+    let heap_b = pools
+        .import(&device, guest.address(), backing_b, PAGE, pin_b, "test", false)
+        .unwrap();
+    assert!(!Arc::ptr_eq(&heap_a, &heap_b));
+    assert!(heap_b.is_live());
+
+    drop((heap_a, heap_b));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
+    drop(xmem);
+}
+
+#[test]
+fn scattered_imports_reuse_cached_piece_heaps() {
+    let Some(device) = hardware_device() else { return };
+    let native = device.clone();
+    let a = Region::private(PAGE as usize);
+    let b = Region::private(PAGE as usize);
+    let c = Region::private(PAGE as usize);
+    let guest_ab = Region::reserved((2 * PAGE) as usize);
+    let guest_ac = Region::reserved((2 * PAGE) as usize);
+
+    a.words(4).copy_from_slice(&[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+    let xmem = FakeXmem::install_runs(&[
+        (
+            guest_ab.address(),
+            vec![
+                BackingRun { address: a.address(), bytes: PAGE },
+                BackingRun { address: b.address(), bytes: PAGE },
+            ],
+        ),
+        (
+            guest_ac.address(),
+            vec![
+                BackingRun { address: a.address(), bytes: PAGE },
+                BackingRun { address: c.address(), bytes: PAGE },
+            ],
+        ),
+    ]);
+
+    let pools = PagePools::default();
+    let init_transition = Mutex::new(None);
+    let import = |guest: &Region| {
+        let AcquiredBacking::Scattered { runs, hold } = acquire_backing(guest.address(), 2 * PAGE).unwrap() else {
+            panic!("expected scattered backing");
+        };
+        let pin = GPU_APERTURE.pin(guest.address(), 2 * PAGE).unwrap();
+        super::super::import::import_scattered_buffer(
+            &native,
+            &pools,
+            &init_transition,
+            0,
+            &buffer_desc(2 * PAGE),
+            D3D12_RESOURCE_STATE_COMMON,
+            runs,
+            hold,
+            pin,
+            "test",
+            false,
+        )
+        .unwrap()
+    };
+
+    let (res_ab, heap_ab) = import(&guest_ab);
+    let (res_ac, heap_ac) = import(&guest_ac);
+    assert_eq!(heap_ab.native.as_raw(), heap_ac.native.as_raw());
+
+    drop((res_ab, heap_ab));
+    let readback = committed(&device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    submit(&device, |list| unsafe {
+        list.CopyBufferRegion(&readback, 0, &res_ac, 0, 16);
+    });
+    let mut out = core::ptr::null_mut();
+    unsafe { readback.Map(0, None, Some(&mut out)) }.unwrap();
+    let seen = unsafe { core::slice::from_raw_parts(out.cast::<u32>(), 4) };
+    assert_eq!(seen, &[0x1010_0001, 0x1010_0002, 0x1010_0003, 0x1010_0004]);
+
+    drop((readback, res_ac, heap_ac));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
+    drop(xmem);
+}
+
+#[test]
+fn try_write_xmem_bytes_skips_unmapped_xmem_pages_without_failing() {
+    let guest = Region::reserved((2 * PAGE) as usize);
+    let backing = Region::private(PAGE as usize);
+    let xmem = FakeXmem::install(&[(guest.address(), backing.address())]);
+    unsafe extern "system" fn partial_acquire(
+        address: u64,
+        bytes: u64,
+        out_backing: *mut u64,
+        hold: *mut u64,
+    ) -> i32 {
+        let map = MAP.lock().unwrap();
+        if bytes == PAGE
+            && let Some(&(_, start)) = map.iter().find(|(g, _)| *g == address)
+        {
+            let cookie = ACQUIRED.fetch_add(1, Ordering::AcqRel) + 1;
+            unsafe {
+                out_backing.write(start);
+                hold.write(cookie);
+            }
+            return 1;
+        }
+        unsafe { SetLastError(ERROR_INVALID_ADDRESS) };
+        0
+    }
+    *TEST_EXPORTS.lock().unwrap() = Some(Exports::new(partial_acquire, fake_release));
+
+    let mut payload = vec![0x11u8; (2 * PAGE) as usize];
+    payload[PAGE as usize..].fill(0x22);
+    assert!(matches!(try_write_xmem_bytes(guest.address(), &payload), Some(Ok(()))));
+    assert!(backing.words((PAGE as usize) / 4).iter().all(|&w| w == 0x1111_1111));
+    assert_eq!(RELEASED.load(Ordering::Acquire), ACQUIRED.load(Ordering::Acquire));
     drop(xmem);
 }

@@ -4,6 +4,7 @@ All are small hand-written console programs, not taken from any game. One is a
 `v_mov_b32` and `s_endpgm` with an empty root signature embedded. Another sums
 the lane numbers of each 64-lane console wave and writes a word per thread. The
 two `compute-root` programs carry no root and store one word through table 1.
+The `large-dispatch` program stores its group ID.
 """
 import hashlib
 from pathlib import Path
@@ -147,6 +148,25 @@ def recovered_root_shader():
     return stage_container(0x50060, image(7, first + second, user, used), [(b"PSV0", psv)])
 
 
+def root_srv_shader():
+    """A store through table 1 by a program whose records also name a root SRV.
+
+    The scenario's root is three tables and a root SRV. The record of that
+    root SRV names parameter 3, whose address arrives in s7-s8, and PSV names
+    it a raw buffer, t5, space7; the program does not read through it. The raw
+    UAV at slot 2 (0x40) of table 1 is u4, space2, where the root declares an
+    SRV. Both have user-data records.
+    """
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, ROOT_THREADS, 1, 1)
+    resources = ([4, 7, 5, 5], [7, 2, 4, 4])
+    psv = pack([len(info)]) + info + pack([2, 16, *resources[0], *resources[1]])
+    user = ([1, 0, 2, 5, 0x307], [3, 16, 1, 4, 0x105])
+    used = ([0x100, 0, 5, 1, 0x30704], [0x303, 16, 4, 1, 0x10504])
+    return stage_container(0x50060, image(7, root_code(0x40), user, used), [(b"PSV0", psv)])
+
+
 BINDLESS_INDEX = 80
 BINDLESS_EXPECTED = 0x7AB1E002
 
@@ -285,6 +305,113 @@ def bindless_table_store_shader():
     ])
 
 
+# The `large-dispatch` program, checked with `llvm-mc -mcpu=gfx1030 -show-encoding`.
+# Under its root of one table the group ID arrives in s5, s6 and s7. Every
+# thread of a group stores the ID and GROUP_MARK as four words at record
+# x + 2y, so a dispatch two groups wide covers each record once.
+GROUP_MARK = 0x6B1D0000
+GROUP_CODE = (
+    0xBE800304,                  # s_mov_b32 s0, s4: table 0
+    0xBE810380,                  # s_mov_b32 s1, 0
+    0xF4080200, 0xFA000000,      # s_load_dwordx4 s[8:11], s[0:1], 0: the u0 descriptor
+    0x8F0C8106,                  # s_lshl_b32 s12, s6, 1
+    0x800C050C,                  # s_add_u32 s12, s12, s5
+    0x8F0C840C,                  # s_lshl_b32 s12, s12, 4
+    0x7E020205,                  # v_mov_b32 v1, s5
+    0x7E040206,                  # v_mov_b32 v2, s6
+    0x7E060207,                  # v_mov_b32 v3, s7
+    0x7E0802FF, GROUP_MARK,      # v_mov_b32 v4, GROUP_MARK
+    0x7E00020C,                  # v_mov_b32 v0, s12
+    0xBF8CC07F,                  # s_waitcnt lgkmcnt(0)
+    0xE0781000, 0x80020100,      # buffer_store_dwordx4 v[1:4], v0, s[8:11], 0 offen
+    0xBF810000,                  # s_endpgm
+)
+
+
+def group_shader():
+    """A program that stores its group ID, for dispatches over 65,535 groups."""
+    return uav_shader(list(GROUP_CODE), width=64)
+
+
+# The `compute-heap-stride` program, checked with `llvm-mc -mcpu=gfx1030
+# -show-encoding`. It is a root-less compute program: each thread takes the
+# thread number, indexes the input structured buffer in the resource heap with
+# it (an IDXEN raw load, which needs the buffer's record stride) and stores the
+# word it found into the same record of the output structured buffer, through
+# the other heap descriptor (a byte-offset store one record per thread). The
+# load cannot be expressed without the stride: the runtime has to retry the
+# translation with the heap stride table appended, as it does for the Reflected
+# and Original arms. The heap base arrives in s2 (the one FSSM class-5 user
+# record) and the descriptors are loaded with a 32-byte step, the way the
+# console stores a heap slot's descriptor there.
+HEAP_STRIDE_INPUT_SLOT = 100
+HEAP_STRIDE_OUTPUT_SLOT = 110
+HEAP_STRIDE_THREADS = 64
+HEAP_STRIDE_RECORD_BYTES = 32
+
+
+def heap_stride_compute_shader():
+    code = [
+        0xB0140000 | HEAP_STRIDE_INPUT_SLOT,  # s_movk_i32 s20, the input's heap slot
+        0x8F158514,                           # s_lshl_b32 s21, s20, 5   (slot * 32 bytes)
+        0xF4080201, 0x2A000000,               # s_load_dwordx4 s[8:11], s[2:3], s21
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0xE0302000, 0x80020400,               # buffer_load_dword v4, v0, s[8:11], 0 idxen
+        0xBF8C3F70,                           # s_waitcnt vmcnt(0)
+        0xB0140000 | HEAP_STRIDE_OUTPUT_SLOT,  # s_movk_i32 s20, the output's heap slot
+        0x8F158514,                           # s_lshl_b32 s21, s20, 5   (slot * 32 bytes)
+        0xF4080601, 0x2A000000,               # s_load_dwordx4 s[24:27], s[2:3], s21
+        0xBF8CC07F,                           # s_waitcnt lgkmcnt(0)
+        0x34120085,                           # v_lshlrev_b32 v9, 5, v0
+        0xE0701000, 0x80060409,               # buffer_store_dword v4, v9, s[24:27], 0
+        0xBF810000,                           # s_endpgm
+    ]
+    info = bytearray(48)
+    info[24] = 5
+    struct.pack_into("<3I", info, 36, HEAP_STRIDE_THREADS, 1, 1)
+    psv = pack([48]) + info + pack([0])
+    # FSSM: one class-5 user record, the heap base (s2). No used-resource rows.
+    return stage_container(0x50060, image(7, code, [(5, 0, 1, 0, 2)]), [
+        (b"SFI0", struct.pack("<Q", 1 << 25)),
+        (b"PSV0", psv),
+    ])
+
+
+# The `late-pipeline` program: each of 64 threads runs its index through a
+# chain of LATE_STEPS dependent `v_xor_b32`, `v_mul_u32_u24` and
+# `v_add_nc_u32` with literals, which DXC cannot fold, and stores the result as
+# word tid of u0. The chain makes the DXIL larger than the provider's large
+# compile size (512 KiB), so under a short pipeline deadline the program gets a
+# stand-in and its compile finishes later.
+LATE_STEPS = 60000
+
+
+def late_shader():
+    """The program and the word each thread stores."""
+    mask, seed, literals = 0xFFFFFFFF, 0x2545F491, []
+    code = [0xBE800304,              # s_mov_b32 s0, s4: table 0
+            0xBE810380,              # s_mov_b32 s1, 0
+            0xF4080200, 0xFA000000,  # s_load_dwordx4 s[8:11], s[0:1], 0: the u0 descriptor
+            0x7E020300]              # v_mov_b32 v1, v0
+    ops = (0x3A0202FF, 0x160202FF, 0x4A0202FF)  # v_xor_b32, v_mul_u32_u24, v_add_nc_u32 v1, literal, v1
+    for step in range(LATE_STEPS):
+        seed = (seed * 1103515245 + 12345) & mask
+        literals.append(seed | 1)
+        code += [ops[step % 3], seed | 1]
+    code += [0x34000082,              # v_lshlrev_b32 v0, 2, v0
+             0xBF8CC07F,              # s_waitcnt lgkmcnt(0)
+             0xE0701000, 0x80020100,  # buffer_store_dword v1, v0, s[8:11], 0 offen
+             0xBF810000]              # s_endpgm
+    expected = []
+    for tid in range(64):
+        x = tid
+        for step, literal in enumerate(literals):
+            kind = step % 3
+            x = x ^ literal if kind == 0 else ((literal & 0xFFFFFF) * (x & 0xFFFFFF)) & mask if kind == 1 else (x + literal) & mask
+        expected.append(x)
+    return uav_shader(code, width=64), expected
+
+
 def declaration(name, data):
     values = ",".join(str(byte) for byte in data)
     return (f"constexpr unsigned char {name}[] = {{{values}}};\n"
@@ -301,6 +428,7 @@ def header():
             + declaration("lane_shader", lane_shader())
             + f"constexpr unsigned lane_shader_expected[] = {{{lane_words}}};\n"
             + declaration("recovered_root_shader", recovered_root_shader())
+            + declaration("root_srv_shader", root_srv_shader())
             + declaration("bindless_compute_shader", bindless_compute_shader())
             + declaration("bindless_table_compute_shader", bindless_compute_shader(table=True))
             + f"constexpr unsigned bindless_index = {BINDLESS_INDEX};\nconstexpr unsigned bindless_expected = {BINDLESS_EXPECTED:#x};\n"
@@ -313,8 +441,20 @@ def header():
             + declaration("bindless_table_store_shader", bindless_table_store_shader())
             + f"constexpr unsigned bindless_table_slot = {BINDLESS_TABLE_SLOT}, "
               f"bindless_table_expected = {BINDLESS_TABLE_EXPECTED:#x};\n"
+            + declaration("group_shader", group_shader())
+            + f"constexpr unsigned group_shader_mark = {GROUP_MARK:#x};\n"
             + declaration("root_shader", root_shader(0x40)) + declaration("root_refused_shader", root_shader(0xA0))
-            + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n")
+            + f"constexpr unsigned root_shader_expected = {ROOT_EXPECTED:#x};\n"
+            + declaration("compute_heap_stride_shader", heap_stride_compute_shader())
+            + f"constexpr unsigned compute_heap_stride_input_slot = {HEAP_STRIDE_INPUT_SLOT}u, compute_heap_stride_output_slot = {HEAP_STRIDE_OUTPUT_SLOT}u;\n"
+            + f"constexpr unsigned compute_heap_stride_bytes = {HEAP_STRIDE_RECORD_BYTES}u, compute_heap_stride_records = {HEAP_STRIDE_THREADS}u;\n"
+            + late_declarations())
+
+
+def late_declarations():
+    data, expected = late_shader()
+    words = ",".join(f"{word:#x}u" for word in expected)
+    return declaration("late_shader", data) + f"constexpr unsigned late_shader_expected[64] = {{{words}}};\n"
 
 
 if __name__ == "__main__":

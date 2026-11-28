@@ -539,3 +539,26 @@ fn compute_root_srv_remapping_requires_unambiguous_metadata() {
         assert!(super::translate(&ex).is_err(), "translated invalid case {variant}");
     }
 }
+
+#[test]
+fn a_one_of_n_buffer_is_selected_once_for_both_lanes() {
+    // Either of the fixture's two buffers, chosen by a scalar branch, then a per-lane load:
+    // s_cmp_eq_u32 s20, 0; s_cbranch_scc1 +3; s_load_dwordx4 s[16:19], s[4:5], 0x0; s_branch +2;
+    // s_load_dwordx4 s[16:19], s[4:5], 0x20; buffer_load_dword v1, off, s[16:19], 0 offset:8.
+    let mut ex = bounded_cbv_fixture();
+    ex.isa = [0xbf068014u32, 0xbf850003, 0xf4080402, 0xfa000000, 0xbf820002, 0xf4080402, 0xfa000020,
+        0xe0300008, 0x80040100, 0xbf810000]
+        .iter().flat_map(|w| w.to_le_bytes()).collect();
+    ex.isa_data = ex.isa.clone();
+    ex.isa_preamble = [0, 64, 1, 1];
+    let hlsl = crate::hlsl::translate_paired_wave64(&ex).unwrap().hlsl;
+    // The scalar choice wraps the two lanes, and each copy reads its own buffer.
+    for (choice, buffer) in [("if (tb_dsel16 == 0x4000000u) {", "cb0["), ("else if (tb_dsel16 == 0x4000020u) {", "cb1[")] {
+        let copy = hlsl.split(choice).nth(1).unwrap_or_else(|| panic!("{hlsl}"));
+        let copy = &copy[..copy.find("(1u)\n").unwrap()];
+        assert!(copy.contains("#define TB_L") && copy.contains(buffer), "{hlsl}");
+    }
+    // Each copy has a macro of its own.
+    let names: Vec<&str> = hlsl.lines().filter_map(|line| line.trim().strip_prefix("#define ")).map(|d| d.split('(').next().unwrap()).collect();
+    assert!(names.len() == 2 && names[0] != names[1], "{hlsl}");
+}

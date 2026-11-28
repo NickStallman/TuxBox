@@ -5,7 +5,8 @@ import subprocess
 import unittest
 
 from project_tuxbox.runtime_shaders import ShaderRefused
-from project_tuxbox.scarlett_report import aggregate, failure_bucket, refusal_bucket
+from project_tuxbox.scarlett_report import (
+    aggregate, expected_at_preparation, failure_bucket, refusal_bucket)
 
 class ScarlettReport(unittest.TestCase):
     def test_live_log_categories(self):
@@ -18,6 +19,7 @@ class ScarlettReport(unittest.TestCase):
             "v_readlane at 0x20: v2 lane 32 read before any v_writelane": "readlane_uninitialized",
             "s_load at 0xec: dynamic soffset unsupported": "scalar_dynamic_offset",
             "mimg at 0x2d4: s12 not a sampler descriptor (Some(InlineWord(12470))) words [0x30b6, 0x0, 0x0, 0x0]": "sampler",
+            "raw buffer IDXEN needs the console descriptor stride [buffer_load_dword @ 0x40c]": "heap_stride",
         }
         for reason, expected in cases.items():
             with self.subTest(reason=reason):
@@ -42,3 +44,24 @@ class ScarlettReport(unittest.TestCase):
         self.assertNotIn("/home",json.dumps(report))
         with self.assertRaises(ValueError):
             aggregate(totals, Counter(wave_divergent=2), Counter(dxc_timeout=1), Counter({".dxbc":15}))
+
+
+class PreparationRefusalClasses(unittest.TestCase):
+    def test_expected_bucket_classification(self):
+        cases = {
+            "mesh root signature missing": True,
+            "unrecognized mesh SRV/CBV root-table layout": True,
+            "unverified mesh descriptor load": True,
+            "raw buffer IDXEN needs the console descriptor stride": False,
+            "mimg at 0x2d4: s12 not a sampler descriptor (Some(InlineWord(12470))) words [0x30b6, 0x0, 0x0, 0x0]": False,
+            "other_refusal": False,
+        }
+        for reason, expected in cases.items():
+            with self.subTest(reason=reason):
+                bucket = refusal_bucket(ShaderRefused("xshader failed (65): " + reason, cached=False))
+                self.assertEqual(expected_at_preparation(bucket), expected)
+
+    def test_missing_operator_wording_is_actionable(self):
+        # A mesh refusal that is not the root signature is a real gap.
+        self.assertFalse(expected_at_preparation(
+            refusal_bucket(ShaderRefused("xshader failed (65): unsupported mesh operation s_add_i32", cached=False))))

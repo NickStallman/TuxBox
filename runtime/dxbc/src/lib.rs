@@ -19,6 +19,7 @@ pub mod mesh_table;
 mod raster;
 pub mod ray;
 pub mod rootsig;
+pub mod group_base;
 mod signature;
 
 pub use container::{Chunk, Dxbc};

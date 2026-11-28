@@ -17,6 +17,10 @@ pub(in super::super) unsafe extern "system" fn register_pages(
     windows::Win32::Foundation::S_OK
 }
 
+pub(super) struct PieceHeap {
+    pub(super) native: ID3D12Heap,
+}
+
 // Registration returns an opaque cookie. Import the actual slices when a
 // resource uses them, so a large title arena doesn't pin untouched pages.
 #[derive(Default)]
@@ -33,6 +37,7 @@ pub(in super::super) struct PagePools {
     // 1.2 MiB about five times a frame each, and its recording allocators
     // keep every import for 216 frames: about 4,500 live buffers.
     pub(super) loose: std::sync::Mutex<PageCache<ImportedHeap>>,
+    pub(super) pieces: std::sync::Mutex<PageCache<PieceHeap>>,
 }
 
 impl PagePools {
@@ -41,6 +46,50 @@ impl PagePools {
         let token = core::ptr::from_ref(pool.as_ref()).addr();
         self.pools.lock().unwrap_or_else(|e| e.into_inner()).insert(token, pool);
         token
+    }
+
+    pub(super) fn import_piece(
+        &self,
+        device: &ID3D12Device13,
+        address: u64,
+        bytes: u64,
+        guard: &Arc<BackingGuard>,
+        source: &'static str,
+    ) -> windows::core::Result<Arc<PieceHeap>> {
+        let open = || -> windows::core::Result<Arc<PieceHeap>> {
+            let native = unsafe { device.OpenExistingHeapFromAddress1(address as _, bytes as usize) }
+                .map_err(|error| {
+                    trace_import_failure(source, "scattered-sized", bytes, error.code());
+                    error
+                })?;
+            attach_heap_guard(&native, guard)?;
+            Ok(Arc::new(PieceHeap { native }))
+        };
+        let key = if bytes == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
+            Some(address)
+        } else {
+            span_key(address, bytes)
+        };
+        if let Some(key) = key {
+            use std::sync::atomic::AtomicU64;
+            static OPEN: AtomicU64 = AtomicU64::new(0);
+            static HIT: AtomicU64 = AtomicU64::new(0);
+            let mut opened = false;
+            let mut pieces = self.pieces.lock().unwrap_or_else(|e| e.into_inner());
+            let result = pieces.get_or_open(key, |_| true, || {
+                opened = true;
+                open()
+            });
+            if result.is_ok() {
+                if opened {
+                    trace_buffer_path("piece_open", &OPEN, source, bytes);
+                } else {
+                    trace_buffer_path("piece_hit", &HIT, source, bytes);
+                }
+            }
+            return result;
+        }
+        open()
     }
 
     /// Import the guest pages at `base` from `backing`. Caches stay keyed on
@@ -57,7 +106,7 @@ impl PagePools {
                 trace_import_failure(source, "sized", size, error.code());
                 error
             })?;
-            Ok(Arc::new(ImportedHeap::direct(native, pin, backing)))
+            Ok(Arc::new(ImportedHeap::direct(native, pin, backing)?))
         };
         if size == u64::from(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
             use std::sync::atomic::AtomicU64;

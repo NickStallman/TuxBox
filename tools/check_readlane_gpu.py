@@ -40,11 +40,13 @@ CASES = [
     ("wave32_ctl_dep_guard_31", 32, 32, 31, True, "broadcast"),
     ("wave32_64t_and_exec_31", 64, 32, 31, False, "broadcast"),
     ("wave32_mbcnt_exec_31", 32, 32, 31, False, "mbcnt"),
-    ("wave64_swizzle_branch_dyn_63", 64, 64, 63, True, "broadcast"),
+    # s7 is one register for the wave, so lane 63 reads it too though it skipped the read.
+    ("wave64_swizzle_branch_dyn_63", 64, 64, 63, False, "broadcast"),
     ("wave64_dyn_sgpr_high_bits_47", 64, 64, 47, False, "broadcast"),
     ("wave32_64t_dyn_sgpr_31", 64, 32, 31, False, "broadcast"),
     ("wave32_mixed_dynamic_11", 32, 32, 11, False, "mixed"),
     ("wave32_mixed_empty_exec", 32, 32, 11, False, "mixed_empty"),
+    ("wave32_mixed_lds_dpp_11", 32, 32, 11, False, "mixed_lds_dpp"),
 ]
 
 
@@ -55,11 +57,18 @@ def seed_and_expected(lanes, wave_width, target_lane, skip_last, mode, values):
     for lane in range(lanes):
         src = (lane & ~(wave_width - 1)) | target_lane
         val = values[src]
-        if mode in ("mixed", "mixed_empty"):
+        if mode in ("mixed", "mixed_empty", "mixed_lds_dpp"):
             written = 0x5a5a31f2
-            vector_value = written if mode == "mixed" and lane == target_lane else lane + 17
-            broadcast = written if mode == "mixed" else 3
-            expected[VIEW + lanes + lane] = broadcast ^ vector_value
+
+            def v6(index):
+                vector_value = written if mode != "mixed_empty" and index == target_lane else index + 17
+                return (3 if mode == "mixed_empty" else written) ^ vector_value
+            if mode == "mixed_lds_dpp":
+                # Group memory and a quad permute both give the neighbour's v6.
+                other = v6(lane ^ 1)
+                expected[VIEW + lanes + lane] = (v6(lane) ^ (other << 1) ^ (other << 2)) & 0xFFFFFFFF
+            else:
+                expected[VIEW + lanes + lane] = v6(lane)
         elif mode == "mbcnt":
             prefix = lane if lane < 31 else 31
             out = ((prefix & 0xff) << 24) | (val & 0x00ffffff)
@@ -138,6 +147,8 @@ def main(argv=None):
             seed_bytes, exp_bytes = seed_and_expected(lanes, wave_width, target_lane, skip_last, mode, values)
             (trial / f"{name}.seed").write_bytes(seed_bytes)
             expected[name] = exp_bytes
+            if "[WaveSize(64)]" in emit.stdout:
+                (trial / f"{name}.minwave").write_text("64\n")
             dispatched.append(name)
             rows.append(dict(case=name, lanes=lanes, wave_width=wave_width, profile=profile,
                              hlsl_sha256=digest(hlsl), dxil_sha256=digest(blob)))
@@ -157,9 +168,14 @@ def main(argv=None):
                 extra_env={"TUXBOX_NULL_PIPELINES": "0"},
             )
 
+        # Only a host that reports narrower waves may leave the 64-lane programs out.
+        narrow = int(fields.get("wave_lanes_max", 0)) in range(1, 64)
         for row in rows:
             name = row["case"]
             if name not in expected:
+                continue
+            if narrow and fields.get(f"{name}_skipped") == "64":
+                row["skipped"] = "host has no 64-lane waves"
                 continue
             path = trial / f"{name}.bin"
             actual = path.read_bytes() if path.is_file() else b""
@@ -179,7 +195,7 @@ def main(argv=None):
                 )
 
         adapter_ok = (a.adapter.lower() == "any") or (fields.get("adapter", "").lower() == a.adapter.lower())
-        passed = status == 0 and adapter_ok and all(r.get("matched") for r in rows)
+        passed = status == 0 and adapter_ok and all(r.get("matched") or r.get("skipped") for r in rows)
         report = dict(
             schema=1,
             scope="Synthetic compute v_readlane_b32 programs translated to HLSL, compiled with DXC, and checked via D3D12 UAV readback",
@@ -198,9 +214,11 @@ def main(argv=None):
         a.output.parent.mkdir(parents=True, exist_ok=True)
         a.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
-    failed = [r for r in rows if not r.get("matched")]
+    failed = [r for r in rows if not r.get("matched") and not r.get("skipped")]
+    skipped = sum(1 for r in rows if r.get("skipped"))
+    note = f", {skipped} 64-lane cases not run (host has no 64-lane waves)" if skipped else ""
     print(f"{'PASS' if passed else 'FAIL'}: {report['matched_cases']}/{report['cases']} cases, "
-          f"{report['compared_words']} words, adapter {report['adapter']}")
+          f"{report['compared_words']} words, adapter {report['adapter']}{note}")
     for r in failed:
         print(f"  FAIL {r['case']}: {r.get('error') or r.get('first_mismatch')} "
               f"(mismatched_words={r.get('mismatched_words', 'n/a')})")

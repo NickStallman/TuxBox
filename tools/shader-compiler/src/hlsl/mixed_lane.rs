@@ -45,14 +45,18 @@ pub(super) fn prepare(ex: &ShaderExtract, insns: &mut [Insn]) -> Result<bool, St
     }
     for op in insns.iter() {
         let m = op.mnemonic.as_str();
-        // The logical lane mapping has no verified LDS/barrier or DPP contract.
+        // Group memory is addressed per lane, and DPP reads lanes of the 32-lane host wave
+        // the resolve_wave32 mode pins to the guest's. Lane exchanges through group memory,
+        // the global data share and barriers have no verified contract here.
+        let lane_exchange = op.enc == Enc::Ds
+            && (matches!(m, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32") || op.raw[0] & (1 << 17) != 0);
         let wide_mask = (m.ends_with("_b64") || m.ends_with("_i64") || m.ends_with("_u64"))
             && op
                 .src
                 .iter()
                 .chain(&op.dst)
                 .any(|v| matches!(v, Opnd::ExecLo | Opnd::VccLo));
-        if op.enc == Enc::Ds
+        if lane_exchange
             || wide_mask
             || op
                 .src
@@ -64,18 +68,12 @@ pub(super) fn prepare(ex: &ShaderExtract, insns: &mut [Insn]) -> Result<bool, St
             || matches!(
                 m,
                 "s_barrier"
-                    | "s_setpc_b64"
                     | "s_swappc_b64"
                     | "s_call_b64"
                     | "v_mbcnt_hi_u32_b32"
                     | "v_readlane_regrd_b32"
                     | "v_writelane_regwr_b32"
             )
-            || (matches!(op.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vopc)
-                && op
-                    .raw
-                    .first()
-                    .is_some_and(|word| matches!(word & 511, 233 | 234 | 250)))
         {
             return Err(format!(
                 "mixed lane Wave32 cannot lower {m} at {:#x}",
@@ -123,9 +121,11 @@ pub(super) fn prepare(ex: &ShaderExtract, insns: &mut [Insn]) -> Result<bool, St
             ));
         }
     }
+    // Only the storage `v_writelane_b32` fills is read through scalar storage. Other lane
+    // reads, such as a wave reduction's last, stay for the full-mask emitter.
     for op in insns.iter_mut() {
         match op.mnemonic.as_str() {
-            "v_readlane_b32" => {
+            "v_readlane_b32" if matches!(op.src.first(), Some(Opnd::Vgpr(v)) if written.contains(v)) => {
                 let Opnd::Vgpr(dst) = op.dst[0] else {
                     unreachable!()
                 };

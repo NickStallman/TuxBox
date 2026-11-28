@@ -14,11 +14,62 @@ void pump() {
         DispatchMessageW(&message);
     }
 }
+
+// Sample points in percent of the client area: four corners, then the centre.
+constexpr std::array<POINT, 5> samples{{{5, 5}, {95, 5}, {5, 95}, {95, 95}, {50, 50}}};
+// build.py writes the package splash beside the splash-mode guest: a 64x36
+// image in this colour.
+constexpr COLORREF splash_image = RGB(0x30, 0xc0, 0x90);
+constexpr LONG splash_width = 64, splash_height = 36;
+
+// GetPixel on the screen reads physical pixels, but a guest that is not DPI aware,
+// like a title, places its windows in logical pixels. They differ once Windows
+// scales the display, so move each sample point to the pixel it covers.
+COLORREF screen_pixel(HDC screen, HWND window, POINT at) {
+    using Convert = BOOL(WINAPI*)(HWND, POINT*);
+    static const auto convert = reinterpret_cast<Convert>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "LogicalToPhysicalPointForPerMonitorDPI"));
+    if (convert) convert(window, &at);
+    return GetPixel(screen, at.x, at.y);
+}
+
+std::string describe(const std::array<COLORREF, samples.size()>& pixels) {
+    char text[80];
+    std::snprintf(text, sizeof(text), " screen=%#lx/%#lx/%#lx/%#lx/%#lx", pixels[0], pixels[1], pixels[2],
+                  pixels[3], pixels[4]);
+    return text;
+}
 }
 
 DisplayCheck::DisplayCheck(UINT width, UINT height, const wchar_t* window_mode)
-    : check_size_(window_mode != nullptr) {
+    : check_size_(window_mode != nullptr), splash_(window_mode && !wcscmp(window_mode, L"splash")) {
     if (window_mode && !wcscmp(window_mode, L"owned")) return;
+    if (splash_) {
+        // Like ProjectScarlett: an ANSI class, and a window for the whole output.
+        WNDCLASSEXA title{};
+        title.cbSize = sizeof(title);
+        title.lpfnWndProc = DefWindowProcA;
+        title.hInstance = GetModuleHandleW(nullptr);
+        title.lpszClassName = "TuxBoxSplashTitle";
+        if (!RegisterClassExA(&title)) throw std::runtime_error("could not register the title window class");
+        RECT frame{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        window_ = CreateWindowExA(0, title.lpszClassName, "Project TuxBox splash check", WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, frame.right - frame.left, frame.bottom - frame.top,
+                                  nullptr, nullptr, title.hInstance, nullptr);
+        if (!window_) throw std::runtime_error("could not create the title window");
+        owns_title_ = true;
+        // The provider fits the window as it is created and paints the package
+        // image into it until frames come steadily.
+        RECT client{};
+        POINT origin{};
+        measure(client, origin);
+        ShowWindow(window_, SW_SHOW);
+        UpdateWindow(window_);
+        if (!splash_shows(4000)) throw std::runtime_error("the package splash did not appear" + describe(sample()) + sizing_);
+        if (FindWindowW(L"TuxBox.Splash", nullptr)) throw std::runtime_error("the package splash opened a window of its own");
+        return;
+    }
     UINT client_width = width * 6, client_height = height * 6;
     if (check_size_) {
         client_width = !wcscmp(window_mode, L"fit") ? 960 : width;
@@ -37,12 +88,89 @@ DisplayCheck::DisplayCheck(UINT width, UINT height, const wchar_t* window_mode)
 }
 DisplayCheck::~DisplayCheck() { if (owns_title_) DestroyWindow(window_); }
 
+void DisplayCheck::measure(RECT& client, POINT& origin) {
+    if (!GetClientRect(window_, &client)) throw std::runtime_error("could not get presentation client area");
+    origin = {};
+    POINT end{client.right, client.bottom};
+    if (!ClientToScreen(window_, &origin) || !ClientToScreen(window_, &end))
+        throw std::runtime_error("could not locate presentation window");
+    if (check_size_) {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor))
+            throw std::runtime_error("could not locate display work area");
+        const auto& area = monitor.rcWork;
+        sizing_ = " client=" + std::to_string(client.right) + "x" + std::to_string(client.bottom)
+            + " origin=" + std::to_string(origin.x) + "," + std::to_string(origin.y)
+            + " monitor=" + std::to_string(area.right - area.left) + "x" + std::to_string(area.bottom - area.top);
+        if (origin.x < area.left || origin.y < area.top || end.x > area.right || end.y > area.bottom)
+            throw std::runtime_error("off-screen presentation" + sizing_);
+        if (std::abs(client.right * 9 - client.bottom * 16) > 16)
+            throw std::runtime_error("distorted presentation" + sizing_);
+    }
+}
+
+std::array<COLORREF, 5> DisplayCheck::sample() const {
+    std::array<COLORREF, samples.size()> pixels{};
+    RECT client{};
+    POINT origin{};
+    if (!GetClientRect(window_, &client) || !ClientToScreen(window_, &origin)) return pixels;
+    HDC screen = GetDC(nullptr);
+    if (!screen) throw std::runtime_error("could not acquire screen DC");
+    for (size_t i = 0; i < pixels.size(); ++i)
+        pixels[i] = screen_pixel(screen, window_, {origin.x + client.right * samples[i].x / 100,
+                                                   origin.y + client.bottom * samples[i].y / 100});
+    ReleaseDC(nullptr, screen);
+    return pixels;
+}
+
+bool DisplayCheck::shows(COLORREF corner, COLORREF center, ULONGLONG milliseconds) const {
+    const auto deadline = GetTickCount64() + milliseconds;
+    do {
+        pump();
+        const auto pixels = sample();
+        bool matched = true;
+        for (size_t i = 0; i < pixels.size(); ++i) matched &= pixels[i] == (i == 4 ? center : corner);
+        if (matched) return true;
+        Sleep(16);
+    } while (GetTickCount64() < deadline);
+    return false;
+}
+
+bool DisplayCheck::splash_shows(ULONGLONG milliseconds) const {
+    const auto deadline = GetTickCount64() + milliseconds;
+    do {
+        pump();
+        RECT client{};
+        POINT origin{};
+        if (!GetClientRect(window_, &client) || !ClientToScreen(window_, &origin)) return false;
+        HDC screen = GetDC(nullptr);
+        if (!screen) throw std::runtime_error("could not acquire screen DC");
+        const POINT middle{origin.x + client.right / 2, origin.y + client.bottom / 2};
+        bool matched = true;
+        for (const auto& at : samples) {
+            // The sample points, moved inside the centred image.
+            const LONG x = middle.x + splash_width * (at.x - 50) / 200;
+            const LONG y = middle.y + splash_height * (at.y - 50) / 200;
+            matched &= screen_pixel(screen, window_, {x, y}) == splash_image;
+        }
+        // Outside it the window is black.
+        matched &= screen_pixel(screen, window_, {middle.x - splash_width, middle.y}) == RGB(0, 0, 0);
+        ReleaseDC(nullptr, screen);
+        if (matched) return true;
+        Sleep(16);
+    } while (GetTickCount64() < deadline);
+    return false;
+}
+
 void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UINT64 token,
-                          COLORREF corner, COLORREF center) {
+                          COLORREF corner, COLORREF center, ID3D12Resource* overlay) {
     struct FullPlane {
         frame_abi::Plane prefix;
         UINT options[12];
-    } plane{{token, 1, 0, &source}, {}};
+    } planes[2]{{{token, 1, 0, &source}, {}}, {{token, 1, 0, &overlay}, {}}};
+    auto& plane = planes[0];
+    const UINT count = overlay ? 2 : 1;
     struct Parameters {
         float threshold;
         UINT options[7];
@@ -64,7 +192,7 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
     }
     // Frosty's main thread owns the game window while a render thread presents.
     const auto submit = [&] {
-        auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });
+        auto render = std::async(std::launch::async, [&] { return present(queue, count, &plane.prefix, &params); });
         while (render.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) pump();
         // The present may resize the title window asynchronously just before it returns; apply
         // that move before the client area is measured.
@@ -76,6 +204,21 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
             throw std::runtime_error(message);
         }
     };
+    if (splash_ && token == 1) {
+        // A lone first frame completes behind the splash, which stays on the screen
+        // in the title's window.
+        submit();
+        const auto until = GetTickCount64() + 300;
+        while (GetTickCount64() < until) {
+            if (!splash_shows(0)) throw std::runtime_error("the first frame ended the package splash");
+            Sleep(16);
+        }
+        return;
+    }
+    if (splash_) {
+        // With the held first frame, three more within a second are steady and end the splash.
+        for (int i = 0; i < 3; ++i) submit();
+    }
     submit();
     if (!window_) {
         EnumWindows([](HWND w, LPARAM data) -> BOOL {
@@ -87,43 +230,32 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
         }, reinterpret_cast<LPARAM>(&window_));
     }
     RECT client{};
-    if (!GetClientRect(window_, &client)) throw std::runtime_error("could not get presentation client area");
-    POINT origin{}, end{client.right, client.bottom};
-    if (!ClientToScreen(window_, &origin) || !ClientToScreen(window_, &end))
-        throw std::runtime_error("could not locate presentation window");
-    if (check_size_) {
-        MONITORINFO monitor{};
-        monitor.cbSize = sizeof(monitor);
-        if (!GetMonitorInfoW(MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitor))
-            throw std::runtime_error("could not locate display work area");
-        const auto& area = monitor.rcWork;
-        sizing_ = " client=" + std::to_string(client.right) + "x" + std::to_string(client.bottom)
-            + " origin=" + std::to_string(origin.x) + "," + std::to_string(origin.y)
-            + " monitor=" + std::to_string(area.right - area.left) + "x" + std::to_string(area.bottom - area.top);
-        if (origin.x < area.left || origin.y < area.top || end.x > area.right || end.y > area.bottom)
-            throw std::runtime_error("off-screen presentation" + sizing_);
-        if (std::abs(client.right * 9 - client.bottom * 16) > 16)
-            throw std::runtime_error("distorted presentation" + sizing_);
-    }
+    POINT origin{};
+    measure(client, origin);
     const auto deadline = GetTickCount64() + 4000;
     // GE-Proton11-14 can leave a presented image off the screen until a later
     // present, which a title supplies every frame. Repeat this one a few times.
     auto resubmit_at = GetTickCount64() + 250;
     int resubmits = 3;
-    const std::array<POINT, 5> samples{{{5, 5}, {95, 5}, {5, 95}, {95, 95}, {50, 50}}};
     std::array<COLORREF, samples.size()> pixels{};
     do {
         pump();
-        HDC screen = GetDC(nullptr);
-        if (!screen) throw std::runtime_error("could not acquire screen DC");
+        pixels = sample();
         bool matched = true;
-        for (size_t i = 0; i < pixels.size(); ++i) {
-            pixels[i] = GetPixel(screen, origin.x + client.right * samples[i].x / 100,
-                                 origin.y + client.bottom * samples[i].y / 100);
-            matched &= pixels[i] == (i == 4 ? center : corner);
+        for (size_t i = 0; i < pixels.size(); ++i) matched &= pixels[i] == (i == 4 ? center : corner);
+        if (matched) {
+            if (splash_) {
+                // Frames after that still reach the screen.
+                for (int i = 0; i < 10; ++i) {
+                    submit();
+                    Sleep(16);
+                }
+                if (!shows(corner, center, 2000))
+                    throw std::runtime_error("frames stopped reaching the screen after the splash" + describe(sample()));
+                sizing_ += " splash=held,ended";
+            }
+            return;
         }
-        ReleaseDC(nullptr, screen);
-        if (matched) return;
         if (resubmits && GetTickCount64() >= resubmit_at) {
             submit();
             --resubmits;

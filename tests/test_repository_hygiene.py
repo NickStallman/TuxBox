@@ -1,5 +1,7 @@
+import os
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -23,6 +25,13 @@ class RepositoryHygieneTests(unittest.TestCase):
         generated = status() + "\n"
         self.assertEqual(saved, generated,
                          "Regenerate with python tuxbox.py status > docs/RESULTS.md")
+
+    def test_results_table_is_written_as_utf8_whatever_the_console_encoding(self):
+        # A Windows console writes redirected output in its code page, such as cp1252.
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"}
+        written = subprocess.run([sys.executable, str(ROOT / "tuxbox.py"), "status"], cwd=ROOT, env=env,
+                                 check=True, capture_output=True).stdout
+        self.assertEqual(written.replace(b"\r\n", b"\n").decode("utf-8"), status() + "\n")
 
     def test_no_tracked_files_match_gitignore(self):
         result = subprocess.run(

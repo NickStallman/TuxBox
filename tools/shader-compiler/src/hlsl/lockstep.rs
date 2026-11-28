@@ -15,9 +15,9 @@
 //! loop for the wave, so a read reaches its lane in every iteration.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ray_resolve, Emitter, Enc, Insn, Opnd, COUNT_LANES};
+use super::{r, ray_resolve, Emitter, Enc, Insn, Opnd, COUNT_LANES};
 
 thread_local!(static LANE_READS: Cell<bool> = const { Cell::new(false) });
 
@@ -58,6 +58,24 @@ pub(super) fn lower_lane_reads(group: [u32; 3], insns: &mut [Insn]) -> Result<()
         op.mnemonic = super::indexed_lane::WAVE32_READ_LANE.into();
     }
     Ok(())
+}
+
+/// The block dispatcher runs each invocation through its own blocks, so a vote
+/// that a reduction's guard needs may not find the whole wave there.
+pub(super) const DISPATCHED_VOTE: &str = "wave reduction EXECZ vote in a block-dispatched program";
+
+thread_local!(static INSTEAD_OF_GUARDS: Cell<bool> = const { Cell::new(false) });
+
+/// Whether this translation branches with the whole wave where a guard would vote.
+pub(super) fn instead_of_guards() -> bool { INSTEAD_OF_GUARDS.with(Cell::get) }
+
+/// Translate with every branch a decision of the whole wave, which the block
+/// dispatcher keeps, instead of the votes of single guards, which it cannot.
+pub(super) fn without_guards<T>(run: impl FnOnce() -> T) -> T {
+    INSTEAD_OF_GUARDS.with(|c| c.set(true));
+    let result = run();
+    INSTEAD_OF_GUARDS.with(|c| c.set(false));
+    result
 }
 
 /// What a scalar register holds.
@@ -101,6 +119,16 @@ pub(super) struct Vote {
     pub none: bool,
     /// The destination receives the number of lanes in the mask.
     pub count: bool,
+}
+
+/// What the emitter adds to a program whose branches are decisions of the whole wave.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Proof {
+    /// The condition codes to vote after the instructions that set them.
+    pub votes: BTreeMap<usize, Vote>,
+    /// Instructions that count the lanes of a mask or find its first, and so
+    /// read the whole wave's bits where each invocation holds one.
+    pub ballots: BTreeSet<usize>,
 }
 
 const VCC: u16 = 106;
@@ -196,8 +224,9 @@ fn operands(op: &Insn) -> usize {
     used.min(op.src.len())
 }
 
-/// Apply `op` to `state`. `None` refuses the program.
-fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
+/// Apply `op` to `state`. `None` refuses the program. `ballot` is set when the
+/// instruction reads its mask operand as the whole wave's.
+fn step(op: &Insn, state: &mut State, width: u16, ballot: &mut bool) -> Option<Option<Vote>> {
     let name = op.mnemonic.as_str();
     if matches!(name, "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap") {
         return None;
@@ -222,20 +251,15 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
             if op.enc == Enc::Sopk && !name.starts_with("s_movk") && !name.starts_with("s_getreg") {
                 inputs = inputs.join(state.read(op.dst.first()?, 1));
             }
-            // A literal other than the two masks is an ordinary number.
-            if inputs == Class::Conflict {
-                return None;
-            }
-            if name == ray_resolve::READ_LANE
-                || name == super::indexed_lane::WAVE32_READ_LANE
-                || name == COUNT_LANES
-                || name == "tb_first_active_lane"
-                || (name.starts_with("s_ff1_i32") && op.src == [Opnd::ExecLo])
-            {
-                state.set(destination?, 1, Class::Uniform);
+            // A copy of a register that is a mask on one path and a number on another
+            // is as unusable as its source. Whatever reads the copy is refused, so a
+            // restore of EXEC that nothing runs under does not refuse the program.
+            if inputs == Class::Conflict && matches!(name, "s_mov_b32" | "s_mov_b64") {
+                state.set(op.dst.first().and_then(register)?, size, Class::Conflict);
                 return Some(None);
             }
-            if name.starts_with("tb_") {
+            // A literal other than the two masks is an ordinary number.
+            if inputs == Class::Conflict {
                 return None;
             }
             if name == "s_andn2_wrexec_b32" {
@@ -248,14 +272,47 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
                 state.set(EXEC, 1, combined);
                 return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false, count: false }));
             }
-            if name == "s_bcnt1_i32_b32" && inputs == Class::Mask {
-                let mask = *op.src.first()?;
-                // The count replaces the destination, so the mask must survive it.
-                if op.dst.first() == Some(&mask) {
+            // In a 32-lane wave a count the emitter takes after the instruction. It
+            // replaces the destination, so a count into its own mask is left to the
+            // ballot below, which reads the mask first.
+            if name == "s_bcnt1_i32_b32" && inputs == Class::Mask && width == 1 && op.dst.first() != op.src.first() {
+                state.set(destination?, 1, Class::Uniform);
+                return Some(Some(Vote { mask: *op.src.first()?, none: false, count: true }));
+            }
+            // The wave arrives together, so the bits its lanes hold are the whole
+            // mask. EXEC names its own half; another register does when the count
+            // is as wide as the wave.
+            if (name.starts_with("s_ff1_i32_b") || name.starts_with("s_bcnt1_i32_b")) && inputs == Class::Mask {
+                if !matches!(op.src[..], [Opnd::ExecLo | Opnd::ExecHi]) && size != width {
+                    return None;
+                }
+                *ballot = true;
+                state.set(destination?, 1, Class::Uniform);
+                return Some(None);
+            }
+            // The lane a group exchange reads is the same for the whole wave.
+            if name == "tb_indexed_readlane" || name == super::GROUP_READ {
+                if !inputs.is_value() {
                     return None;
                 }
                 state.set(destination?, 1, Class::Uniform);
-                return Some(Some(Vote { mask, none: false, count: true }));
+                return Some(None);
+            }
+            if name == ray_resolve::READ_LANE
+                || name == super::indexed_lane::WAVE32_READ_LANE
+                || name == COUNT_LANES
+                || name == "tb_first_active_lane"
+                || (name.starts_with("s_ff1_i32") && op.src == [Opnd::ExecLo])
+            {
+                state.set(destination?, 1, Class::Uniform);
+                return Some(None);
+            }
+            // A prefix sum over the wave, which is together here, written under EXEC.
+            if name == super::wave_alloc::PREFIX {
+                return state.get(EXEC).is_mask().then_some(None);
+            }
+            if name.starts_with("tb_") {
+                return None;
             }
             if name.contains("saveexec") {
                 let exec = state.get(EXEC);
@@ -264,6 +321,16 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
                     return None;
                 }
                 state.set(destination?, size, exec);
+                state.set(EXEC, size, combined);
+                return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false, count: false }));
+            }
+            // The new EXEC is also what the destination receives.
+            if name.contains("wrexec") {
+                let combined = state.get(EXEC).join(state.read(op.src.first()?, size));
+                if !combined.is_mask() {
+                    return None;
+                }
+                state.set(destination?, size, combined);
                 state.set(EXEC, size, combined);
                 return Some((combined == Class::Mask).then_some(Vote { mask: Opnd::ExecLo, none: false, count: false }));
             }
@@ -347,6 +414,15 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
                     continue;
                 }
                 let class = state.read(source, wide(name));
+                // The lanes of a mask below this one. The emitter takes the ballot of
+                // EXEC itself; of another register only the low word of a narrow wave.
+                if name.starts_with("v_mbcnt_") && position == 0 && class == Class::Mask {
+                    if !matches!(source, Opnd::ExecLo | Opnd::ExecHi) {
+                        (name == "v_mbcnt_lo_u32_b32" && width == 1).then_some(())?;
+                        *ballot = true;
+                    }
+                    continue;
+                }
                 if selects && position == 2 { class.is_mask() } else { class.is_value() }.then_some(())?;
             }
             if name.starts_with("v_cmp") {
@@ -384,9 +460,13 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
             } else {
                 op.src.len()
             };
-            if op.dst.iter().any(|destination| register(destination).is_some())
-                || !op.src.iter().take(used).filter(|source| register(source).is_some())
-                    .all(|source| state.read(source, 4).is_value())
+            // A descriptor is four words. The offset register of a buffer access is one.
+            let words = |position| if matches!(op.enc, Enc::Mubuf | Enc::Mtbuf) && position == 2 { 1 } else { 4 };
+            // These run under EXEC as the vector instructions do.
+            if !state.get(EXEC).is_mask()
+                || op.dst.iter().any(|destination| register(destination).is_some())
+                || !op.src.iter().enumerate().take(used).filter(|(_, source)| register(source).is_some())
+                    .all(|(position, source)| state.read(source, words(position)).is_value())
             {
                 return None;
             }
@@ -395,9 +475,9 @@ fn step(op: &Insn, state: &mut State, width: u16) -> Option<Option<Vote>> {
     }
 }
 
-/// The votes that make every branch of the program one decision per wave of
-/// `width` lanes, or `None` when that cannot be shown.
-pub(super) fn prove(insns: &[Insn], width: u32) -> Option<BTreeMap<usize, Vote>> {
+/// The votes and ballots that make every branch of the program one decision per
+/// wave of `width` lanes, or `None` when that cannot be shown.
+pub(super) fn prove(insns: &[Insn], width: u32) -> Option<Proof> {
     let words = u16::try_from(width / 32).ok()?;
     let index: BTreeMap<i64, usize> = insns.iter().enumerate().map(|(i, op)| (op.offset as i64, i)).collect();
     let end = insns.last().map_or(0, |op| (op.offset + op.dwords * 4) as i64);
@@ -406,14 +486,18 @@ pub(super) fn prove(insns: &[Insn], width: u32) -> Option<BTreeMap<usize, Vote>>
         *first = Some(State::entry());
     }
     let mut pending = vec![0usize];
-    let mut votes = BTreeMap::new();
+    let mut proof = Proof::default();
     while let Some(at) = pending.pop() {
         let Some(op) = insns.get(at) else { continue };
         let mut state = states[at].clone()?;
         // Classes only move towards `Conflict`, so a later visit may need a vote
-        // an earlier one did not, or refuse, but never the reverse.
-        if let Some(vote) = step(op, &mut state, words)? {
-            votes.insert(at, vote);
+        // or a ballot an earlier one did not, or refuse, but never the reverse.
+        let mut ballot = false;
+        if let Some(vote) = step(op, &mut state, words, &mut ballot)? {
+            proof.votes.insert(at, vote);
+        }
+        if ballot {
+            proof.ballots.insert(at);
         }
         let mut next = Vec::with_capacity(2);
         let branch = op.enc == Enc::Sopp && Emitter::branch_cond(op.op).is_some();
@@ -439,7 +523,18 @@ pub(super) fn prove(insns: &[Insn], width: u32) -> Option<BTreeMap<usize, Vote>>
             }
         }
     }
-    Some(votes)
+    Some(proof)
+}
+
+/// The whole wave's word of the mask an instruction counts, where each
+/// invocation holds its own bit of it. `mask` names the low word.
+pub(super) fn word(em: &Emitter<'_>, at: usize, mask: &Opnd, high: bool) -> Option<String> {
+    em.lockstep.as_ref().filter(|proof| proof.ballots.contains(&at))?;
+    let (mask, high) = match mask {
+        Opnd::ExecHi => (&Opnd::ExecLo, true),
+        other => (other, high),
+    };
+    Some(format!("WaveActiveBallot(({} & 1u) != 0u).{}", r(mask).ok()?, if high { "y" } else { "x" }))
 }
 
 /// The wave-wide form of a branch on a lane mask.

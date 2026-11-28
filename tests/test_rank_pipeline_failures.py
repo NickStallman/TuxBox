@@ -1,11 +1,12 @@
 from contextlib import redirect_stdout
 from io import StringIO
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
 from tools.rank_pipeline_failures import (
-    CONFLICT, HOST_REJECTED, MIXED, NO_ANSWER, NO_REASON, NOT_LISTED,
+    CONFLICT, HOST_REJECTED, LAST_USED, MIXED, NO_ANSWER, NO_REASON, NOT_LISTED,
     STAND_IN, load_reasons, main, normalize, rank,
 )
 
@@ -98,6 +99,31 @@ class RankPipelineFailures(unittest.TestCase):
                                       str(cache / "runtime/one")]), 0)
             self.assertIn("reason A", out.getvalue())
             self.assertNotIn("reason B", out.getvalue())
+
+    def test_older_compiler_build_is_not_merged_by_default(self):
+        with TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            for version, used in [("old", 1_000_000), ("new", 2_000_000)]:
+                folder = cache / "runtime" / version
+                folder.mkdir(parents=True)
+                (folder / "same.reason").write_text(version + " reason")
+                (folder / "same.name").write_text("")
+                (folder / LAST_USED).write_text("")
+                os.utime(folder / LAST_USED, (used, used))
+            (cache / "pipeline-failures").mkdir()
+            (cache / "pipeline-failures/1.tsv").write_text(
+                "2\tstand-in\tslot62\tCS.missing=same\n")
+            out = StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(main([str(cache)]), 0)
+            self.assertIn("new reason", out.getvalue())
+            self.assertNotIn("old reason", out.getvalue())
+            self.assertNotIn(CONFLICT, out.getvalue())
+
+            everything = StringIO()
+            with redirect_stdout(everything):
+                self.assertEqual(main([str(cache), "--all-runtime-caches"]), 0)
+            self.assertIn(CONFLICT, everything.getvalue())
 
     def test_missing_runtime_directory_still_reports_outcomes(self):
         with TemporaryDirectory() as tmp:

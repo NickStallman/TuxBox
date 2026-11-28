@@ -3,20 +3,24 @@
 use super::{r, Emitter, Insn, Opnd};
 
 pub(super) const FLOAT_HELPERS: &str = r#"
+// Computed without branches: a program inlines this hundreds of times, and
+// each branch adds blocks for DXC to analyse.
 uint tb_float_relation(uint2 a, uint2 b, uint sign, uint infinity, uint minNormal, bool keepDenormals) {
     uint ax = a.y & (sign-1u), bx = b.y & (sign-1u);
-    if (ax > infinity || (ax == infinity && a.x != 0u) ||
-        bx > infinity || (bx == infinity && b.x != 0u)) return 8u;
-    if (!keepDenormals) {
-        if (ax < minNormal) { a.x = 0u; ax = 0u; }
-        if (bx < minNormal) { b.x = 0u; bx = 0u; }
-    }
-    bool negA = (a.y & sign) != 0u, negB = (b.y & sign) != 0u;
-    if ((ax | a.x | bx | b.x) == 0u) return 2u;
-    if (negA != negB) return negA ? 1u : 4u;
-    if (ax == bx && a.x == b.x) return 2u;
-    bool lessMagnitude = ax < bx || (ax == bx && a.x < b.x);
-    return (lessMagnitude != negA) ? 1u : 4u;
+    uint unordered = uint(ax > infinity) | (uint(ax == infinity) & uint(a.x != 0u)) |
+        uint(bx > infinity) | (uint(bx == infinity) & uint(b.x != 0u));
+    // All ones keeps an operand; zero flushes a denormal.
+    uint flush = uint(!keepDenormals);
+    uint keepA = (flush & uint(ax < minNormal)) - 1u, keepB = (flush & uint(bx < minNormal)) - 1u;
+    a.x &= keepA; ax &= keepA; b.x &= keepB; bx &= keepB;
+    uint negA = uint((a.y & sign) != 0u), negB = uint((b.y & sign) != 0u);
+    uint same = uint(negA == negB);
+    uint equal = uint((ax | a.x | bx | b.x) == 0u) | (same & uint(ax == bx) & uint(a.x == b.x));
+    uint below = uint(ax < bx) | (uint(ax == bx) & uint(a.x < b.x));
+    // Unlike signs order by A's sign; like signs by magnitude, reversed below zero.
+    uint less = ((same ^ 1u) & negA) | (same & (below ^ negA));
+    uint ordered = equal * 2u + (equal ^ 1u) * (4u - 3u * less);
+    return unordered * 8u + (unordered ^ 1u) * ordered;
 }
 bool tb_class_f64(uint2 bits, uint mask) {
     // Fold payload bits below bit 32 into the least significant fraction

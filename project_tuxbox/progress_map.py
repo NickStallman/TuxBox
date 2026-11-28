@@ -53,90 +53,27 @@ def window(group, width, height, path, *, focused=False):
 
 
 # Labels for observations in a packaged-settings retail run.
-FROSTY_GATES = {
-    "load_world": "World loaded",
-    "submit_frame": "Frame submitted",
-    "use_menu": "Menu used",
-    "load_wake_up_room": "Wake Up room loaded",
-    "load_chase_intro": "Chase intro loaded",
-    "play_chase": "Chase played",
-    "explore_city": "City explored",
-    "verify_visuals": "Visuals verified",
-    "verify_audio": "Audio verified",
-    "verify_frame_pacing": "Frame pacing verified",
-}
-
-
-def draw_overall(svg, y, paths, inventory, shader_rows):
+def draw_overall(svg, y, paths, instructions):
     verified = sum(row["status"] == "verified" for row in paths)
     library_share = verified / len(paths) if paths else None
-    archives = inventory.get("archives", {})
-    totals = [archives.get(name, {}).get("entries") for name in ("global", "material")]
-    shader_total = sum(totals) if all(type(n) is int and n > 0 for n in totals) else 0
-    surveyed = sum(row[2] for row in shader_rows)
-    translated = sum(row[1] for row in shader_rows)
-    shader_share = translated / shader_total if surveyed == shader_total and shader_total else None
+    instruction_share = instructions["share"] if instructions else None
 
     group = section(svg, PAD, y, "Overall TuxBox coverage")
     height = 112
     rect(group, 0, 0, INNER, height, PANEL, stroke=AMBER)
     text(group, 18, 32, "Overall TuxBox coverage", 25, AMBER, bold=True)
-    overall = None if library_share is None or shader_share is None else (library_share + shader_share) / 2
+    overall = None if library_share is None or instruction_share is None else (library_share + instruction_share) / 2
     text(group, INNER-18, 32, f"{overall:.1%}" if overall is not None else "Unmeasured",
          23, AQUA if overall is not None else MUTED, bold=True, anchor="end")
     rect(group, 18, 45, INNER-36, 8, LINE)
     if overall:
         rect(group, 18, 45, (INNER-36)*overall, 8, AQUA)
     library_label = f"{verified}/{len(paths)} verified ({library_share:.1%})" if library_share is not None else "Unmeasured"
-    shader_label = f"{translated:,}/{shader_total:,} entries ({shader_share:.1%})" if shader_share is not None else "Unmeasured"
+    instruction_label = (f"{instructions['covered']:,}/{instructions['total']:,} ({instruction_share:.1%})"
+                         if instruction_share is not None else "Unmeasured")
     text(group, 18, 77, f"Library behaviors · {library_label}", 15)
-    text(group, INNER-18, 77, f"Shader translation · {shader_label}", 15, anchor="end")
-    text(group, 18, 99, "Frosty sample · 50% required library behaviors, 50% shader translation.", 13, MUTED)
-    return y+height+GAP
-
-
-def draw_frosty_target(svg, y, evidence):
-    title = read_json(evidence / "matrix-awakens-launch.json")
-    if not title:
-        return y
-    receipt = read_json(evidence / title["progress_receipt"]) if title.get("progress_receipt") else {}
-    settings = receipt.get("settings", {})
-    run = receipt.get("runs", {}).get("tuxbox", {})
-    measured = bool(title.get("sha256") and title["sha256"] == receipt.get("title_sha256")
-                    and run.get("log_sha256") and "verified_milestones" in run
-                    and settings.get("graphics_profile") == "packaged"
-                    and settings.get("loose_graphics_overrides_in_package") == 0
-                    and settings.get("ray_tracing") == settings.get("lumen_hardware_ray_tracing") == 1)
-    verified = set(run["verified_milestones"]) if measured else set()
-    unknown = verified.difference(FROSTY_GATES)
-    if unknown:
-        raise ValueError(f"Unknown Frosty milestone(s): {sorted(unknown)}")
-    failure = receipt.get("failure", {}) if measured else {}
-    shader = failure.get("global_shader")
-    blocker = f"Blocked at global shader {shader} · {failure['entry']}" if shader is not None else ""
-    labels = [label for key, label in FROSTY_GATES.items() if key in verified]
-    # Five or more observations wrap to a second line within the SVG.
-    lines = [" · ".join(labels[pos:pos+4]) for pos in range(0, len(labels), 4)]
-    if not lines:
-        lines = ["No verified gameplay observations" if measured else "No matching retail run"]
-    reduced = read_json(evidence / "matrix-awakens/wake-up-xg.json")
-    executable = reduced.get("providers", {}).get("Frosty-XSX-Shipping.exe", {})
-    reduced_settings = reduced.get("profile_cvars", {})
-    reached_wake_up = (bool(title.get("sha256")) and executable.get("sha256") == title["sha256"]
-                       and reduced.get("fixed_log_sha256") and reduced_settings.get("r.RayTracing") == "0"
-                       and reduced_settings.get("r.Lumen.DiffuseIndirect.Allow") == "0"
-                       and reduced_settings.get("r.Lumen.Reflections.Allow") == "0"
-                       and any(event.get("event") == "Construct bullet time" for event in reduced.get("events", [])))
-    height = 65 + 22*len(lines) + (30 if blocker else 0) + (30 if reached_wake_up else 0)
-    group = section(svg, PAD, y, "Frosty retail test")
-    rect(group, 0, 0, INNER, height, PANEL, stroke=LINE)
-    text(group, 18, 32, "Frosty retail test", 23, AMBER, bold=True)
-    for index, line in enumerate(lines):
-        text(group, 18, 61+22*index, ("Packaged settings · " if index == 0 else "") + line, 15)
-    if blocker:
-        text(group, 18, 91+22*(len(lines)-1), blocker, 15, AMBER)
-    if reached_wake_up:
-        text(group, 18, height-13, "Reduced settings · Wake Up reached the bullet-time scene", 15, GREEN)
+    text(group, INNER-18, 77, f"RDNA 2 instructions · {instruction_label}", 15, anchor="end")
+    text(group, 18, 99, "50% required library behaviors, 50% RDNA 2 instructions converted to DXIL.", 13, MUTED)
     return y+height+GAP
 
 
@@ -199,7 +136,7 @@ def draw_libraries(svg, y, rows):
     for index, row in enumerate(rows):
         top = 149 + 29*index
         cell = element(group, "g")
-        element(cell, "title").text = f"{', '.join(row['libraries'])} · {row['scope']}"
+        element(cell, "title").text = ", ".join(row["libraries"])
         rect(cell, 18, top-19, INNER-36, 1, LINE)
         text(cell, 18, top, row["name"], 15)
         text(cell, 420, top, row["provider"], 14)
@@ -414,78 +351,55 @@ def shader_table(evidence):
     return "\n".join(lines)
 
 
-def draw_shaders(svg, y, data, rows, material_hits):
-    if not data:
+def instruction_coverage(evidence):
+    """How many RDNA 2 instructions TuxBox converts to HLSL that compiles to DXIL.
+
+    An instruction counts when one of its encodings, translated alone, compiled
+    through DXC and DXV, or when a GPU check ran it, which compiles it too.
+    """
+    from .instruction_inventory import RECORD, read_record
+    dxil = read_json(evidence / "shader-instructions/dxil.json")
+    checks = read_json(evidence / "shader-instructions/gpu-checks.json")
+    use = read_json(evidence / "shader-instructions/recorded-use.json")
+    if not dxil.get("compiled") or not RECORD.is_file():
+        return None
+    rows = read_record(RECORD.read_text())
+    names = {row["name"] for row in rows}
+    compiled = {row["name"] for row in rows if f"{row['family']} {row['opcode']} {row['name']}" in set(dxil["compiled"])}
+    cards = {name.split()[0]: set(card["instructions"]) for name, card in checks.get("adapters", {}).items()}
+    checked = set.union(set(), *cards.values()) & names
+    on_both = set.intersection(*(cards[v] for v in ("AMD", "NVIDIA"))) & names if {"AMD", "NVIDIA"} <= set(cards) else set()
+    covered = compiled | checked
+    used = {name for name, count in use.get("instructions", {}).items() if count and name in names}
+    return {"total": len(names), "covered": len(covered), "share": len(covered) / len(names),
+            "compiled": len(compiled), "used": len(used), "used_covered": len(used & covered),
+            "used_on_both": len(used & on_both)}
+
+
+def draw_instructions(svg, y, coverage):
+    if not coverage:
         return y
-    archive = data.get("archives", {}).get("material", {}).get("member_sha256")
-    stages = material_hits.get("stages", {})
-    hit_groups = [stages.get(kind, {}) for kind in ("opaque", "paired")]
-    show_hits = (archive and material_hits.get("material_archive_sha256") == archive
-                 and material_hits.get("result_set_sha256") and all(
-                     type(stage.get("translated")) is int and type(stage.get("entries")) is int
-                     and 0 <= stage["translated"] <= stage["entries"] for stage in hit_groups))
-    height = 146 + 28*len(rows) + (28 if show_hits else 0)
-    group = section(svg, PAD, y, "RDNA 2 shader translation")
-    window(group, INNER, height, "~/docs/SHADERS.md")
-    text(group, 18, 70, "RDNA 2 shader translation", 25, AMBER, bold=True)
-    text(group, 18, 96, "Measured on Frosty’s shader archives", 15)
-    text(group, 301, 121, "Compiler output", 13, MUTED)
-    text(group, INNER-102, 121, "Archive entries", 13, MUTED, anchor="end")
-    for index, (label, count, total, output, compiler) in enumerate(rows):
-        top = 145 + 28*index
-        cell = element(group, "g")
-        element(cell, "title").text = f"{label} · compiler snapshot {compiler}"
-        rect(cell, 18, top-18, INNER-36, 1, LINE)
-        text(cell, 18, top, label, 15)
-        text(cell, 301, top, "HLSL emitted" if output == "HLSL" else "DXIL compiled", 14)
-        rect(cell, 510, top-10, 125, 6, LINE)
-        rect(cell, 510, top-10, 125*count/total, 6, AQUA)
-        text(cell, INNER-102, top, f"{count:,}/{total:,}", 14, TEXT, anchor="end")
-        text(cell, INNER-18, top, f"{count/total:.1%}", 14, TEXT, anchor="end")
-    if show_hits:
-        opaque, paired = (f"{row['translated']:,}/{row['entries']:,}" for row in hit_groups)
-        text(group, 18, height-17, f"Material hit groups emitting HLSL · {opaque} opaque · {paired} with any-hit", 14, MUTED)
+    rows = [("All instructions", coverage["covered"], coverage["total"], "converted to DXIL")]
+    if coverage["used"]:
+        rows += [("Used in recorded shaders", coverage["used_covered"], coverage["used"], "converted to DXIL"),
+                 ("Used in recorded shaders", coverage["used_on_both"], coverage["used"], "run on AMD and NVIDIA")]
+    height = 152 + 28*len(rows)
+    group = section(svg, PAD, y, "RDNA 2 instructions")
+    window(group, INNER, height, "~/docs/INSTRUCTIONS.md")
+    text(group, 18, 70, "RDNA 2 instructions", 25, AMBER, bold=True)
+    text(group, 18, 96, "Converted to HLSL that compiles to DXIL", 15)
+    for index, (label, count, total, measure) in enumerate(rows):
+        top = 128 + 28*index
+        rect(group, 18, top-18, INNER-36, 1, LINE)
+        text(group, 18, top, label, 15)
+        text(group, 400, top, measure, 14)
+        rect(group, 610, top-10, 125, 6, LINE)
+        rect(group, 610, top-10, 125*count/total, 6, AQUA)
+        text(group, INNER-102, top, f"{count:,}/{total:,}", 14, TEXT, anchor="end")
+        text(group, INNER-18, top, f"{count/total:.1%}", 14, TEXT, anchor="end")
+    text(group, 18, height-18, "Compiled alone through DXC and DXV, or run by a GPU check. "
+         "Compiling doesn't prove a result matches the console.", 13, MUTED)
     return y + height + GAP
-
-
-def draw_projectscarlett_shaders(svg, y, evidence):
-    run = read_json(evidence / "projectscarlett-shader-preparation.json")
-    title = read_json(evidence / "projectscarlett-startup.json")
-    if (not title.get("executable_sha256") or run.get("executable_sha256") != title["executable_sha256"]
-            or not run.get("compiler_sha256") or not run.get("log_sha256")):
-        return y
-    counts = run.get("requests", {})
-    total, compiled, unsupported, failed = (counts.get(key) for key in ("total", "compiled", "unsupported", "failed"))
-    if (not all(type(n) is int and n >= 0 for n in (total, compiled, unsupported, failed))
-            or not total or compiled + unsupported + failed != total):
-        return y
-
-    group = section(svg, PAD, y, "Project Scarlett shader preparation")
-    share = compiled / total
-    pipelines = run.get("mesh_pipelines", {})
-    tested, created = pipelines.get("tested"), pipelines.get("created")
-    gpu_result = (type(tested) is int and type(created) is int and 0 <= created <= tested <= compiled
-                  and tested and pipelines.get("gpu") and pipelines.get("log_sha256"))
-    play = read_json(evidence / "projectscarlett-gameplay.json")
-    report = play.get("title_crash_report", {})
-    frame, code = report.get("frame"), play.get("result", {}).get("exit_code")
-    play_result = (play.get("executable_sha256") == title["executable_sha256"] and report.get("sha256")
-                   and report.get("game_state") == "Game Running" and type(frame) is int and type(code) is int)
-    height = 88 + 22*bool(gpu_result) + 22*bool(play_result)
-    rect(group, 0, 0, INNER, height, PANEL, stroke=LINE)
-    text(group, 18, 30, "Project Scarlett shader preparation", 23, AMBER, bold=True)
-    text(group, INNER-18, 30, f"{share:.1%}", 23, AQUA, bold=True, anchor="end")
-    rect(group, 18, 42, INNER-36, 7, LINE)
-    rect(group, 18, 42, (INNER-36)*share, 7, AQUA)
-    text(group, 18, 73, f"{compiled:,}/{total:,} captured requests compiled", 15)
-    text(group, INNER-18, 73, f"{unsupported:,} unsupported · {failed:,} failed", 14, MUTED, anchor="end")
-    if gpu_result:
-        text(group, 18, 96, f"{created:,}/{tested:,} new mesh pipelines created on {pipelines['gpu']}", 14, MUTED)
-    if play_result:
-        outcome = f"then exited with code {code}" if code else "then exited"
-        text(group, 18, height-14, f"Furthest run reached gameplay at frame {frame:,}, {outcome} · not yet playable",
-             14, MUTED)
-    return y+height+GAP
 
 
 def draw_verification(svg, y, evidence):
@@ -506,9 +420,8 @@ def render_map(evidence):
                              "aria-labelledby": "map-title map-description"})
     element(svg, "title", id="map-title").text = "TuxBox runtime compatibility"
     element(svg, "desc", id="map-description").text = (
-        "Overall coverage gives equal weight to verified Frosty library behaviors and shader translation. "
-        "Project Scarlett shader preparation is measured on captured requests. "
-        "Gameplay results identify the graphics settings used.")
+        "Overall coverage gives equal weight to verified library behaviors and RDNA 2 instructions "
+        "converted to HLSL that compiles to DXIL.")
     bg = rect(svg, 0, 0, WIDTH, 1, BG)
     rect(svg, 0, 0, WIDTH, 48, BAR)
     rect(svg, 0, 47, WIDTH, 1, LINE)
@@ -518,14 +431,10 @@ def render_map(evidence):
     brand.set("letter-spacing", "4")
     text(svg, WIDTH-PAD, 30, "Xbox Series X|S", 16, AQUA, anchor="end")
     paths = load_library_paths(evidence).get("paths", [])
-    inventory = read_json(evidence / "matrix-awakens/shader-inventory.json")
-    shader_rows = list(shader_archive_results(evidence, inventory))
-    y = draw_overall(svg, 48+GAP, paths, inventory, shader_rows)
-    material_hits = read_json(evidence / "matrix-awakens/material-hit-hlsl-survey.json")
-    y = draw_shaders(svg, y, inventory, shader_rows, material_hits)
-    y = draw_projectscarlett_shaders(svg, y, evidence)
+    instructions = instruction_coverage(evidence)
+    y = draw_overall(svg, 48+GAP, paths, instructions)
+    y = draw_instructions(svg, y, instructions)
     y = draw_libraries(svg, y, paths)
-    y = draw_frosty_target(svg, y, evidence)
     height = draw_verification(svg, y, evidence) + 6
     bg.set("height", str(height))
     svg.set("viewBox", f"0 0 {WIDTH} {height}")

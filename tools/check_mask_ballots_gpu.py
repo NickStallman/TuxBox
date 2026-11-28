@@ -28,6 +28,9 @@ from project_tuxbox.inspect import digest  # noqa: E402
 
 # Results go to v10, v11 and v12. s12 holds the entry EXEC and v14 the lane's index.
 WAVE_OPTIONS = {32: (), 64: ("-mattr=-wavefrontsize32,+wavefrontsize64",)}
+# A running sum along each row of sixteen lanes.
+ROW_SCAN = ["v_add_nc_u32_dpp v5, v5, v5 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1",
+            *(f"v_add_nc_u32_dpp v5, v5, v5 row_shr:{n} row_mask:0xf bank_mask:0xf" for n in (2, 4, 8))]
 WAVE32 = {
     # A compare's own mask.
     "compare": ["v_cmp_lt_u32_e32 vcc_lo, 0x3e8, v0", "s_bcnt1_i32_b32 s20, vcc_lo", "v_mov_b32_e32 v10, s20",
@@ -69,6 +72,17 @@ WAVE64 = {
                "s_bcnt1_i32_b64 s20, s[14:15]", branch("s_cbranch_scc0", "end"), "v_mov_b32_e32 v10, s20",
                "v_mbcnt_lo_u32_b32 v11, s14, 0", "v_mbcnt_hi_u32_b32 v11, s15, v11", "v_mov_b32_e32 v12, 1",
                label("end")],
+    # The exclusive prefix sum of the active lanes' values, taken twice in a loop. The lower
+    # half's total goes round through lane 31.
+    "scan": ["v_cmp_lt_u32_e32 vcc, 0x3e8, v0", "s_bcnt1_i32_b64 s20, vcc", "v_mov_b32_e32 v10, s20",
+             "v_mov_b32_e32 v11, 0", "s_mov_b32 s22, 0", label("again"), "s_or_saveexec_b64 s[14:15], -1",
+             "v_cndmask_b32_e64 v4, 0, v0, s[14:15]", "v_mov_b32_e32 v5, v4", *ROW_SCAN,
+             "s_mov_b32 exec_lo, 0xffff0000", "s_mov_b32 exec_hi, 0xffff0000",
+             "v_permlanex16_b32 v6, v5, -1, -1 op_sel:[1,0]", "v_add_nc_u32_e32 v5, v6, v5",
+             "v_readlane_b32 s16, v5, 31", "s_mov_b32 exec_lo, 0", "s_mov_b32 exec_hi, -1",
+             "v_add_nc_u32_e32 v5, s16, v5", "s_mov_b32 exec_lo, -1", "s_mov_b32 exec_hi, -1",
+             "v_sub_nc_u32_e32 v5, v5, v4", "s_mov_b64 exec, s[14:15]", "v_add_nc_u32_e32 v12, v5, v12",
+             "s_add_u32 s22, s22, 1", "s_cmp_lt_u32 s22, 2", branch("s_cbranch_scc1", "again")],
 }
 
 
@@ -87,7 +101,7 @@ def model(name, active, values, host):
         value = values[start:start + host]
         over = [on[i] and value[i] > LIMIT for i in lanes]
         mask = {"compare": over, "elected": over, "gathered": [on[i] and value[i] & 3 < 3 for i in lanes],
-                "others": [on[i] and not over[i] for i in lanes]}[name]
+                "others": [on[i] and not over[i] for i in lanes], "scan": over}[name]
         count, first = sum(mask), mask.index(True) if any(mask) else 0xffffffff
         for i in lanes:
             rank = sum(mask[:i])
@@ -95,6 +109,8 @@ def model(name, active, values, host):
                 rows.append((0, 0, 0))
             elif name == "compare":
                 rows.append((count, rank, first))
+            elif name == "scan":
+                rows.append((count, 0, 2 * sum(value[j] for j in range(i) if on[j]) & 0xffffffff))
             elif name == "elected":
                 rows.append((count if i == first else 0, rank, first) if mask[i] else (0, 0, 0))
             else:
@@ -121,13 +137,14 @@ def instrument_paired(hlsl):
     if not start or "tb_pair" not in hlsl or "[WaveSize(32)]" not in hlsl or "WaveActiveBallot" not in hlsl:
         raise ValueError("fixture must take the paired translation")
     lanes = [f"(tb_first + tb_pair + {32 * half}u)" for half in (0, 1)]
-    load = "".join(f"    uint input{half} = output[{lanes[half]}];\n    v0__{half} = input{half} & 0x7fffffffu;\n"
+    load = "".join(f"    uint input{half} = output[{lanes[half]}];\n    v0__[{half}] = input{half} & 0x7fffffffu;\n"
                    for half in (0, 1))
     load += ("    exec_lo = WaveActiveBallot((input0 >> 31) != 0u).x;\n"
              "    exec_hi = WaveActiveBallot((input1 >> 31) != 0u).x;\n")
     stores = ""
     for half in (0, 1):
-        low, high, last = (f"v{n}__{half}" if re.search(rf"\bv{n}__{half}\b", hlsl) else "0u" for n in (10, 11, 12))
+        # A register the program never touches is not declared.
+        low, high, last = (f"v{n}__[{half}]" if re.search(rf"\bv{n}__\b", hlsl) else "0u" for n in (10, 11, 12))
         stores += (f"    output[64u + {lanes[half]}] = {low} | ({high} << 8u) | ((WaveGetLaneCount() * 2u) << 16u);\n"
                    f"    output[128u + {lanes[half]}] = {last};\n")
     hlsl = hlsl[:start.end()] + load + hlsl[start.end():]

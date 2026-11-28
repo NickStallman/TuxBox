@@ -12,6 +12,17 @@ pub(in crate::hlsl) fn compute_user_sgpr(ex: &ShaderExtract, class: u32) -> Opti
     u8::try_from(loc & 0xff).ok()
 }
 
+/// User SGPRs that carry the GPU address of a root descriptor (FSSM user-data
+/// class 1: two SGPRs each, the first in the low byte of the location).
+pub(in crate::hlsl) fn root_address_sgprs(ex: &ShaderExtract) -> Vec<u8> {
+    let Some(rows) = tuxbox_dxbc::compute_table::user_data_records(&ex.fssm) else { return Vec::new() };
+    rows.filter(|&[class, _, width, ..]| class == 1 && width == 2)
+        .filter_map(|[.., loc]| u8::try_from(loc & 0xff).ok())
+        .flat_map(|low| [Some(low), low.checked_add(1)])
+        .flatten()
+        .collect()
+}
+
 /// The sampler heap base of a mesh program, from its one FSSM class-6 row.
 pub(in crate::hlsl) fn mesh_sampler_heap_base(ex: &ShaderExtract) -> Option<u8> {
     if ex.stage != Stage::Mesh || ex.root_sig.as_ref()?.flags & 0x800 == 0 {

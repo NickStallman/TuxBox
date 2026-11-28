@@ -12,8 +12,9 @@ impl<'a> Emitter<'a> {
             || (i.enc == Enc::Sopk && matches!(i.op, 0x12 | 0x13 | 0x15) && i.raw[0] & 63 == 1));
         // A wave64 VALU mask occupies an even-aligned SGPR pair. An odd
         // VOP3 comparison destination proves one-word masks throughout the
-        // guest program, including comparisons that target even registers.
-        let wave32_compare_masks = insns.iter().any(|ins| {
+        // guest program, including comparisons that target even registers. So
+        // does a program that only ever handles its masks as 32 bits.
+        let wave32_compare_masks = operand_fields::one_word_masks(&insns) || insns.iter().any(|ins| {
             ins.enc == Enc::Vop3 && ins.mnemonic.starts_with("v_cmp_")
                 && matches!(ins.dst.as_slice(), [Opnd::Sgpr(n)] if n & 1 != 0)
         });
@@ -23,6 +24,9 @@ impl<'a> Emitter<'a> {
             packed: None,
             loop_depth: 0,
             accepted_swizzle_loops: BTreeSet::new(),
+            descriptor_copies: BTreeSet::new(),
+            descriptor_reads: BTreeSet::new(),
+            heap_index_reads: BTreeSet::new(),
             in_accepted_swizzle_loop_stack: Vec::new(),
             ex,
             insns,
@@ -114,6 +118,8 @@ impl<'a> Emitter<'a> {
             msel: HashMap::new(),
             bsel: HashMap::new(),
             dsel_loads: HashMap::new(),
+            size_reads: BTreeSet::new(),
+            count_reads: BTreeMap::new(),
             dsel_runtime: HashMap::new(),
             dsel_moves: HashMap::new(),
             live: Vec::new(),
@@ -140,6 +146,8 @@ impl<'a> Emitter<'a> {
             fspx_wave: None,
             hair_multisample: false,
             hoist_wave_exchanges: false,
+            hoisted_votes: BTreeSet::new(),
+            group_votes: false,
             regs: if has_mode { BTreeSet::from(["tb_fp_mode".into()]) } else { BTreeSet::new() },
             body: String::new(),
             heap_locals: BTreeSet::new(),

@@ -107,8 +107,46 @@ pub fn translate_stencil_target(ex: &ShaderExtract, slot: u32) -> Result<Transla
 
 pub(in crate::hlsl) fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_order: &[String],
     stencil_target: Option<u32>) -> Result<Translated, String> {
+    let translated = translate_outputs_per_lane(ex, feeds_ps, output_order, stencil_target);
+    // Where no one-lane-per-thread form runs the program, the two-lane form may: it
+    // keeps both halves of a console wave and branches once for the whole wave.
+    match translated {
+        Err(reason) if stencil_target.is_none() && paired_wave64::takes_over(ex, &reason) => {
+            translate_paired_wave64(ex).ok().filter(|paired| paired.hlsl.len() <= MAX_HLSL_BYTES).ok_or(reason)
+        }
+        other => other,
+    }
+}
+
+fn translate_outputs_per_lane(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_order: &[String],
+    stencil_target: Option<u32>) -> Result<Translated, String> {
+    let first = translate_outputs_before_key_counts(ex, feeds_ps, output_order, stencil_target);
+    if first.is_ok() || ex.stage != Stage::Compute || stencil_target.is_some() {
+        return first;
+    }
+    // Only a program refused every other way takes the per-key count rewrite.
+    let mut insns = disassemble(&ex.isa);
+    if lower_local_pc_transfers(&mut insns).is_err() {
+        return first;
+    }
+    match with_key_counts(&insns, || translate_outputs_before_key_counts(ex, feeds_ps, output_order, stencil_target)) {
+        Some(Ok(retried)) => Ok(retried),
+        _ => first,
+    }
+}
+
+fn translate_outputs_before_key_counts(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_order: &[String],
+    stencil_target: Option<u32>) -> Result<Translated, String> {
     let mut lane_read_failed = false;
     let first = translate_outputs_once_impl(ex, feeds_ps, output_order, stencil_target, &mut lane_read_failed);
+    // Interleaved loops go through the block dispatcher, where only a program whose
+    // every branch is the whole wave's keeps its lanes together at a reduction.
+    let first = match first {
+        Err(reason) if reason == lockstep::DISPATCHED_VOTE => lockstep::without_guards(|| {
+            translate_outputs_once_impl(ex, feeds_ps, output_order, stencil_target, &mut false)
+        }).or(Err(reason)),
+        other => other,
+    };
     if lane_read_failed && ex.stage == Stage::Compute && stencil_target.is_none()
         && first.as_ref().is_err_and(|reason| reason.contains("inside non-uniform loop"))
     {
@@ -201,6 +239,8 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
                 | Opnd::ConstInt(_) | Opnd::ConstF32(_) | Opnd::Literal(_)))
     })).then(|| compute_group(ex));
     lower_local_pc_transfers(&mut insns)?;
+    // A lane kept to itself cannot stand in for these whole-wave loops.
+    let key_counts = if ex.stage == Stage::Compute && !lone_lane::on() && rewriting() { lower_key_counts(&mut insns) } else { Vec::new() };
     let entry_fallback = ex.stage == Stage::Compute && indexed_lane::skip_empty_wave_fallback(&mut insns);
     let single_wave32 = (entry_fallback || probe_trace) && compute_group(ex).into_iter().fold(1u32, u32::saturating_mul) == 32
         && insns.iter().any(|op| op.mnemonic == "s_and_saveexec_b32")
@@ -260,7 +300,9 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         required_wave_size
     };
     let required_wave_size = if resolve_wave32 {
-        if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
+        // Mixed lane storage pins host lanes to the guest's, so a quad exchange reads the
+        // lane it names. The ray resolve has no verified exchange.
+        if matches!(required_wave_size, Some(64)) || !mixed_lane_wave32 && insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
         }
         Some(32)
@@ -386,6 +428,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         if scan_width.is_some() { return Err("wave scan needs a verified packed root layout".into()); }
         em.resolve_resources()?;
     }
+    counters_are_private(&em, &key_counts)?;
     if allocation_wave64 {
         // Both following stores write list data to the same typed view: the light
         // index and the previous uint head returned by the indexed atomic exchange.
@@ -515,7 +558,11 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         em.lockstep = Some(lockstep::prove(&em.insns, 32).ok_or("whole-wave lane reads: masks and numbers mix")?);
     }
     if let Some(width) = required_wave_size.filter(|_| !lockstep::for_lane_reads()) {
-        match wave_sum::check_control_flow(&em.insns, width) {
+        // A guard's vote does not survive the block dispatcher (see `translate_outputs`).
+        let checked = wave_sum::check_control_flow(&em.insns, width).and_then(|guards| {
+            if lockstep::instead_of_guards() && !guards.is_empty() { Err(lockstep::DISPATCHED_VOTE.into()) } else { Ok(guards) }
+        });
+        match checked {
             Ok(guards) => em.reduction_execz_guards = guards,
             Err(reason) if em.resolve_wave32 && !requires_ballot && scan_width.is_none() => {
                 // A termination proof lets bounded loops drop the watchdog. Without
@@ -533,7 +580,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
                     return Err(reason);
                 }
                 match lockstep::prove(&em.insns, width) {
-                    Some(votes) => em.lockstep = Some(votes),
+                    Some(proof) => em.lockstep = Some(proof),
                     None => {
                         // Lockstep cannot prove this program; lower the totals that
                         // wave_sum rejects on control flow to WaveActiveSum, a
@@ -569,7 +616,8 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
         && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
-    if em.portable_wave64 { em.mask_ballots = None; }
+    // Lockstep counts, reads and branches on masks across the wave itself.
+    if em.portable_wave64 || em.lockstep.is_some() { em.mask_ballots = None; }
     em.regs.extend(em.mask_ballots.iter().flat_map(mask_ballots::Ballots::names).collect::<Vec<_>>());
     if straight_exchange && !em.portable_wave64 {
         return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
@@ -688,6 +736,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         hlsl.insert_str(0, instance_cull_hzb::HIDDEN_DECLARATIONS);
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
+    if em.group_votes { hlsl.insert_str(0, group_loops::GROUP_ANY); }
     if em.portable_wave64 { hlsl.insert_str(0, &wave_sum::portable_declarations(compute_group(ex))); }
     if shared_mask {
         hlsl.insert_str(0, &page_waves::ballot_declarations(compute_group(ex).into_iter().product()));
@@ -715,6 +764,17 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
     if material_classify { hlsl.insert_str(0, ps09_classify::DECLARATIONS); }
     hlsl.insert_str(0, &format!("// entry-live registers (read before written): {}
 ", live_in.join(" ")));
+    // A host lays a derivative-taking group out two by two, so a wave of a group wider
+    // than 16 threads holds two runs of thread numbers and need not start on a wave
+    // boundary. No recorded program is one; refuse instead of trusting the wave to be
+    // the console's.
+    if ex.stage == Stage::Compute && em.compute_derivatives {
+        let [x, y, z] = compute_group(ex);
+        let threads = x.saturating_mul(y).saturating_mul(z);
+        if x > 16 && (y > 1 || z > 1) && em.required_wave_size.is_some_and(|width| threads > width) {
+            return Err("derivatives in a group wider than 16 threads that spans several waves".into());
+        }
+    }
     // ps_5_0 forces UAV slots to start after the render-target outputs (FXC X4509);
     // SM5.1 has no such rule, and D3D12 accepts SM5.1 bytecode.
     let profile = if em.compute_derivatives || em.resolve_wave32 {

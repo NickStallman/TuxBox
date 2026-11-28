@@ -10,7 +10,7 @@ impl<'a> Emitter<'a> {
         for line in mask_ballots::capture(self, idx) {
             self.line(&line);
         }
-        if let Some(vote) = self.lockstep.as_ref().and_then(|votes| votes.get(&idx)).cloned() {
+        if let Some(vote) = self.lockstep.as_ref().and_then(|proof| proof.votes.get(&idx)).cloned() {
             let mask = r(&vote.mask)?;
             if vote.count {
                 let dst = ins.dst.first().ok_or("missing lane count destination")?;
@@ -108,9 +108,10 @@ impl<'a> Emitter<'a> {
                 return self.ws(&d.ok_or("missing elected lane register")?, "((exec_lo & 1u) ? 0u : 0xffffffffu)");
             }
             "s_ff1_i32_b64" if ins.src == [Opnd::ExecLo] && !self.paired => {
-                // WaveActiveMin returns the same lane ID to all participating invocations.
+                // Every participating invocation gets the same lane ID.
                 let dst = d.ok_or("missing elected lane register")?;
-                return self.ws(&dst, "WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu)");
+                let lane = self.first_active_lane();
+                return self.ws(&dst, &lane);
             }
             "tb_subsurface_group_sync" => {
                 self.line("GroupMemoryBarrierWithGroupSync();");
@@ -118,7 +119,8 @@ impl<'a> Emitter<'a> {
             }
             "tb_first_active_lane" => {
                 let dst = d.ok_or("missing elected lane register")?;
-                return self.ws(&dst, "WaveActiveMin((exec_lo & 1u) ? WaveGetLaneIndex() : 0xffffffffu)");
+                let lane = self.first_active_lane();
+                return self.ws(&dst, &lane);
             }
             "tb_capture_allocation_mask32" => {
                 let dst = d.ok_or("missing mask register")?;

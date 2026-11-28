@@ -335,10 +335,35 @@ impl Registry {
         }
     }
 
+    pub(crate) fn retire_range(&self, address: u64, bytes: u64) {
+        let Some(end) = address.checked_add(bytes) else {
+            return;
+        };
+        if end == address {
+            return;
+        }
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let retired: Vec<usize> = state
+            .imports
+            .iter()
+            .filter(|(_, (import, _))| import.start < end && address < import.end)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in retired {
+            if let Some((_, live)) = state.imports.remove(&key) {
+                live.store(false, Ordering::Release);
+            }
+        }
+    }
+
     fn apply(&self, mappings: &Mappings) -> Result<()> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         mappings.apply(&mut state.imports)
     }
+}
+
+pub(crate) unsafe extern "system" fn retire_from_xmem(address: u64, bytes: u64) {
+    GPU_APERTURE.retire_range(address, bytes);
 }
 
 struct Job {

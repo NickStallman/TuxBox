@@ -94,17 +94,11 @@ unsafe fn translate(
         D3D12_FEATURE_D3D12_OPTIONS7 => {
             // At RVA 0x51844 the Scarlett UMD writes mesh tier then sampler
             // feedback tier. Feedback maps require additional device methods.
-            let mesh = match host_query(
-                device,
-                feature,
-                D3D12_FEATURE_DATA_D3D12_OPTIONS7::default(),
-            ) {
-                Ok(host) if host.MeshShaderTier.0 >= D3D12_MESH_SHADER_TIER_1.0 => {
-                    D3D12_MESH_SHADER_TIER_1
-                }
-                // Older desktop runtimes may not recognize this feature query.
-                Ok(_) | Err(E_INVALIDARG | E_NOTIMPL) => D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
-                Err(error) => return Err(error),
+            // Mesh support is the host profile's, which signatures also follow.
+            let mesh = if super::host_profile::mesh_shaders(device) {
+                D3D12_MESH_SHADER_TIER_1
+            } else {
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
             };
             unsafe { words.cast::<[u32; 2]>().write_unaligned([mesh.0 as u32, 0]) };
         }

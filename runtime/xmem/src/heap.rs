@@ -119,7 +119,10 @@ unsafe extern "system" fn statistics(heap: HANDLE, out: *mut [usize; 2]) -> i32 
     };
     // On Windows this is the same query and callback shape as the Xbox DLL.
     // Wine can leave the extended query unimplemented; its regular heap walk
-    // provides region commits and separate large virtual blocks.
+    // provides region commits and separate large virtual blocks. An NT heap,
+    // which HeapCreate makes on desktop Windows, answers the query too but
+    // leaves the segment-heap counters at zero. Every heap commits something,
+    // so walk it instead.
     let status = unsafe {
         RtlQueryHeapInformation(
             ptr::null_mut(),
@@ -129,7 +132,7 @@ unsafe extern "system" fn statistics(heap: HANDLE, out: *mut [usize; 2]) -> i32 
             ptr::null_mut(),
         )
     };
-    if status >= 0 && native.received {
+    if status >= 0 && native.received && native.bytes[0] != 0 {
         unsafe { out.write_unaligned(native.bytes) };
         return 1;
     }

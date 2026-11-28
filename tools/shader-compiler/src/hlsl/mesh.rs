@@ -247,6 +247,9 @@ pub(super) fn translate(
     if wave_control {
         h.push_str(&super::page_waves::declarations([128, 1, 1], false));
     }
+    if em.group_votes {
+        h.push_str(super::group_loops::GROUP_ANY);
+    }
     if swizzles {
         h.push_str("#define TB_SWIZZLE_WORDS 128u\ngroupshared uint tb_swizzle[TB_SWIZZLE_WORDS];\nuint tb_swizzle_read(uint i) { return i < TB_SWIZZLE_WORDS ? tb_swizzle[i] : 0u; }\n");
     }

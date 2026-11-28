@@ -28,7 +28,40 @@ float tb_cubetc(float x, float y, float z) { float ax = abs(x), ay = abs(y), az 
 float tb_cubeid(float x, float y, float z) { float ax = abs(x), ay = abs(y), az = abs(z); if (az >= ax && az >= ay) return z < 0.0 ? 5.0 : 4.0; if (ay >= ax) return y < 0.0 ? 3.0 : 2.0; return x < 0.0 ? 1.0 : 0.0; }
 float3 tb_cube_dir(float s, float t, float face) { float u = (s - 1.5) * 2.0, v = (t - 1.5) * 2.0; int f = (int)round(face); if (f == 0) return float3(1.0, -v, -u); if (f == 1) return float3(-1.0, -v, u); if (f == 2) return float3(u, 1.0, v); if (f == 3) return float3(u, -1.0, -v); if (f == 4) return float3(u, -v, 1.0); return float3(-u, -v, -1.0); }
 float tb_mull(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }
-uint tb_f16_cvt(float x, bool rtz) { uint u = asuint(x); uint s = (u >> 16) & 0x8000u; uint a = u & 0x7fffffffu; if (a > 0x7f800000u) return s | 0x7e00u | ((a >> 13) & 0x3ffu); if (a == 0x7f800000u) return s | 0x7c00u; if (rtz) { if (a >= 0x477fe000u) return s | 0x7bffu; } else { if (a >= 0x477ff000u) return s | 0x7c00u; } if (a >= 0x38800000u) { uint r = (a >> 13) - 0x1c000u; uint rem = a & 0x1fffu; if (!rtz && (rem > 0x1000u || (rem == 0x1000u && (r & 1u) != 0u))) r += 1u; return s | r; } if (a < 0x33000000u) return s; uint e = a >> 23; uint mant = (a & 0x7fffffu) | 0x800000u; uint sh = 126u - e; uint q = mant >> sh; uint rem = mant & ((1u << sh) - 1u); uint half = 1u << (sh - 1u); if (!rtz && (rem > half || (rem == half && (q & 1u) != 0u))) q += 1u; return s | q; }
+// A host's log2 can be exact only to an absolute error, which is far more than
+// one unit of a result close to zero. Close to 1 the logarithm comes from the
+// series of 2 atanh((x - 1) / (x + 1)), whose error is relative to the result.
+float tb_log2(float x) {
+    precise float d = x - 1.0;
+    precise float s = d / (2.0 + d);
+    precise float q = s * s;
+    precise float near = 2.885390081777927 * s * (1.0 + q * (0.3333333333 + q * (0.2 + q * (0.1428571429 + q * (0.1111111111 + q * 0.0909090909)))));
+    return (x > 0.75 && x < 1.5) ? near : log2(x);
+}
+uint tb_f16_cvt(float x, bool rtz) {
+    uint u = asuint(x);
+    uint s = (u >> 16) & 0x8000u;
+    uint a = u & 0x7fffffffu;
+    uint nearest = uint(!rtz);
+    // Computed without branches, as a program inlines this at every conversion.
+    // Each range of magnitudes has a result; the last matching selection wins.
+    uint r = (a >> 13) - 0x1c000u;
+    uint rem = a & 0x1fffu;
+    r += nearest & (uint(rem > 0x1000u) | (uint(rem == 0x1000u) & r & 1u));
+    uint sh = (126u - (a >> 23)) & 31u;
+    uint mant = (a & 0x7fffffu) | 0x800000u;
+    uint q = mant >> sh;
+    uint lost = mant & ((1u << sh) - 1u);
+    uint half = 1u << ((sh - 1u) & 31u);
+    q += nearest & (uint(lost > half) | (uint(lost == half) & q & 1u));
+    uint value = s | q;
+    value ^= (value ^ s) & (0u - uint(a < 0x33000000u));
+    value ^= (value ^ (s | r)) & (0u - uint(a >= 0x38800000u));
+    value ^= (value ^ (s | (0x7c00u - uint(rtz)))) & (0u - uint(a >= 0x477ff000u - 0x1000u * uint(rtz)));
+    value ^= (value ^ (s | 0x7c00u)) & (0u - uint(a == 0x7f800000u));
+    value ^= (value ^ (s | 0x7e00u | ((a >> 13) & 0x3ffu))) & (0u - uint(a > 0x7f800000u));
+    return value;
+}
 "#;
 
 pub(in crate::hlsl) const MAD24_SAT: &str = r#"
@@ -87,4 +120,19 @@ bool tb_isnan(float x) { return (asuint(x) & 0x7fffffffu) > 0x7f800000u; }
 float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a < b ? a : b)); }
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
 float tb_med3(float a, float b, float c) { if (tb_isnan(a) || tb_isnan(b) || tb_isnan(c)) return tb_min(tb_min(a, b), c); float mx = tb_max(tb_max(a, b), c); if (mx == a) return tb_max(b, c); if (mx == b) return tb_max(a, c); return tb_max(a, b); }
+"#;
+
+/// OMOD scales an instruction's rounded result by 2^k. It adds k to the exponent
+/// bits, so no compiler can move the scale into a product and lose an overflow
+/// to infinity: a `precise` multiply still came back finite on NVIDIA. With
+/// output denormals off OMOD flushes them, so a result below the normal range
+/// and a denormal input become a zero of the same sign. Infinity and NaN pass.
+pub(in crate::hlsl) const OMOD: &str = r#"float tb_omod(float x, int k) {
+    uint b = asuint(x), e = (b >> 23) & 0xffu, sign = b & 0x80000000u;
+    if (e == 0xffu) return x;
+    int n = int(e) + k;
+    if (e == 0u || n <= 0) return asfloat(sign);
+    if (n >= 255) return asfloat(sign | 0x7f800000u);
+    return asfloat((b & 0x807fffffu) | (uint(n) << 23));
+}
 "#;

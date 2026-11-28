@@ -58,10 +58,11 @@ impl Flow {
             if (!op.is_complete() && !lane_spill)
                 || op.enc == Enc::Unknown
                 || (!branch && op.mnemonic.contains("branch"))
-                || matches!(
+                // `lower_local_pc_transfers` leaves a resolved long jump as a branch.
+                || (!branch && matches!(
                     op.mnemonic.as_str(),
                     "s_setpc_b64" | "s_swappc_b64" | "s_call_b64" | "s_rfe_b64" | "s_trap"
-                )
+                ))
             {
                 return None;
             }

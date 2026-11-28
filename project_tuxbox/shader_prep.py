@@ -341,7 +341,7 @@ def prepare_for_launch(executable, host):
             from .pipeline_prep import prepare_pipelines
             chase_profile = json.loads(profile.with_name("frosty-chase-warmup.json").read_text())
             built, found = prepare_chase(pak, cache, chase_profile, plan["executable_sha256"],
-                                         {row["dxbc_sha256"] for row in plan["shaders"]}, progress)
+                                         {row["dxbc_sha256"] for row in plan["shaders"]}, progress, env=host.env)
             compiled += built
             reused += found
             prepare_pipelines(executable, host, plan, cache, progress, standalone=True)

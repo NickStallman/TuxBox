@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_mesa_shader_cache, configure_nvidia_shader_cache, configure_pipeline_cache, limit_malloc_growth, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -306,6 +306,7 @@ class SeedShaderCache(unittest.TestCase):
             seed.assert_called_once()
 
 
+@unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
 class OfflineLaunch(unittest.TestCase):
     def host(self, probe_code=0, stderr=""):
         tmp = tempfile.TemporaryDirectory()
@@ -464,6 +465,64 @@ class PipelineCache(unittest.TestCase):
             self.assertEqual(env, {"VKD3D_SHADER_CACHE_PATH": value})
 
 
+class MallocLimits(unittest.TestCase):
+    def test_limits_are_added_and_a_user_value_is_kept(self):
+        env = {"MALLOC_ARENA_MAX": "2"}
+        limit_malloc_growth(env)
+        self.assertEqual(env["MALLOC_ARENA_MAX"], "2")
+        self.assertEqual(env["MALLOC_MMAP_THRESHOLD_"], "1048576")
+        self.assertEqual(env["MALLOC_TRIM_THRESHOLD_"], "8388608")
+
+
+class MesaShaderCache(unittest.TestCase):
+    def test_prefix_gets_its_own_driver_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            env = {"WINEPREFIX": str(prefix)}
+            reports = []
+            configure_mesa_shader_cache(env, reports.append)
+            cache = prefix / "shadercache"
+            self.assertEqual(env["MESA_SHADER_CACHE_DIR"], str(cache))
+            self.assertEqual(env["MESA_SHADER_CACHE_MAX_SIZE"], "4G")
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(reports, [f"Mesa shader cache: {cache}"])
+
+    def test_explicit_directory_size_and_disabled_cache_stay(self):
+        env = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DIR": "/games/mesa"}
+        configure_mesa_shader_cache(env)
+        self.assertEqual(env["MESA_SHADER_CACHE_DIR"], "/games/mesa")
+        self.assertEqual(env["MESA_SHADER_CACHE_MAX_SIZE"], "4G")
+        sized = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DIR": "/games/mesa",
+                 "MESA_SHADER_CACHE_MAX_SIZE": "12G"}
+        reports = []
+        configure_mesa_shader_cache(sized, reports.append)
+        self.assertEqual(sized["MESA_SHADER_CACHE_MAX_SIZE"], "12G")
+        self.assertEqual(reports, ["Mesa shader cache: /games/mesa (path set by the environment)"])
+        for value in ("1", "true"):
+            disabled = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DISABLE": value}
+            configure_mesa_shader_cache(disabled)
+            self.assertEqual(list(disabled), ["WINEPREFIX", "MESA_SHADER_CACHE_DISABLE"])
+
+    def test_launch_without_a_prefix_leaves_the_default_cache(self):
+        env = {}
+        configure_mesa_shader_cache(env)
+        self.assertEqual(env, {})
+
+    def test_the_host_sets_it_before_any_gpu_work(self):
+        # Pipeline preparation runs with the host's own environment, so the
+        # directory must be there, not only in the title's launch environment.
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("project_tuxbox.host.shutil.which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+             patch("project_tuxbox.host.subprocess.check_output", return_value="wine-10.0\n"), \
+             patch.dict(os.environ, clear=False) as environ:
+            environ.pop("MESA_SHADER_CACHE_DIR", None)
+            environ.pop("MESA_SHADER_CACHE_DISABLE", None)
+            host = Host("wine", None, Path(tmp))
+            cache = Path(tmp).resolve() / "shadercache"
+            self.assertEqual(host.env["MESA_SHADER_CACHE_DIR"], str(cache))
+            self.assertEqual(host.env["VKD3D_SHADER_CACHE_PATH"], str(cache))
+
+
 class NvidiaShaderCache(unittest.TestCase):
     def test_prefix_gets_its_own_driver_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -534,7 +593,8 @@ class NvidiaShaderCache(unittest.TestCase):
             small = self.driver_cache(cache, "small", [(32, 968)], 1000 + (3 << 20))
             before = {path: (path.stat().st_size, path.stat().st_mtime_ns) for path in cache.rglob("*.*")}
             reports = []
-            configure_nvidia_shader_cache({"WINEPREFIX": str(prefix)}, reports.append)
+            own = {"__GL_SHADER_DISK_CACHE_APP_NAME": "mine"}
+            configure_nvidia_shader_cache({"WINEPREFIX": str(prefix), **own}, reports.append)
             self.assertEqual(len(reports), 3)
             self.assertIn(f"{large} has stopped being indexed: 3,824 MiB of its 7.7 GiB is past the end", reports[1])
             self.assertIn(f"{small} has stopped being indexed: 3 MiB of its 0.0 GiB is past the end", reports[2])
@@ -544,6 +604,34 @@ class NvidiaShaderCache(unittest.TestCase):
             explicit = []
             configure_nvidia_shader_cache({"__GL_SHADER_DISK_CACHE_PATH": str(cache)}, explicit.append)
             self.assertEqual(explicit[1:], reports[1:])
+
+    def test_a_launch_writes_a_file_with_room_and_reads_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            cache = prefix / "shadercache"
+
+            def launch(**extra):
+                env = {"WINEPREFIX": str(prefix), **extra}
+                configure_nvidia_shader_cache(env)
+                return (env.get("__GL_SHADER_DISK_CACHE_APP_NAME"),
+                        env.get("__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME"))
+
+            self.assertEqual(launch(), ("tuxbox1", None))
+            # The driver's own file, past its index, is still read. A bare header is not.
+            self.driver_cache(cache, "92f74448a56b9fe8", [], 5 << 30)
+            self.driver_cache(cache, "92f74448a56b9fe6", [], 32)
+            self.driver_cache(cache, "tuxbox10", [], (1 << 30) - 1)
+            self.assertEqual(launch(), ("tuxbox1", "92f74448a56b9fe8"))
+            self.driver_cache(cache, "tuxbox12", [], 1 << 30)
+            self.assertEqual(launch(), ("tuxbox2", "92f74448a56b9fe8;tuxbox10;tuxbox12"))
+            for number in range(2, 11):
+                self.driver_cache(cache, f"tuxbox{number}0", [], 1 << 30 if number < 10 else 64)
+            name, read = launch()
+            self.assertEqual(name, "tuxbox10")
+            self.assertEqual(len(read.split(";")), 11)
+            self.assertNotIn("tuxbox100", read.split(";"))
+            self.assertEqual(launch(__GL_SHADER_DISK_CACHE_APP_NAME="mine"), ("mine", None))
+            self.assertEqual(launch(__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME="theirs"), (None, "theirs"))
 
     def test_a_cache_at_the_index_limit_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

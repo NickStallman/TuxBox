@@ -24,6 +24,9 @@ impl<'a> Emitter<'a> {
             self.sampler_heap_base = Some(base);
             self.compute_heap = true;
         }
+        if self.compute_heap && !self.pixel_heap {
+            (self.descriptor_copies, self.descriptor_reads) = descriptor_broadcast::find(&self.insns);
+        }
         let off2idx: HashMap<usize, usize> = self.insns.iter().enumerate().map(|(i, x)| (x.offset, i)).collect();
         // Block leaders and per-instruction branch targets.
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
@@ -144,6 +147,11 @@ impl<'a> Emitter<'a> {
                             }
                             match sym.get(&k).copied() {
                                 Some(b) if a == b => {}
+                                // A size value on some paths only is no longer known,
+                                // and must not be read (see `descriptor_size`).
+                                _ if k >= descriptor_size::KEY => {
+                                    osym.insert(k, Sym::Size(descriptor_size::SizePart::Lost));
+                                }
                                 Some(b) => match self.join_desc(a, b) {
                                     Some(j) => {
                                         osym.insert(k, j);
@@ -171,6 +179,9 @@ impl<'a> Emitter<'a> {
                             if matches!(v, Sym::Desc { .. } | Sym::Multi { .. } | Sym::Table(_)) && !osym.contains_key(k) {
                                 osym.insert(*k, *v);
                             }
+                            if *k >= descriptor_size::KEY && !osym.contains_key(k) {
+                                osym.insert(*k, Sym::Size(descriptor_size::SizePart::Lost));
+                            }
                         }
                         if let Some(heap) = heap {
                             osym.extend(heap);
@@ -197,6 +208,9 @@ impl<'a> Emitter<'a> {
         self.msel.clear();
         self.bsel.clear();
         self.dsel_loads.clear();
+        // Facts held while the analysis was still converging are not proof.
+        self.size_reads.clear();
+        self.count_reads.clear();
         self.dsel_runtime.clear();
         self.dsel_moves.clear();
         self.raw_byte_index.clear();

@@ -23,6 +23,7 @@ enum Shape {
     HeapBuffer,
     UnresolvedOffset,
     PerInvocation,
+    Swizzle,
 }
 
 fn branch(op: u32, from: usize, to: usize) -> u32 {
@@ -88,8 +89,11 @@ fn shader(width: u32, shape: Shape) -> ShaderExtract {
         code[at] = branch(5, at, outer);
     }
     code.extend(reduction);
-    if shape == Shape::EmptyExec {
+    if matches!(shape, Shape::EmptyExec | Shape::Swizzle) {
         code.push(smov(126, 128));
+    }
+    if shape == Shape::Swizzle {
+        code.extend([0xd8d4_8000, 0x1100_001a]); // ds_swizzle_b32 v17, v26 within each quad
     }
     if shape == Shape::ClobberSavedExec {
         if width == 32 {
@@ -244,6 +248,16 @@ fn unbounded_loops_with_uniform_scalars_keep_the_watchdog() {
         assert_eq!(translated.required_wave_size, Some(32), "{shape:?}");
         assert!(translated.hlsl.contains("++tb_guard < 65536u"), "{shape:?}");
     }
+}
+
+#[test]
+fn a_swizzle_reads_lanes_that_stay_together() {
+    // It writes no scalar, so the lanes it reads still take every branch together.
+    let translated = translate(&shader(32, Shape::Swizzle)).expect("uniform scalars");
+    assert_eq!(translated.required_wave_size, Some(32));
+    assert!(translated.hlsl.contains("WaveReadLaneAt((exec_lo & tb_lane_bit) != 0u ? v26 : 0u, "));
+    assert!(translated.hlsl.contains("uint(exec_lo == 0u) * "));
+    assert!(translated.hlsl.contains("++tb_guard < 65536u"));
 }
 
 #[test]

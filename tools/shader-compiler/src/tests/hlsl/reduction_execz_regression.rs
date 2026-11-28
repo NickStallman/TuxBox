@@ -18,12 +18,13 @@ fn guarded_shader(width: u32, prefix: &[u32]) -> ShaderExtract {
 }
 
 #[test]
-fn reduction_execz_votes_only_at_proven_guards() {
+fn every_execz_around_a_reduction_votes() {
     for width in [32, 64] {
+        // The guard and the independent tail branch are both the whole wave's.
         let translated = translate(&guarded_shader(width, &[])).expect("guarded reduction");
         assert_eq!(translated.required_wave_size, Some(width));
-        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
-        assert!(translated.hlsl.contains("uint((exec_lo & 1u) == 0u) * "));
+        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 2);
+        assert!(!translated.hlsl.contains("uint((exec_lo & 1u) == 0u) * "));
     }
 }
 
@@ -33,7 +34,8 @@ fn reduction_execz_accepts_direct_rejoin_at_vote() {
         // Skip one local vector instruction and rejoin exactly at the guard.
         let translated = translate(&guarded_shader(width, &[0xbf88_0002, 0x4a00_0081]))
             .expect("direct rejoin before wave vote");
-        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 1);
+        assert_eq!(translated.hlsl.matches("!WaveActiveAnyTrue((exec_lo & 1u) != 0u)").count(), 3);
+        assert!(!translated.hlsl.contains("uint((exec_lo & 1u) == 0u) * "));
     }
 }
 

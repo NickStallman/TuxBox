@@ -20,19 +20,35 @@ pub fn may_write_images(shader: &[u8]) -> bool {
 fn writes_no_image(shader: &[u8]) -> Option<()> {
     let container = Dxbc::parse(shader).ok()?;
     let part = container.chunk(b"DXIL")?;
-    let variants = xdat::programs(shader.get(part.offset + 24..part.offset + part.size)?).ok()?;
+    let dxil = shader.get(part.offset..part.offset + part.size)?;
+    let vertex = u32::from_le_bytes(*dxil.first_chunk()?) >> 16 == VERTEX;
+    let variants = xdat::programs(dxil.get(24..)?).ok()?;
     if variants.is_empty() {
         return None;
     }
     for program in &variants {
-        isa_writes_no_image(&fssm::decode(program).ok()?.isa)?;
+        stage_writes_no_image(&fssm::decode(program).ok()?.isa, vertex)?;
     }
     Some(())
+}
+
+/// The DXIL program kind of a vertex shader.
+const VERTEX: u32 = 1;
+
+/// A vertex program calls the hardware fetch program through `s_swappc_b64`.
+/// The translation materialises vertex inputs from the input layout instead and
+/// never runs that call, so it cannot write an image through it.
+fn translated_away(op: &rdna2::Insn, vertex: bool) -> bool {
+    vertex && op.mnemonic == "s_swappc_b64"
 }
 
 /// `Some` when the instruction stream is fully decoded, stays inside itself
 /// and has no image store or image atomic.
 pub fn isa_writes_no_image(isa: &[u8]) -> Option<()> {
+    stage_writes_no_image(isa, false)
+}
+
+fn stage_writes_no_image(isa: &[u8], vertex: bool) -> Option<()> {
     if isa.is_empty() || !isa.len().is_multiple_of(4) {
         return None;
     }
@@ -41,7 +57,7 @@ pub fn isa_writes_no_image(isa: &[u8]) -> Option<()> {
             || op.enc == Enc::Unknown
             || op.mnemonic.contains('<')
             // Code reached through a computed address is not in this stream.
-            || matches!(
+            || !translated_away(&op, vertex) && matches!(
                 op.mnemonic.as_str(),
                 "s_call_b64" | "s_setpc_b64" | "s_swappc_b64" | "s_rfe_b64" | "s_trap"
             )
@@ -67,6 +83,7 @@ pub fn table_image_writes(shader: &[u8]) -> Option<Vec<TableSlot>> {
     let part = container.chunk(b"DXIL")?;
     let dxil = shader.get(part.offset..part.offset + part.size)?;
     let stage = u32::from_le_bytes(*dxil.first_chunk()?) >> 16;
+    let vertex = stage == VERTEX;
     let variants = xdat::programs(dxil.get(24..)?).ok()?;
     if variants.is_empty() {
         return None;
@@ -74,7 +91,7 @@ pub fn table_image_writes(shader: &[u8]) -> Option<Vec<TableSlot>> {
     let mut slots = Vec::new();
     for program in &variants {
         let code = fssm::decode(program).ok()?;
-        if isa_writes_no_image(&code.isa).is_some() {
+        if stage_writes_no_image(&code.isa, vertex).is_some() {
             continue;
         }
         // Each descriptor's user-data record names the register its table
@@ -98,7 +115,7 @@ pub fn table_image_writes(shader: &[u8]) -> Option<Vec<TableSlot>> {
                 }
             }
         }
-        for slot in isa_table_image_writes(&code.isa, &tables)? {
+        for slot in stage_table_image_writes(&code.isa, &tables, vertex)? {
             if !slots.contains(&slot) {
                 slots.push(slot);
             }
@@ -128,7 +145,11 @@ const NO_REGISTER: u32 = 125;
 /// `None` when a store's descriptor does not come, on every path, from one
 /// eight-dword load at a constant offset of such a pointer.
 pub fn isa_table_image_writes(isa: &[u8], tables: &[(u8, u32)]) -> Option<Vec<TableSlot>> {
-    isa_writes_no_image_or_decodes(isa)?;
+    stage_table_image_writes(isa, tables, false)
+}
+
+fn stage_table_image_writes(isa: &[u8], tables: &[(u8, u32)], vertex: bool) -> Option<Vec<TableSlot>> {
+    decodes(isa, vertex)?;
     let ops = rdna2::disassemble(isa);
     let writes = |op: &rdna2::Insn| op.mnemonic.starts_with("image_store") || op.mnemonic.starts_with("image_atomic");
     if !ops.iter().any(writes) {
@@ -245,7 +266,7 @@ pub fn isa_table_image_writes(isa: &[u8], tables: &[(u8, u32)]) -> Option<Vec<Ta
 }
 
 /// `Some` when the stream is fully decoded and stays inside itself.
-fn isa_writes_no_image_or_decodes(isa: &[u8]) -> Option<()> {
+fn decodes(isa: &[u8], vertex: bool) -> Option<()> {
     if isa.is_empty() || !isa.len().is_multiple_of(4) {
         return None;
     }
@@ -253,7 +274,7 @@ fn isa_writes_no_image_or_decodes(isa: &[u8]) -> Option<()> {
         if !op.is_complete()
             || op.enc == Enc::Unknown
             || op.mnemonic.contains('<')
-            || matches!(
+            || !translated_away(&op, vertex) && matches!(
                 op.mnemonic.as_str(),
                 "s_call_b64" | "s_setpc_b64" | "s_swappc_b64" | "s_rfe_b64" | "s_trap"
             )
@@ -267,3 +288,4 @@ fn isa_writes_no_image_or_decodes(isa: &[u8]) -> Option<()> {
 #[cfg(test)]
 #[path = "tests/image_writes.rs"]
 mod tests;
+

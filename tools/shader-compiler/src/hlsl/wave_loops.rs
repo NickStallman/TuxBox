@@ -281,7 +281,11 @@ fn full_mask_program(em: &Emitter<'_>) -> bool {
         && !em.insns.iter().any(|op| {
             (op.mnemonic.starts_with("tb_")
                 && !matches!(op.mnemonic.as_str(), ray_resolve::READ_LANE | super::mixed_lane::WRITE_LANE))
-                || op.enc == Enc::Ds
+                // Group memory writes only vector registers, so it leaves scalars and masks
+                // whole; `lds_order` orders a wave's exchanges through it. Lane exchanges
+                // through it and the global data share are not part of this proof.
+                || (op.enc == Enc::Ds && (matches!(op.mnemonic.as_str(), "ds_bpermute_b32" | "ds_permute_b32")
+                    || op.raw.first().is_some_and(|word| word & (1 << 17) != 0)))
                 || matches!(
                     op.mnemonic.as_str(),
                     "s_barrier" | "s_sendmsg" | "s_sendmsghalt"

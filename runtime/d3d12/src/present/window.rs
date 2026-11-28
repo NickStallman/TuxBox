@@ -136,6 +136,37 @@ fn fitted_window(
     })
 }
 
+/// The window rectangle that fits `width` x `height` into the work area,
+/// with the title window's own frame.
+fn title_bounds(hwnd: HWND, width: u32, height: u32, work: RECT) -> Result<RECT> {
+    // SAFETY: HWND is a live title window; these calls only read its state.
+    unsafe {
+        let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
+        let extended = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+        fitted_window(width, height, work, style, extended, !GetMenu(hwnd).is_invalid())
+    }
+}
+
+/// Fit a window the title has just created, on the thread that created it and
+/// before the title shows it, as `fit_title_window` would at the first present.
+pub(super) fn fit_created_window(hwnd: HWND, width: u32, height: u32) -> Result<()> {
+    // SAFETY: the caller runs on the window's own thread, so the move applies
+    // before this returns.
+    unsafe {
+        let info = monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST))?;
+        let bounds = title_bounds(hwnd, width, height, info.rcWork)?;
+        SetWindowPos(
+            hwnd,
+            None,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    }
+}
+
 fn fit_title_window(hwnd: HWND, width: u32, height: u32) -> Result<()> {
     // SAFETY: HWND is the selected visible title window. Asynchronous sizing
     // leaves its UI thread free to consume the event outside this render call.
@@ -152,16 +183,7 @@ fn fit_title_window(hwnd: HWND, width: u32, height: u32) -> Result<()> {
         {
             return Ok(());
         }
-        let style = WINDOW_STYLE(GetWindowLongPtrW(hwnd, GWL_STYLE) as u32);
-        let extended = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
-        let bounds = fitted_window(
-            width,
-            height,
-            work,
-            style,
-            extended,
-            !GetMenu(hwnd).is_invalid(),
-        )?;
+        let bounds = title_bounds(hwnd, width, height, work)?;
         SetWindowPos(
             hwnd,
             None,

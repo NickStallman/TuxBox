@@ -68,15 +68,6 @@ fn written(ins: &Insn, wide: bool) -> Vec<(u8, u8)> {
     one(if m.starts_with("tb_") && m.ends_with("64") { 2 } else { 1 })
 }
 
-/// Whether the lanes of an instruction's mask are all running it. Other masks can also
-/// hold lanes that went another way.
-fn running(ins: &Insn) -> bool {
-    let m = ins.mnemonic.as_str();
-    !BITWISE.iter().any(|p| m.starts_with(p)) || m.contains("saveexec")
-        || ins.src.iter().enumerate().any(|(k, o)| *o == Opnd::ExecLo
-            && (m.starts_with("s_mov_b") || m.starts_with("s_and_b") || (m.starts_with("s_andn2_b") && k == 0)))
-}
-
 const BITWISE: [&str; 11] = ["s_mov_b", "s_and_b", "s_or_b", "s_xor_b", "s_andn2_b", "s_orn2_b", "s_nand_b", "s_nor_b",
     "s_xnor_b", "s_not_b", "s_cselect_b"];
 
@@ -121,11 +112,11 @@ fn predecessors(insns: &[Insn]) -> Vec<Vec<usize>> {
 
 /// Which lanes of a wave run an instruction together.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Together { All, Running, Some }
+enum Together { All, Some }
 
-/// Branches of the console take the whole wave, those of the translation one lane. Lanes
-/// part in what a branch on a mask jumps over or repeats and after an early exit. A branch on
-/// EXEC keeps the running ones together.
+/// Branches of the console take the whole wave. Those on EXEC or VCC take it here too (see
+/// `Ballots::branches`); a branch on SCC that can come from a mask takes one lane, so lanes
+/// part in what it jumps over or repeats, and after an early exit.
 fn together(insns: &[Insn]) -> Vec<Together> {
     let branches = || insns.iter().enumerate().filter(|(_, x)| x.enc == Enc::Sopp && Emitter::branch_cond(x.op).is_some());
     let target = |x: &Insn| x.offset as i64 + 4 + 4 * x.aux.imm;
@@ -138,8 +129,7 @@ fn together(insns: &[Insn]) -> Vec<Together> {
         let lanes = match branch.op {
             2 => continue,
             4 | 5 if uniform_condition(insns, i, &targets) => continue,
-            8 if to > from => Together::Running,
-            9 if to <= from => Together::Running,
+            6..=9 => continue,
             _ => Together::Some,
         };
         for (k, x) in insns.iter().enumerate() {
@@ -220,8 +210,7 @@ impl Reach<'_> {
             if !seen.insert(d) { continue; }
             let captured = direct.contains(&d);
             // Lanes that went another way would be missing from its ballot.
-            let whole = match self.together[d] { Together::All => true, Together::Running => running(&self.insns[d]), Together::Some => false };
-            if captured && !whole { return None; }
+            if captured && self.together[d] == Together::Some { return None; }
             match kind(&self.insns[d], self.wide) {
                 Kind::Number => return None,
                 // Counted itself, it holds lanes that are not running.
@@ -247,6 +236,10 @@ pub(super) struct Ballots {
     pub defs: BTreeMap<usize, BTreeSet<u8>>,
     /// Instructions that read ballots instead of their mask operand.
     pub uses: BTreeSet<usize>,
+    /// Branches on an empty or non-empty EXEC or VCC, decided for the whole wave as the
+    /// console does. Each lane holds only its own bit, so a lane deciding alone would skip
+    /// scalar writes, barriers and mask bits the rest of its wave still runs.
+    pub branches: BTreeSet<usize>,
     pub width: u32,
 }
 
@@ -272,7 +265,8 @@ pub(super) fn find(insns: &[Insn]) -> Option<Ballots> {
         _ => return None,
     };
     let reach = Reach { insns, from: predecessors(insns), together: together(insns), wide };
-    let mut found = Ballots { defs: BTreeMap::new(), uses: BTreeSet::new(), width: if wide { 64 } else { 32 } };
+    let mut found = Ballots { defs: BTreeMap::new(), uses: BTreeSet::new(), branches: BTreeSet::new(), width: if wide { 64 } else { 32 } };
+    found.branches = insns.iter().enumerate().filter(|(_, i)| i.enc == Enc::Sopp && (6..=9).contains(&i.op)).map(|(k, _)| k).collect();
     for (i, ins) in insns.iter().enumerate().filter(|(_, i)| counted(i)) {
         let Some(source) = ins.src.first() else { continue };
         // The emitter already takes the ballot of EXEC for the other two.
@@ -287,7 +281,14 @@ pub(super) fn find(insns: &[Insn]) -> Option<Ballots> {
         for d in defs { found.defs.entry(d).or_default().insert(first); }
         found.uses.insert(i);
     }
-    (!found.uses.is_empty()).then_some(found)
+    (!found.uses.is_empty() || !found.branches.is_empty()).then_some(found)
+}
+
+/// The condition of branch `at` when the whole wave decides it.
+pub(super) fn branch(em: &Emitter<'_>, at: usize, op: u32) -> Option<String> {
+    em.mask_ballots.as_ref().filter(|b| b.branches.contains(&at))?;
+    let (mask, empty) = match op { 6 => ("vcc_lo", true), 7 => ("vcc_lo", false), 8 => ("exec_lo", true), 9 => ("exec_lo", false), _ => return None };
+    Some(format!("{}WaveActiveAnyTrue(({mask} & 1u) != 0u)", if empty { "!" } else { "" }))
 }
 
 /// The text of a mask word read by instruction `at`.

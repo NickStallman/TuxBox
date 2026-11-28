@@ -6,6 +6,11 @@ from pathlib import Path
 import re
 from threading import Event
 
+# The umu game id TuxBox launches with. Proton names a game window
+# steam_app_<id> for it, so desktop rules treat the window as a game's; the
+# "default" id leaves the executable name instead.
+PROTON_APP_ID = "tuxbox"
+
 
 # Proton sends a console game's stdio to its own conhost. Wine's console
 # channel exposes those writes. Unicode debug strings use the SEH channel.
@@ -81,9 +86,9 @@ class _WineMessages:
 def _proton_log_path(backend, env, cwd):
     if backend != "proton" or env.get("PROTON_LOG", "") in ("", "0"):
         return None
-    # Host uses umu's GAMEID=umu-default, which sets SteamGameId=default.
+    # Host's umu GAMEID sets SteamGameId, which names Proton's log.
     directory = Path(env.get("PROTON_LOG_DIR", env.get("HOME", str(Path.home()))))
-    return Path(cwd) / directory / "steam-default.log"
+    return Path(cwd) / directory / f"steam-{PROTON_APP_ID}.log"
 
 
 def check_log_path(backend, env, cwd, log_path):

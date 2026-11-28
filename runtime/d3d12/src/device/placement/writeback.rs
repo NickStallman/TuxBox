@@ -1,5 +1,5 @@
 //! Publish the GPU's texels to the original Xbox pages before the guest fence.
-use super::{Texture, committed, lock};
+use super::{Digest, Texture, committed, lock};
 use core::{mem::ManuallyDrop, ops::Range};
 use std::sync::Arc;
 use windows::Win32::Foundation::{
@@ -141,7 +141,7 @@ impl Readback {
                 // region covers this mip. Recheck on every publication, since
                 // the guest can commit backing after creating the texture.
                 if region.0 - address >= size && !mapped_region(&region.1) {
-                    state.previous[level].clear();
+                    state.previous[level] = None;
                     continue;
                 }
                 tiled.clear();
@@ -186,7 +186,7 @@ impl Readback {
                 }
                 // Include padding from guest memory in the comparison baseline:
                 // upload::refresh compares the entire physical mip snapshot.
-                texture.snapshot_mip(mip, &mut state.previous[level])?;
+                state.previous[level] = texture.snapshot_mip(mip, &mut tiled)?.then(|| Digest::of(&tiled));
             }
             Ok(())
         });
@@ -275,6 +275,11 @@ fn write_mapped(
     range: Range<usize>,
     region: &mut Region,
 ) -> Result<()> {
+    if let Some(addr) = base.checked_add(range.start)
+        && let Some(result) = super::super::heap::backing::try_write_xmem_bytes(addr as u64, &bytes[range.start..range.end])
+    {
+        return result;
+    }
     let mut at = range.start;
     while at < range.end {
         let addr = base.checked_add(at).ok_or(E_INVALIDARG)?;

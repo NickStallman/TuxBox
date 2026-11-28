@@ -1,8 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
+from threading import Barrier, Lock
 from pathlib import Path
 import struct
 import subprocess
 import sys
+from time import monotonic, sleep
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -65,6 +69,15 @@ class DxilReuse(unittest.TestCase):
         # Other targets keep their key, so their cached output stays usable.
         self.assertEqual(DxilStore.key(b"shader", "ps_6_0"), hashlib.sha256(b"ps_6_0\nshader").hexdigest())
 
+    def test_streamed_content_key_matches_existing_cache_keys(self):
+        path = self.root / "large.hlsl"
+        data = bytes(range(256)) * 12289
+        path.write_bytes(data)
+        for target in ("ps_6_0", "cs_6_6", "ms_6_5"):
+            self.assertEqual(DxilStore.key_file(path, target), DxilStore.key(data, target))
+        path.write_bytes(b"")
+        self.assertEqual(DxilStore.key_file(path, "ps_6_0"), DxilStore.key(b"", "ps_6_0"))
+
     def test_new_translator_with_same_hlsl_skips_dxc(self):
         first = self.compile(self.cache("a"))
         second = self.compile(self.cache("b"))
@@ -72,6 +85,127 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual((self.root / "runtime/b" / (hashlib.sha256(b"shader").hexdigest() + ".sha256")).read_text(),
                          hashlib.sha256(second).hexdigest())
+
+    def test_parallel_distinct_sources_share_identical_cold_hlsl(self):
+        caches = [self.cache("a"), self.cache("b")]
+        sources = []
+        for i in range(2):
+            data = f"distinct source {i}".encode()
+            key = hashlib.sha256(data).hexdigest()
+            source = self.root / (key + ".dxbc")
+            source.write_bytes(data)
+            sources.append((source, key))
+        translated = Barrier(2)
+        misses = Barrier(2)
+        guard = Lock()
+        original_fetch = DxilStore.fetch
+        fetched = set()
+
+        def run(args, *, timeout):
+            self.run_tool(args, timeout=timeout)
+            if args[0].name == "xshader":
+                translated.wait(5)
+
+        def fetch(store, key, output, **kwargs):
+            # Force both initial lookups to miss before either can publish.
+            result = original_fetch(store, key, output, **kwargs)
+            with guard:
+                first = output not in fetched
+                fetched.add(output)
+            if first:
+                misses.wait(5)
+            return result
+
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run), \
+                patch.object(DxilStore, "fetch", fetch), ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(compile_request, source, key, self.tools, cache, None)
+                    for (source, key), cache in zip(sources, caches)]
+            self.assertTrue(all(job.result(timeout=10) for job in jobs))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(*( (cache / (key + ".cso")).read_bytes()
+                            for (_, key), cache in zip(sources, caches)))
+
+    def test_content_lock_releases_after_failed_compile_and_never_caches_failure(self):
+        cache = self.cache("a")
+        original = self.run_tool
+        def fail(args, *, timeout):
+            if args[0].name == "dxc":
+                raise OSError("transient compile failure")
+            original(args, timeout=timeout)
+        data = b"failed source"
+        key = hashlib.sha256(data).hexdigest()
+        source = self.root / (key + ".dxbc")
+        source.write_bytes(data)
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=fail):
+            with self.assertRaisesRegex(OSError, "transient"):
+                compile_request(source, key, self.tools, cache, None)
+        self.assertFalse((cache / (key + ".unsupported")).exists())
+        self.assertEqual(self.compile(self.cache("b"), b"new source"), container(b"void"))
+        self.assertEqual(self.compile(cache, data), container(b"void"))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_different_content_locks_do_not_serialize_unrelated_shaders(self):
+        caches = [self.cache("a"), self.cache("b")]
+        ready = Barrier(2)
+        active = Barrier(2)
+        def run(args, *, timeout):
+            if args[0].name == "xshader":
+                args[args.index("--hlsl-out") + 1].write_bytes(args[1].read_bytes())
+                args[args.index("--profile-out") + 1].write_text("ps_6_0")
+                ready.wait(5)
+            elif args[0].name == "dxc":
+                active.wait(5)  # Both independent content keys must proceed.
+                self.run_tool(args, timeout=timeout)
+        sources = []
+        for i in range(2):
+            data = f"distinct source {i}".encode()
+            key = hashlib.sha256(data).hexdigest()
+            source = self.root / (key + ".dxbc")
+            source.write_bytes(data)
+            sources.append((source, key))
+        with patch("project_tuxbox.runtime_shaders.run_tool", side_effect=run), ThreadPoolExecutor(max_workers=2) as pool:
+            jobs = [pool.submit(compile_request, source, key, self.tools, cache, None)
+                    for (source, key), cache in zip(sources, caches)]
+            self.assertTrue(all(job.result(timeout=10) for job in jobs))
+        self.assertEqual(len(self.calls), 2)
+
+    def test_content_lock_coordinates_independent_processes(self):
+        from project_tuxbox.runtime_shaders import compile_lock
+        store = DxilStore.for_cache(self.cache("a"))
+        key = "a" * 64
+        entered = self.root / "entered"
+        attempted = self.root / "attempted"
+        program = (
+            "from pathlib import Path; import sys; "
+            "from project_tuxbox.runtime_shaders import compile_lock; "
+            "Path(sys.argv[3]).touch(); "
+            "lock = compile_lock(Path(sys.argv[1]), sys.argv[2], timeout=5); "
+            "lock.__enter__(); Path(sys.argv[4]).touch(); lock.__exit__(None, None, None)"
+        )
+        with compile_lock(store.root, key):
+            child = subprocess.Popen([sys.executable, "-c", program, str(store.root), key,
+                                      str(attempted), str(entered)],
+                                     cwd=Path(__file__).resolve().parents[1],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                deadline = monotonic() + 3
+                while not attempted.exists() and monotonic() < deadline:
+                    sleep(.005)
+                self.assertTrue(attempted.exists())
+                sleep(.1)
+                self.assertFalse(entered.exists())
+            except BaseException:
+                child.kill()
+                child.communicate()
+                raise
+        try:
+            _, stderr = child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 0, stderr)
+            self.assertTrue(entered.exists())
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
 
     def test_changed_hlsl_profile_or_toolchain_recompiles(self):
         self.compile(self.cache("a"))
@@ -96,6 +230,72 @@ class DxilReuse(unittest.TestCase):
         self.assertEqual(len(self.calls), 2)
         self.compile(self.cache("c"))
         self.assertEqual(len(self.calls), 2, "the recompile replaced the damaged entry")
+
+    def test_fetch_returns_the_verified_snapshot(self):
+        cache = self.cache("a")
+        data = self.compile(cache)
+        store = DxilStore.for_cache(cache)
+        key = store.key(self.hlsl.encode(), self.profile)
+        output = self.root / "output.cso"
+        self.assertEqual(store.fetch(key, output), data)
+        self.assertEqual(output.read_bytes(), data)
+
+    def test_rejected_stage_is_not_staged_or_counted_as_reuse(self):
+        from project_tuxbox.dxil_store import reused
+        from project_tuxbox.runtime_shaders import portable_stage
+        cache = self.cache("a")
+        data = self.compile(cache)
+        store = DxilStore.for_cache(cache)
+        key = store.key(self.hlsl.encode(), self.profile)
+        output = self.root / "output.cso"
+        before = reused["dxil"]
+        self.assertEqual(portable_stage(data), 0)
+        self.assertIsNone(store.fetch(key, output, accept=lambda blob: portable_stage(blob) == 5))
+        self.assertFalse(output.exists())
+        self.assertEqual(reused["dxil"], before)
+        self.assertEqual(store.fetch(key, output, accept=lambda blob: portable_stage(blob) == 0), data)
+        self.assertEqual(reused["dxil"], before + 1)
+
+    def test_fetch_rejects_oversized_entries_before_copy(self):
+        store = DxilStore.for_cache(self.cache("a"))
+        key = "a" * 64
+        output = self.root / "output.cso"
+        with (store.root / f"{key}.cso").open("wb") as stream:
+            stream.truncate((64 << 20) + 1)
+        (store.root / f"{key}.sha256").write_text("0" * 64)
+        self.assertIsNone(store.fetch(key, output))
+        self.assertFalse(output.exists())
+
+    def test_fetch_rejects_linked_payloads_and_markers(self):
+        store = DxilStore.for_cache(self.cache("a"))
+        key = "a" * 64
+        output = self.root / "output.cso"
+        data = container(b"void")
+        payload = self.root / "payload"
+        marker = self.root / "marker"
+        payload.write_bytes(data)
+        marker.write_text(hashlib.sha256(data).hexdigest())
+        (store.root / f"{key}.cso").symlink_to(payload)
+        (store.root / f"{key}.sha256").write_bytes(marker.read_bytes())
+        self.assertIsNone(store.fetch(key, output))
+        (store.root / f"{key}.cso").unlink()
+        (store.root / f"{key}.cso").write_bytes(data)
+        (store.root / f"{key}.sha256").unlink()
+        (store.root / f"{key}.sha256").symlink_to(marker)
+        self.assertIsNone(store.fetch(key, output))
+        self.assertFalse(output.exists())
+
+    def test_fifo_payload_and_identity_are_rejected_without_blocking(self):
+        cache = self.cache("a")
+        store = DxilStore.for_cache(cache)
+        key = "a" * 64
+        output = self.root / "output.cso"
+        os.mkfifo(store.root / f"{key}.cso")
+        (store.root / f"{key}.sha256").write_text("0" * 64)
+        self.assertIsNone(store.fetch(key, output))
+        (cache / "dxil-identity").unlink()
+        os.mkfifo(cache / "dxil-identity")
+        self.assertIsNone(DxilStore.for_cache(cache))
 
     def test_timed_out_request_goes_straight_to_o0_afterwards(self):
         self.timeouts = 1

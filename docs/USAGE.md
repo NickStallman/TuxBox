@@ -21,7 +21,7 @@ The Series S trial requested a 1920×1080 render resource and stopped on a textu
 TuxBox chooses shader translations and fallbacks by what the graphics driver can do, not by who made the card. The provider logs the profile it found when it first imports game memory:
 
 ```text
-host profile: adapter=10de:2705 wave=32-32 section-import=aliased descriptor-bytes=32/32
+host profile: adapter=10de:2705 wave=32-32 section-import=aliased descriptor-bytes=32/32 mesh=yes rays=yes
 ```
 
 | Field | Meaning |
@@ -29,8 +29,10 @@ host profile: adapter=10de:2705 wave=32-32 section-import=aliased descriptor-byt
 | `wave` | The fewest and most lanes a shader wave can have |
 | `section-import` | Whether the GPU reads the game's own memory after importing it: `aliased`, `substituted` (the driver reported success but the GPU read something else), `refused` or `unknown` |
 | `descriptor-bytes` | Descriptor sizes for views and samplers |
+| `mesh` | Whether the card runs mesh shaders: `yes` or `none`. Without them, mesh dispatch signatures are refused with `E_NOTIMPL` |
+| `rays` | Whether the card traces rays: `yes` or `none`. Without it, ray dispatch signatures are refused with `E_NOTIMPL` |
 
-`TUXBOX_HOST_PROFILE` replaces what the driver reports, so one machine can try a path meant for another. For example, `wave=32` makes a 64-lane card take the 32-lane translations. Settings are separated by `;`, and one unusable setting rejects them all. Overridden values are marked `(set)` in the log. Forcing `section-import=substituted` takes the [memory copy](#memory-copy) on a card that doesn't need it. An override cannot reproduce another driver's own behaviour.
+`TUXBOX_HOST_PROFILE` replaces what the driver reports, so one machine can try a path meant for another. For example, `wave=32` makes a 64-lane card take the 32-lane translations. Settings are separated by `;`, and one unusable setting rejects them all. Overridden values are marked `(set)` in the log. Forcing `section-import=substituted` takes the [memory copy](#memory-copy) on a card that doesn't need it. `mesh=none` and `rays=none` take a capability away; an override can't add one the driver lacks. An override cannot reproduce another driver's own behaviour.
 
 ### Memory copy
 

@@ -319,3 +319,21 @@ fn compute_acceleration_structure_is_a_table_srv() {
     wide[0][3] = 8;
     assert_eq!(compute_root_bindings(&compute_shader(&user, &wide, &[scene, uav]), &root), None);
 }
+
+#[test]
+fn compute_root_srv_carries_the_shader_register() {
+    let root = three_tables_srv_constants();
+    // Parameter 3's address arrives in s7-s8; the shader names it t5 space7.
+    let used = [[0x100, 0, 5, 1, 0x3_0704]];
+    let raw = [4, 7, 5, 5, 11, 0];
+    let srv = compute_shader(&[[1, 0, 2, 5, 0x307]], &used, &[raw]);
+    assert_eq!(compute_root_bindings(&srv, &root).map(|(b, _)| b),
+        Some(vec![Binding { table: 3, kind: ROOT_SRV, register: 5, space: 7, slot: 0 }]));
+    // Without the user-data row, or when parameter 3 is not a root SRV, it fails closed.
+    assert_eq!(compute_root_bindings(&compute_shader(&[], &used, &[raw]), &root), None);
+    let mut constants = root.clone();
+    constants.params[3].kind = RootParamKind::Constants { register: 5, space: 7, num32: 2 };
+    assert_eq!(compute_root_bindings(&srv, &constants), None);
+    // Root-less callers never see a root SRV binding.
+    assert_eq!(bindings(&srv, 5), None);
+}

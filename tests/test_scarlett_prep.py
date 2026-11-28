@@ -40,7 +40,7 @@ class ScarlettPreparation(unittest.TestCase):
                 raise ValueError("invalid digest")
 
             stderr = io.StringIO()
-            host = SimpleNamespace(env={"WINEPREFIX": str(root)})
+            host = SimpleNamespace(env={"WINEPREFIX": str(root), "TUXBOX_PERSISTENT_DXC": "0"})
             with patch("project_tuxbox.scarlett_prep.scarlett_requests", return_value=requests), \
                     patch("project_tuxbox.scarlett_prep.snapshot_compiler_cache", return_value=(None, None)), \
                     patch("project_tuxbox.scarlett_prep.desktop_progress", return_value=nullcontext(None)), \
@@ -50,11 +50,44 @@ class ScarlettPreparation(unittest.TestCase):
             log = stderr.getvalue()
             self.assertEqual(compile_mock.call_count, 7)
             self.assertIn("1 compiled, 1 cached, 4 unsupported, 1 failed", log)
-            self.assertIn("3 with a reason, 1 cached before reasons were kept.", log)
+            self.assertIn("3 actionable, 1 cached before reasons were kept.", log)
             self.assertIn("2 x s_load at 0x_: dynamic soffset unsupported", log)
             self.assertIn("1 x unverified mesh shader bindings", log)
             self.assertNotIn("x cached unsupported HLSL", log)
             self.assertLess(log.index("2 x s_load"), log.index("1 x unverified"))
+
+    def test_reports_expected_mesh_refusals_separately(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "game_scarlett_master.exe"
+            exe.touch()
+            exe.with_name("d3d12_xs.dll").touch()
+            requests = root / "requests"
+            requests.mkdir()
+            for n in (1, 2, 3):
+                (requests / (str(n) * 64 + ".dxbc")).touch()
+
+            def compile_one(source, *args):
+                n = int(source.stem[0])
+                if n == 1:
+                    raise ShaderRefused("xshader failed (65): mesh root signature missing", cached=False)
+                if n == 2:
+                    raise ShaderRefused("xshader failed (65): unrecognized mesh SRV/CBV root-table layout", cached=False)
+                raise ShaderRefused("xshader failed (65): unverified mesh launch register", cached=False)
+
+            stderr = io.StringIO()
+            host = SimpleNamespace(env={"WINEPREFIX": str(root), "TUXBOX_PERSISTENT_DXC": "0"})
+            with patch("project_tuxbox.scarlett_prep.scarlett_requests", return_value=requests), \
+                    patch("project_tuxbox.scarlett_prep.snapshot_compiler_cache", return_value=(None, None)), \
+                    patch("project_tuxbox.scarlett_prep.desktop_progress", return_value=nullcontext(None)), \
+                    patch("project_tuxbox.scarlett_prep.compile_request", side_effect=compile_one), \
+                    redirect_stderr(stderr):
+                self.assertTrue(prepare_scarlett(exe, host))
+            log = stderr.getvalue()
+            self.assertIn("1 actionable, 2 expected at pipeline creation (mesh_root_layout=2), 0 cached before reasons were kept.", log)
+            self.assertIn("1 x unverified mesh launch register", log)
+            self.assertNotIn("mesh root signature missing", log)
+            self.assertNotIn("root-table layout", log)
 
 
 class BoundedPreparation(unittest.TestCase):

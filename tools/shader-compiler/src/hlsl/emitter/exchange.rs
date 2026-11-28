@@ -36,10 +36,15 @@ impl<'a> Emitter<'a> {
             return Ok(());
         }
         if ins.mnemonic == GROUP_READ {
+            let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
+            if self.lockstep.is_some() && self.required_wave_size == Some(mask + 1) {
+                // The whole wave is here (see `lockstep`), so the lane is read directly.
+                self.line(&format!("uint swizzle{idx} = WaveReadLaneAt({}, {} & {mask}u);", r(&ins.src[0])?, r(&ins.src[1])?));
+                return Ok(());
+            }
             if self.dispatched || !self.compute_swizzle {
                 return Err("group lane read requires structured compute swizzle lowering".into());
             }
-            let mask = if ins.aux.imm == 31 { 31u32 } else { 63u32 };
             let width = mask + 1;
             let count = compute_group(self.ex)
                 .into_iter()

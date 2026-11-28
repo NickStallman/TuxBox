@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 
 from .inspect import digest
 from .prep_progress import PrepPhase, report_progress
+from . import persistent_dxc
 from .runtime_shaders import MAX_SHADER_BYTES, compile_request, portable_stage, snapshot_compiler_cache
 from .shader_prep import run_tool
 from .shader_inventory import ARCHIVES, ENTRY, STAGES, decoder, dxbc, parse_tables, serialized_state
@@ -42,12 +43,15 @@ def extract_programs(stream, archive, indices, work, decode):
     return sources
 
 
+PREP_THREADS = 2
+
+
 def prepare_batch(jobs, prepare, label, progress):
     compiled = 0
     if not jobs:
         return 0
     phase = PrepPhase(progress, label, len(jobs))
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=PREP_THREADS) as pool:
         pending = {pool.submit(prepare, job): job for job in jobs}
         try:
             for ordinal, result in enumerate(as_completed(pending), 1):
@@ -63,7 +67,8 @@ def prepare_batch(jobs, prepare, label, progress):
     return compiled
 
 
-def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progress=None, *, prepare_host=None):
+def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progress=None, *, prepare_host=None,
+                  env=None):
     import fcntl  # The runtime's Proton prefix and file locking are Linux-specific.
 
     if profile["title_sha256"] != title_sha256 or profile["archives"] != {k: v[2] for k, v in ARCHIVES.items()}:
@@ -71,15 +76,24 @@ def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progr
     if profile["programs"].keys() != ARCHIVES.keys():
         raise ValueError("Chase shader program list must name both archives")
     root = by_source.parent
+
+    def report(message):
+        report_progress(None, message)
+
+    # The live session picks the same helper, so it finds the cache filled here.
+    helper = persistent_dxc.session_helper(os.environ if env is None else env, report)
     # Serialize cold starts for a prefix. Each completed program is published by
     # compile_request, so a later failure or cancellation keeps the valid work.
     with ((root / "tuxbox-first-boot.lock").open("a+b") as lock,
           TemporaryDirectory(dir=root, prefix=".chase-") as tmp,
-          TemporaryDirectory(prefix="tuxbox-xshader-") as host_tmp):
+          TemporaryDirectory(prefix="tuxbox-xshader-") as host_tmp,
+          persistent_dxc.staged(helper, host_tmp, PREP_THREADS, report) as persistent):
         fcntl.flock(lock, fcntl.LOCK_EX)
         work = Path(tmp)
         report_progress(progress, "Checking the chase shader archives")
-        tools, cache = snapshot_compiler_cache(Path(host_tmp) / "xshader", root)
+        pinned = {"dxc_helper": persistent.helper} if persistent is not None else {}
+        tools, cache = snapshot_compiler_cache(Path(host_tmp) / "xshader", root, **pinned)
+        options = {"persistent": persistent} if persistent is not None else {}
         sources = {}
         decode = decoder()
         with pak.open("rb") as stream:
@@ -112,7 +126,7 @@ def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progr
                     dest.write_bytes(code)
                     run_tool([tools[2], dest], timeout=10)
                     return False
-            return compile_request(work / (key + ".dxbc"), key, tools, cache, work)
+            return compile_request(work / (key + ".dxbc"), key, tools, cache, work, **options)
 
         compiled = prepare_batch(sorted(key for key, stage in programs.items() if stage < 6),
                                  prepare_program, "Chase shaders", progress)
@@ -128,7 +142,7 @@ def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progr
             os.link(work / (producer + ".dxbc"), request / "producer.dxbc")
             os.link(work / (pixel + ".dxbc"), request / "pixel.dxbc")
             os.link(pixel_dxil, request / "pixel.cso")
-            return compile_request(request, key, tools, cache, work)
+            return compile_request(request, key, tools, cache, work, **options)
 
         compiled += prepare_batch(sorted(pairs), prepare_link, "Linked chase shaders", progress)
         stencils = set()
@@ -142,7 +156,7 @@ def prepare_chase(pak, by_source, profile, title_sha256, prepared_sources, progr
             key = f"{source}_rt{slot}"
             request = work / (key + ".stencil")
             os.link(work / (source + ".dxbc"), request)
-            return compile_request(request, key, tools, cache, work)
+            return compile_request(request, key, tools, cache, work, **options)
 
         compiled += prepare_batch(sorted(stencils), prepare_stencil, "Stencil variants", progress)
         if prepare_host:

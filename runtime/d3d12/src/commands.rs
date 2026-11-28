@@ -243,6 +243,7 @@ unsafe extern "system" fn reset(
         Ok(pipeline) => pipeline,
         Err(error) => return error,
     };
+    let initial = initial.map(device::late_pipeline::current);
     let mut state = recording(list);
     if matches!(state.phase, ListState::Open { .. }) {
         return E_FAIL;
@@ -252,7 +253,7 @@ unsafe extern "system" fn reset(
         (native.vtable().Reset)(
             native.as_raw(),
             allocator.native.as_raw(),
-            initial.map_or(ptr::null_mut(), |p| p.native.as_raw()),
+            initial.map_or(ptr::null_mut(), |(pipeline, _)| pipeline.as_raw()),
         )
     };
     if hr.is_ok() {
@@ -273,7 +274,7 @@ unsafe extern "system" fn reset(
         if state.media.is_some() {
             state.media = Some(media::Recording::new(allocator));
         }
-        state.stencil_slot = initial.and_then(|p| p.state.stencil_slot);
+        state.stencil_slot = initial.and_then(|(_, data)| data.stencil_slot);
         if let Some(targets) = &mut state.stencil_targets {
             targets.unbind();
         }
@@ -758,7 +759,7 @@ static DEVICE11_QUEUE_SLOTS: Slots<64> = {
 pub(crate) unsafe fn wrap_command_list(
     native: ID3D12GraphicsCommandList,
     allocator: &device::Allocator,
-    initial: Option<&device::compute::Pipeline>,
+    initial: Option<device::late_pipeline::Resolved<'_>>,
     device: &IUnknown,
     compact: bool,
     extended: bool,
@@ -794,7 +795,7 @@ pub(crate) unsafe fn wrap_command_list(
             graphics_state: recording::GraphicsState::default(),
             active_queries: 0,
             bundle_executed: false,
-            stencil_slot: initial.and_then(|p| p.state.stencil_slot),
+            stencil_slot: initial.and_then(|(_, data)| data.stencil_slot),
             stencil_targets: None,
             dsv_bound: false,
             display_bound: false,
@@ -811,7 +812,7 @@ pub(crate) unsafe fn wrap_command_list(
             sampled_heaps: Vec::new(),
             read_heaps: Vec::new(),
             media: compact.then(|| media::Recording::new(allocator)),
-            phase: ListState::Fresh(allocator.native.clone(), initial.map(|p| p.native.clone())),
+            phase: ListState::Fresh(allocator.native.clone(), initial.map(|(pipeline, _)| pipeline.clone())),
             error: S_OK,
             error_reported: false,
         }),

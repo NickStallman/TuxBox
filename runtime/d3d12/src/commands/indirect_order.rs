@@ -96,14 +96,28 @@ impl Order {
     }
 }
 
-/// Every earlier access, then indirect argument reads. vkd3d-proton takes it
-/// as naming indirect arguments.
+/// Earlier writes that can leave arguments, then indirect argument reads.
+/// vkd3d-proton takes it as naming indirect arguments. The desktop runtime
+/// refuses `ACCESS_COMMON` before a named access: `Close` then fails with
+/// `E_INVALIDARG`. A compute list takes only these two writes.
 pub(super) const BARRIER: D3D12_GLOBAL_BARRIER = D3D12_GLOBAL_BARRIER {
     SyncBefore: D3D12_BARRIER_SYNC_ALL,
     SyncAfter: D3D12_BARRIER_SYNC_EXECUTE_INDIRECT,
-    AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
+    AccessBefore: D3D12_BARRIER_ACCESS(
+        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS.0 | D3D12_BARRIER_ACCESS_COPY_DEST.0,
+    ),
     AccessAfter: D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
 };
+
+/// [`BARRIER`] for a list of `list_type`: a direct list can also write
+/// through stream output and resolves.
+pub(super) fn barrier(list_type: D3D12_COMMAND_LIST_TYPE) -> D3D12_GLOBAL_BARRIER {
+    let mut barrier = BARRIER;
+    if list_type == D3D12_COMMAND_LIST_TYPE_DIRECT {
+        barrier.AccessBefore.0 |= D3D12_BARRIER_ACCESS_STREAM_OUTPUT.0 | D3D12_BARRIER_ACCESS_RESOLVE_DEST.0;
+    }
+    barrier
+}
 
 #[cfg(test)]
 #[path = "../tests/commands/indirect_order.rs"]

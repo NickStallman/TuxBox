@@ -1,5 +1,5 @@
 //! Fence a private copy queue against the guest queues that read these textures.
-use super::{Texture, committed, lock};
+use super::{Digest, Texture, committed, lock};
 use core::mem::ManuallyDrop;
 use std::{collections::VecDeque, sync::Arc};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, HANDLE};
@@ -10,6 +10,8 @@ pub(super) struct Change {
     pub(super) texture: Arc<Texture>,
     pub(super) level: usize,
     pub(super) bytes: Vec<u8>,
+    /// The digest of `bytes`, recorded once their upload is queued.
+    pub(super) digest: Digest,
 }
 
 // These COM objects must survive the asynchronous copy, even if the guest
@@ -20,6 +22,11 @@ struct Upload {
     list: ID3D12CommandList,
     _textures: Vec<ID3D12Resource>,
 }
+
+/// Changed bytes that go into one upload. A title's first flush can change
+/// gigabytes, and each upload holds them twice: the bytes read from the title
+/// and the staging buffer they are detiled into.
+const BATCH_BYTES: usize = 128 << 20;
 
 pub(super) struct Transfer {
     queue: ID3D12CommandQueue,
@@ -59,6 +66,22 @@ impl Transfer {
         if let Some(error) = self.failed {
             return Err(error.into());
         }
+        let mut changes = Vec::new();
+        let mut bytes = 0;
+        for texture in textures {
+            let found = changes.len();
+            texture.changed(&mut changes, &mut self.scratch)?;
+            bytes += changes[found..].iter().map(|change: &Change| change.bytes.len()).sum::<usize>();
+            // All of a texture's mips stay in one upload.
+            if bytes >= BATCH_BYTES {
+                self.upload(device, std::mem::take(&mut changes))?;
+                bytes = 0;
+            }
+        }
+        self.upload(device, changes)
+    }
+
+    fn upload(&mut self, device: &ID3D12Device, changes: Vec<Change>) -> Result<()> {
         let completed = unsafe { self.fence.GetCompletedValue() };
         while self
             .pending
@@ -66,10 +89,6 @@ impl Transfer {
             .is_some_and(|(tick, _)| *tick <= completed)
         {
             self.pending.pop_front();
-        }
-        let mut changes = Vec::new();
-        for texture in textures {
-            texture.changed(&mut changes, &mut self.scratch)?;
         }
         if changes.is_empty() {
             return Ok(());
@@ -117,7 +136,7 @@ impl Transfer {
         }
         for change in changes {
             let mut state = lock(&change.texture.contents);
-            self.scratch = std::mem::replace(&mut state.previous[change.level], change.bytes);
+            state.previous[change.level] = Some(change.digest);
             state.uploaded = tick;
             state.readers.clear();
         }

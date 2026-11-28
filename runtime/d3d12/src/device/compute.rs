@@ -8,6 +8,7 @@ use windows::core::{GUID, HRESULT, Interface};
 
 pub(crate) use super::compute_table::ComputeTable;
 pub(crate) use super::compute_scene::{RootSource, SceneRoot, SceneSource};
+pub(crate) use super::compute_split::GroupBase;
 
 static ROOT: Slots<8> = child_slots::<ID3D12RootSignature, RootSource, 8>();
 pub(crate) type Root = Proxy<ID3D12RootSignature, RootSource>;
@@ -35,6 +36,10 @@ pub(crate) struct PipelineData {
     /// stores all trace to such descriptors. `None` when that is not known:
     /// the pipeline may then write any texture it can reach.
     pub(crate) image_writes: Option<std::sync::Arc<[tuxbox_dxbc::image_writes::TableSlot]>>,
+    /// How a translated program runs a dispatch over 65,535 groups in a dimension.
+    pub(crate) group_base: Option<std::sync::Arc<super::compute_split::GroupBase>>,
+    /// Set on a stand-in whose real compile is still running (see `late_pipeline`).
+    pub(crate) late: Option<Box<super::late_pipeline::Late>>,
 }
 
 const _: () = assert!(
@@ -222,6 +227,7 @@ unsafe fn create_pipeline_x_inner(
     };
     let guest_threads = tuxbox_dxbc::shader_compute_threads(bytes);
     let mut sampler_root = None;
+    let mut sampler_layout = None;
     let (translation, reflected) = match layout {
         Some(TableLayout::Reflected(table)) => {
             // Embedded RTS0 cannot be replaced. The translator reads that original
@@ -231,7 +237,7 @@ unsafe fn create_pipeline_x_inner(
             // was prepared without that root can use unmapped guest indices.
             let mut code = super::shader_cache::compute_with_root(bytes, table.layout.payload())
                 .or_else(|| {
-                    if table.index_map.is_some() { None } else { super::shader_cache::prepared(bytes) }
+                    if table.index_map.is_some() { None } else { super::shader_cache::prepared_compute(bytes) }
                 });
             // A heap-indexed IDXEN access needs each slot's buffer stride: retry
             // on the same root with the arena's stride table appended.
@@ -251,7 +257,7 @@ unsafe fn create_pipeline_x_inner(
             let Some(code) = code else {
                 super::compute_table::capture_stage_root(bytes, &table.original);
                 crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, guest_threads, out) }.unwrap_or(E_NOTIMPL);
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, guest_threads, None, out) }.unwrap_or(E_NOTIMPL);
             };
             (Some(code), Some(table))
         }
@@ -284,10 +290,11 @@ unsafe fn create_pipeline_x_inner(
             let extended = root.and_then(|r| super::compute_table::sampler_root(
                 &this.native, &r.state, bytes, desc.NodeMask).ok().flatten());
             match extended.and_then(|(native, layout)| {
-                super::shader_cache::compute_with_root(bytes, layout.payload()).map(|code| (code, native))
+                super::shader_cache::compute_with_root(bytes, layout.payload()).map(|code| (code, native, layout))
             }) {
-                Some((code, native)) => {
+                Some((code, native, layout)) => {
                     sampler_root = Some(native);
+                    sampler_layout = Some(layout);
                     (Some(code), None)
                 }
                 // Only the pipeline root binds a program without an embedded one.
@@ -297,15 +304,35 @@ unsafe fn create_pipeline_x_inner(
                 // stand-in keeps the translator's refusal on record.
                 None => match root {
                     Some(r) if super::shader_cache::rootless_compute(bytes) => {
-                        let Some(code) = super::shader_cache::compute_with_root(bytes, r.state.payload()) else {
+                        let mut strided_table: Option<std::sync::Arc<ComputeTable>> = None;
+                        let code = super::shader_cache::compute_with_root(bytes, r.state.payload())
+                            .or_else(|| {
+                                // A heap-indexed IDXEN access can only be expressed
+                                // with each slot's buffer stride: retry on the same
+                                // root with the stride table appended.
+                                if !super::shader_cache::refused_for_heap_strides(bytes, r.state.payload()) {
+                                    return None;
+                                }
+                                let Ok(TableLayout::Reflected(strided)) = super::compute_table::reflected_with_strides(
+                                    &this.native, &r.state, Program::Compute(bytes), desc.NodeMask) else {
+                                    return None;
+                                };
+                                let code = super::shader_cache::compute_with_root(bytes, strided.layout.payload())?;
+                                static FIRST: std::sync::Once = std::sync::Once::new();
+                                crate::diagnostics::log_once(&FIRST, || "translated a compute shader with the heap stride table".to_string());
+                                super::shader_cache::superseded(bytes, r.state.payload());
+                                strided_table = Some(strided);
+                                Some(code)
+                            });
+                        let Some(code) = code else {
                             super::compute_table::capture_stage_root(bytes, &r.state);
                             crate::diagnostics::compute_failure(bytes, E_NOTIMPL.0);
-                            return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, out) }
+                            return unsafe { null_compute(this, Some(&r.native), desc, guest_threads, None, out) }
                                 .unwrap_or(E_NOTIMPL);
                         };
-                        (Some(code), None)
+                        (Some(code), strided_table)
                     }
-                    _ => (super::shader_cache::prepared(bytes).or_else(|| {
+                    _ => (super::shader_cache::prepared_compute(bytes).or_else(|| {
                         super::shader_cache::compute_with_root(bytes, root?.state.payload())
                     }), None),
                 },
@@ -313,22 +340,28 @@ unsafe fn create_pipeline_x_inner(
         }
     };
     let compute_threads = guest_threads
-        .or_else(|| translation.as_deref().and_then(tuxbox_dxbc::shader_compute_threads));
+        .or_else(|| translation.as_ref().and_then(|t| tuxbox_dxbc::shader_compute_threads(&t.code)));
     // The group size above is the console's. A narrow-wave translation runs the
     // same group on half as many host threads, so it is chosen only now.
-    let translation = translation.map(|code| fitting_translation(this, code));
-    let code = translation.as_deref().unwrap_or(bytes);
+    let translation = translation.map(|mut translated| {
+        if let Some((code, request)) = narrow_translation(this, &translated.code) {
+            translated.code = code;
+            translated.request = request;
+        }
+        translated
+    });
+    let code = translation.as_ref().map_or(bytes, |t| t.code.as_slice());
     if let Some(refusal) = unsupported_wave_size(this, code) {
         crate::diagnostics::compute_wave_failure(bytes, &refusal.detail);
         crate::failures::refusal("CS", &refusal.tag);
-        return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }
+        return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, None, out) }
             .unwrap_or(E_INVALIDARG);
     }
     let scene_root = if let Some(translated) = &translation {
         match super::compute_scene::private_root(
             &this.native,
             bytes,
-            translated,
+            &translated.code,
             root.map(|p| &p.state),
             reflected.as_ref().map(|t| &t.layout),
             desc.NodeMask,
@@ -339,9 +372,18 @@ unsafe fn create_pipeline_x_inner(
     } else {
         None
     };
-    let label = super::shader_cache::source_digest(bytes)
-        .map(|hash| format!("CS {}", &hash[..8]))
-        .unwrap_or_else(|| "CS".to_string());
+    // A split dispatch runs the program on its pipeline root with the group
+    // base appended. A ray-query program's scene root is not extended.
+    let mut group_base = translation.as_ref().filter(|_| scene_root.is_none()).map(|_| {
+        let root = reflected.as_ref().map(|t| t.layout.clone()).or(sampler_layout)
+            .or_else(|| root.map(|r| r.state.clone()))
+            .unwrap_or_else(|| RootSource::new(bytes));
+        let waves = super::host_profile::wave_range(this);
+        std::sync::Arc::new(super::compute_split::GroupBase::new(&this.native, bytes, root, desc.NodeMask, desc.Flags, waves))
+    });
+    let source = super::shader_cache::source_digest(bytes);
+    let label = compute_compile_label(source.as_deref(), translation.as_ref().map(|t| t.request.as_str()), code.len());
+    let original_label = compute_compile_label(source.as_deref(), None, bytes.len());
     let mut host = D3D12_COMPUTE_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(
             scene_root
@@ -363,21 +405,38 @@ unsafe fn create_pipeline_x_inner(
     // The driver compile must own its device, root signature, and shader bytes:
     // a deadline can return while that compile is still writing the GPU cache.
     let signature = core::mem::ManuallyDrop::into_inner(host.pRootSignature.clone());
-    let compile = |shader: &[u8]| {
+    // The bindings of the compiled pipeline. A stand-in keeps them for its
+    // compile to take over (see `late_pipeline`).
+    let compiled = |scene_root, reflected, sampler_root, group_base| PipelineData {
+        scene_root,
+        reflected,
+        compute_threads,
+        sampler_root,
+        image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
+        group_base,
+        ..Default::default()
+    };
+    let slot = super::late_pipeline::Slot::<ID3D12PipelineState>::default();
+    let compile = |shader: &[u8], label: &str| {
+        let slot = slot.clone();
         let device = this.native.clone();
         let signature = signature.clone();
         let shader = shader.to_vec();
         let node_mask = desc.NodeMask;
         let flags = desc.Flags;
-        let name = label.clone();
-        crate::big_stack::run_deadline(&label, move || {
+        let name = label.to_owned();
+        crate::big_stack::run_deadline(label, move || {
             // Large programs queue here so the driver does not compile them
             // all at once. The queue is on the detached compile thread, so the
             // title's own thread still returns at the deadline.
             let _slot = crate::compile_gate::large_compile(shader.len(), |slots| {
                 crate::diagnostics::log(&format!("{name} waits for one of {slots} large compile slots"));
             });
-            owned_compile(device, signature, shader, node_mask, flags)
+            let result = owned_compile(device, signature, shader, node_mask, flags);
+            if let Ok(pipeline) = &result {
+                slot.fill(pipeline.clone());
+            }
+            result
         })
     };
     // Boot 174727 substituted null pipelines for translated shaders whose
@@ -399,25 +458,30 @@ unsafe fn create_pipeline_x_inner(
             owned_compile(device, signature, shader, node_mask, flags)
         })
     } else {
-        match compile(code) {
+        match compile(code, &label) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
                 // The original guest shader would be a second long driver compile.
                 crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
+                let data = compiled(scene_root, reflected, sampler_root, group_base);
+                let late = Some(Box::new(super::late_pipeline::Late { slot: slot.clone(), data }));
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, late, out) }.unwrap_or(E_NOTIMPL);
             }
         }
     };
     if translation.is_some() && reflected.is_none() && scene_root.is_none() && native.is_err() {
         // Structural checks cannot validate DXIL instructions or root bindings.
         // Let the adapter handle the original guest shader if it rejects the cache.
-        native = match compile(bytes) {
+        group_base = None;
+        native = match compile(bytes, &original_label) {
             crate::big_stack::PipelineWait::Ready(result) => result,
             crate::big_stack::PipelineWait::Deferred => {
                 crate::failures::refusal("CS", "driver compile deadline");
                 unsafe { ManuallyDrop::drop(&mut host.pRootSignature) };
-                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) }.unwrap_or(E_NOTIMPL);
+                let data = compiled(scene_root, reflected, sampler_root, group_base);
+                let late = Some(Box::new(super::late_pipeline::Late { slot: slot.clone(), data }));
+                return unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, late, out) }.unwrap_or(E_NOTIMPL);
             }
         };
     }
@@ -426,7 +490,7 @@ unsafe fn create_pipeline_x_inner(
         if let Some(root) = root { super::compute_table::capture_stage_root(bytes, &root.state); }
         crate::diagnostics::compute_failure(bytes, error.code().0);
         crate::failures::refusal("CS", &format!("driver compile failed: {:#010x}", error.code().0));
-        if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, out) } {
+        if let Some(status) = unsafe { null_compute(this, root.map(|p| &p.native), desc, compute_threads, None, out) } {
             return status;
         }
     } else if let Some(table) = &reflected {
@@ -440,14 +504,7 @@ unsafe fn create_pipeline_x_inner(
             native,
             &PIPELINE,
             this,
-            PipelineData {
-                scene_root,
-                reflected,
-                compute_threads,
-                sampler_root,
-                image_writes: tuxbox_dxbc::image_writes::table_image_writes(bytes).map(Into::into),
-                ..Default::default()
-            },
+            compiled(scene_root, reflected, sampler_root, group_base),
             out,
         )
     }
@@ -478,7 +535,7 @@ pub(super) fn large_deferred(
 /// The guest descriptor can be released as soon as the caller returns. A
 /// deadline does that while the driver is still compiling, so the bytes and
 /// the root signature in that descriptor must not be the ones the driver reads.
-fn owned_compile(
+pub(super) fn owned_compile(
     device: ID3D12Device,
     root: Option<ID3D12RootSignature>,
     shader: Vec<u8>,
@@ -505,7 +562,7 @@ fn owned_compile(
 /// Create a resource-free compute pipeline on the guest root (see `fallback`).
 unsafe fn null_compute(
     this: &Device, root: Option<&ID3D12RootSignature>, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
-    compute_threads: Option<[u32; 3]>, out: Out,
+    compute_threads: Option<[u32; 3]>, late: Option<Box<super::late_pipeline::Late>>, out: Out,
 ) -> Option<HRESULT> {
     use super::fallback::{Stage, bytecode, enabled, shader, substituted};
     if !enabled() { return None; }
@@ -529,7 +586,7 @@ unsafe fn null_compute(
         })
     });
     substituted("compute");
-    Some(unsafe { wrap_pageable(native, &PIPELINE, this, PipelineData { null_usage, compute_threads, ..Default::default() }, out) })
+    Some(unsafe { wrap_pageable(native, &PIPELINE, this, PipelineData { null_usage, compute_threads, late, ..Default::default() }, out) })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -567,11 +624,26 @@ pub(super) fn check_wave_range(required: (u32, u32), host: (u32, u32)) -> Option
 /// `translation`, or the narrow-wave translation of the same program when this
 /// host cannot run it and the compiler can produce one.
 pub(super) fn fitting_translation(device: &Device, translation: Vec<u8>) -> Vec<u8> {
-    let Some(host) = super::host_profile::wave_range(device) else { return translation };
-    if !needs_narrow_waves(super::shader_cache::portable_wave_range(&translation), host) {
-        return translation;
+    narrow_translation(device, &translation).map(|(code, _)| code).unwrap_or(translation)
+}
+
+fn narrow_translation(device: &Device, translation: &[u8]) -> Option<(Vec<u8>, String)> {
+    let host = super::host_profile::wave_range(device)?;
+    if !needs_narrow_waves(super::shader_cache::portable_wave_range(translation), host) {
+        return None;
     }
-    super::shader_cache::narrow_wave_variant(&translation).unwrap_or(translation)
+    super::shader_cache::narrow_wave_variant(translation)
+}
+
+/// Keep the familiar short guest hash, but identify the exact compiler
+/// request selected for this attempt, including rooted and narrow variants.
+/// A retry with original guest bytes must never name a translated cache file.
+fn compute_compile_label(source: Option<&str>, request: Option<&str>, bytes: usize) -> String {
+    let short = source.and_then(|s| s.get(..8)).unwrap_or("unknown");
+    match request {
+        Some(key) => format!("CS {short} request={key} bytes={bytes}"),
+        None => format!("CS {short} request=original bytes={bytes}"),
+    }
 }
 
 /// Whether a program that needs exactly 64 lanes meets a host that has fewer.

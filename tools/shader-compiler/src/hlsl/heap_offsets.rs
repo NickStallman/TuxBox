@@ -9,7 +9,7 @@ fn offset(sym: &HashMap<u16, Sym>, o: &Opnd) -> Option<Sym> {
         .filter(|s| matches!(s, Sym::HeapOffset | Sym::HeapSamplerOffset))
 }
 
-fn result_words(i: &Insn) -> u16 {
+pub(super) fn result_words(i: &Insn) -> u16 {
     let m = i.mnemonic.as_str();
     match i.enc {
         Enc::Mimg => {

@@ -66,7 +66,7 @@ class BackendDiagnostics(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "Proton raw log rotation requires POSIX unlink-while-open semantics")
     def test_proton_raw_log_arrives_live_and_drains_final_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "logs/steam-default.log"
+            path = Path(directory) / "logs/steam-tuxbox.log"
             path.parent.mkdir()
             path.write_bytes(b"stale run\n")
             received = bytearray()
@@ -90,14 +90,14 @@ class BackendDiagnostics(unittest.TestCase):
 
     def test_proton_startup_failure_does_not_replay_previous_run(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "steam-default.log"
+            path = Path(directory) / "steam-tuxbox.log"
             path.write_bytes(b"previous run")
             with game_diagnostics("proton", {"PROTON_LOG": "1", "HOME": directory}, ".", self.fail):
                 pass
 
     def test_reject_same_path_and_hard_link_before_opening_mirror(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "steam-default.log"
+            path = Path(directory) / "steam-tuxbox.log"
             env = {"PROTON_LOG": "1", "HOME": directory}
             with self.assertRaises(ValueError):
                 check_log_path("proton", env, ".", path)

@@ -613,9 +613,9 @@ impl<'a> Emitter<'a> {
                 // Gather around floor(uv * size - 0.5) in D3D component order.
                 // Sampling texel centres preserves the bound sampler's edge mode.
                 let lod = lod.as_ref().ok_or("missing HZB gather mip")?;
-                self.line(&format!("uint w{t}, h{t}, m{t}; {tex}.GetDimensions(0u, w{t}, h{t}, m{t});"));
-                self.line(&format!("uint l{t} = (uint)clamp({lod}, 0.0, float(max(1u, m{t}) - 1u));"));
-                self.line(&format!("{tex}.GetDimensions(l{t}, w{t}, h{t}, m{t}); float2 sz{t} = max(float2(w{t},h{t}), 1.0);"));
+                self.line(&format!("uint w{t}, h{t}, mips{t}; {tex}.GetDimensions(0u, w{t}, h{t}, mips{t});"));
+                self.line(&format!("uint l{t} = (uint)clamp({lod}, 0.0, float(max(1u, mips{t}) - 1u));"));
+                self.line(&format!("{tex}.GetDimensions(l{t}, w{t}, h{t}, mips{t}); float2 sz{t} = max(float2(w{t},h{t}), 1.0);"));
                 self.line(&format!("float2 base{t} = floor({cvec} * sz{t} - 0.5) + 0.5;"));
                 let taps = ["0,1", "1,1", "1,0", "0,0"].map(|xy|
                     format!("{tex}.SampleLevel({smp}, (base{t} + float2({xy}))/sz{t}, l{t}).r"));
@@ -639,12 +639,12 @@ impl<'a> Emitter<'a> {
                 };
                 let lod = lod.as_ref().ok_or("missing gather4_l lod")?;
                 let (uv, slice, dims, ext) = if dim == 5 {
-                    (format!("({cvec}).xy"), Some(format!("({cvec}).z")), format!("w{t}, h{t}, e{t}, m{t}"), format!("uint e{t};"))
+                    (format!("({cvec}).xy"), Some(format!("({cvec}).z")), format!("w{t}, h{t}, e{t}, mips{t}"), format!("uint e{t};"))
                 } else {
-                    (cvec.clone(), None, format!("w{t}, h{t}, m{t}"), String::new())
+                    (cvec.clone(), None, format!("w{t}, h{t}, mips{t}"), String::new())
                 };
-                self.line(&format!("uint w{t}, h{t}, m{t}; {ext} {tex}.GetDimensions(0u, {dims});"));
-                self.line(&format!("uint l{t} = (uint)clamp(round({lod}), 0.0, float(max(1u, m{t}) - 1u));"));
+                self.line(&format!("uint w{t}, h{t}, mips{t}; {ext} {tex}.GetDimensions(0u, {dims});"));
+                self.line(&format!("uint l{t} = (uint)clamp(round({lod}), 0.0, float(max(1u, mips{t}) - 1u));"));
                 self.line(&format!("{tex}.GetDimensions(l{t}, {dims}); float2 sz{t} = max(float2(w{t}, h{t}), 1.0);"));
                 let off2 = offset.as_ref().map(|o| format!(" + float2({o})")).unwrap_or_default();
                 self.line(&format!("float2 base{t} = floor({uv} * sz{t} - 0.5) + 0.5{off2};"));

@@ -30,7 +30,9 @@ impl<'a> Emitter<'a> {
                     self.ws(&link, &format!("{:#x}u", ins.offset + 4))?;
                     self.ws(&hi(&link), "0u")?;
                 }
+                let whole_wave = mask_ballots::branch(self, idx, ins.op);
                 let cond = match ins.op {
+                    _ if whole_wave.is_some() => whole_wave,
                     2 => Some("true".to_string()),
                     4 => Some("scc == 0u".into()),
                     5 => Some("scc != 0u".into()),
@@ -327,14 +329,15 @@ impl<'a> Emitter<'a> {
                 // Population count of a 64-bit value — typically the number of active
                 // lanes (wave-level allocation). One invocation = one lane, so a lane
                 // mask counts as 0 or 1.
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
-                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).or_else(|| lockstep::word(self, idx, &s[0], true))
+                    .map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &format!("(countbits({a}) + countbits({ah}))"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
             }
             "s_bcnt1_i32_b32" => {
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
                 self.ws(&d, &format!("countbits({a})"))?;
                 self.line(&format!("scc = ({} != 0u) ? 1u : 0u;", name(&d)?));
                 Ok(())
@@ -352,15 +355,16 @@ impl<'a> Emitter<'a> {
                 self.ws(&d, &ff0_b64_expr(&a, &ah))
             }
             "s_ff1_i32_b32" => {
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
                 self.ws(&d, &format!("firstbitlow({a})"))
             }
             // s_ff1_i32_b64 is firstbitlow over the 64-bit value: the low word
             // decides when it is nonzero, otherwise the high word.
             "s_ff1_i32_b64" => {
                 self.touch(&hi(&s[0]));
-                let a = mask_ballots::word(self, idx, &s[0]).unwrap_or(a);
-                let ah = mask_ballots::word(self, idx, &hi(&s[0])).map_or_else(|| r(&hi(&s[0])), Ok)?;
+                let a = mask_ballots::word(self, idx, &s[0]).or_else(|| lockstep::word(self, idx, &s[0], false)).unwrap_or(a);
+                let ah = mask_ballots::word(self, idx, &hi(&s[0])).or_else(|| lockstep::word(self, idx, &s[0], true))
+                    .map_or_else(|| r(&hi(&s[0])), Ok)?;
                 self.ws(&d, &ff1_b64_expr(&a, &ah))
             }
             "s_sext_i32_i8" => self.ws(&d, &format!("asuint(asint({a} << 24) >> 24)")),
@@ -492,6 +496,12 @@ impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn emit_sopc(&mut self, ins: &Insn) -> Result<(), String> {
         let m = ins.mnemonic.as_str();
         let s = &ins.src;
+        // A 64-bit compare also reads the upper register of each pair.
+        if m.ends_with("_u64") {
+            for operand in s.iter().take(2) {
+                self.touch(&hi(operand));
+            }
+        }
         let c = match m {
             "s_bitcmp0_b32" => format!("((({} >> ({} & 31u)) & 1u) == 0u)", r(&s[0])?, r(&s[1])?),
             "s_bitcmp1_b32" => format!("((({} >> ({} & 31u)) & 1u) != 0u)", r(&s[0])?, r(&s[1])?),

@@ -174,6 +174,22 @@ impl<'a> Emitter<'a> {
             );
             return self.ws(&d, &e);
         }
+        // VOP3 OP_SEL picks the high half of a 16-bit source or result. Only these forms
+        // read it; the others would silently use the low half. Lowered SDWA forms are
+        // also `Enc::Vop3` but keep their own words, so test the encoding prefix.
+        let half_operands = ["_f16", "_i16", "_u16", "_b16"].iter().any(|t| m.contains(t));
+        let reads_op_sel = int16::handles(&m)
+            || matches!(m.as_str(), "v_pack_b32_f16" | "v_fma_f16" | "v_mad_u32_u16" | "v_mad_i32_i16");
+        if ins.raw.first().is_some_and(|w| w >> 26 == 0x35 && w & 0x7800 != 0) && half_operands && !reads_op_sel {
+            return Err("unsupported 16-bit operand select".into());
+        }
+        // These are translated before SDWA operand selection (`emit_sdwa`) and would ignore it.
+        if ins.aux.sdwa.is_some() && matches!(m.as_str(), "v_add_co_ci_u32" | "v_sub_co_ci_u32"
+            | "v_subrev_co_ci_u32" | "v_fmac_f16" | "v_fmamk_f16" | "v_fmaak_f16"
+            | "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32")
+        {
+            return Err("unsupported SDWA form".into());
+        }
         // ---- half-float arithmetic: operands are f16 in the low 16 bits (inline float
         // constants denote the half-float of that value); the result is written as f16.
         // VOP3 forms carry per-source abs/neg modifiers and a result clamp/output modifier,
@@ -532,11 +548,17 @@ impl<'a> Emitter<'a> {
             "v_mul_f32" => Some(format!("{} * {}", fa()?, fb()?)),
             "v_min_f32" => Some(format!("min({}, {})", fa()?, fb()?)),
             "v_max_f32" => Some(format!("max({}, {})", fa()?, fb()?)),
-            "v_mac_f32" | "v_fmac_f32" => Some(format!("{} * {} + asfloat({dn})", fa()?, fb()?)),
-            "v_madmk_f32" | "v_fmamk_f32" => Some(format!("{} * {k} + {}", fa()?, fb()?)),
-            "v_madak_f32" | "v_fmaak_f32" => Some(format!("{} * {} + {k}", fa()?, fb()?)),
+            // The fused forms round once. `mad` asks the host for its fused
+            // multiply-add; a product and a sum may be rounded twice.
+            "v_fmac_f32" => Some(format!("mad({}, {}, asfloat({dn}))", fa()?, fb()?)),
+            "v_fmamk_f32" => Some(format!("mad({}, {k}, {})", fa()?, fb()?)),
+            "v_fmaak_f32" => Some(format!("mad({}, {}, {k})", fa()?, fb()?)),
+            "v_mac_f32" => Some(format!("{} * {} + asfloat({dn})", fa()?, fb()?)),
+            "v_madmk_f32" => Some(format!("{} * {k} + {}", fa()?, fb()?)),
+            "v_madak_f32" => Some(format!("{} * {} + {k}", fa()?, fb()?)),
             "v_mad_f32" if legacy => Some(format!("tb_mull({}, {}) + {}", fa()?, fb()?, fc()?)),
-            "v_mad_f32" | "v_fma_f32" => Some(format!("{} * {} + {}", fa()?, fb()?, fc()?)),
+            "v_fma_f32" => Some(format!("mad({}, {}, {})", fa()?, fb()?, fc()?)),
+            "v_mad_f32" => Some(format!("{} * {} + {}", fa()?, fb()?, fc()?)),
             "v_min3_f32" => Some(format!("min(min({}, {}), {})", fa()?, fb()?, fc()?)),
             "v_max3_f32" => Some(format!("max(max({}, {}), {})", fa()?, fb()?, fc()?)),
             // ISA: any NaN operand -> V_MIN3_F32 of the three; otherwise the median.
@@ -562,16 +584,18 @@ impl<'a> Emitter<'a> {
             "v_rndne_f32" => Some(format!("round({})", fa()?)),
             "v_floor_f32" => Some(format!("floor({})", fa()?)),
             "v_exp_f32" => Some(format!("exp2({})", fa()?)),
-            "v_log_f32" => Some(format!("log2({})", fa()?)),
+            "v_log_f32" => Some(format!("tb_log2({})", fa()?)),
             "v_rcp_f32" | "v_rcp_iflag_f32" => Some(format!("1.0 / {}", fa()?)),
             "v_rsq_f32" => Some(format!("rsqrt({})", fa()?)),
             "v_sqrt_f32" => Some(format!("sqrt({})", fa()?)),
-            "v_sin_f32" => Some(format!("sin({} * 6.28318530718)", fa()?)),
+            // The angle is in turns. Dropping whole turns first is exact, where the
+            // product with 2 pi loses a large angle's fraction or overflows.
+            "v_sin_f32" => Some(format!("sin(({0} - round({0})) * 6.28318530718)", fa()?)),
             "v_cubema_f32" => Some(format!("tb_cubema({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubesc_f32" => Some(format!("tb_cubesc({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubetc_f32" => Some(format!("tb_cubetc({}, {}, {})", fa()?, fb()?, fc()?)),
             "v_cubeid_f32" => Some(format!("tb_cubeid({}, {}, {})", fa()?, fb()?, fc()?)),
-            "v_cos_f32" => Some(format!("cos({} * 6.28318530718)", fa()?)),
+            "v_cos_f32" => Some(format!("cos(({0} - round({0})) * 6.28318530718)", fa()?)),
             _ => None,
         };
         if let Some(e) = fexpr {
@@ -656,7 +680,9 @@ impl<'a> Emitter<'a> {
                 } else if matches!(s[0], Opnd::ExecLo | Opnd::ExecHi) && !self.resolve_wave32 {
                     // Each invocation holds only its own EXEC bit; the guest reads the wave mask.
                     format!("WaveActiveBallot((exec_lo & 1u) != 0u).{}", if s[0] == Opnd::ExecLo { "x" } else { "y" })
-                } else { mask_ballots::word(self, self.cur_idx, &s[0]).unwrap_or(a) };
+                } else {
+                    mask_ballots::word(self, self.cur_idx, &s[0]).or_else(|| lockstep::word(self, self.cur_idx, &s[0], false)).unwrap_or(a)
+                };
                 self.line(&format!("uint t{t} = countbits({a} & {});", low_mask(lane)));
                 self.line("#else");
                 self.line(&format!("uint t{t} = 0u;"));

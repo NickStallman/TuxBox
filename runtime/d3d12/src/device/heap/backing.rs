@@ -32,10 +32,12 @@
 //! failure fails the import.
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, ERROR_NOT_FOUND,
-    ERROR_NOT_SUPPORTED, GetLastError,
+    E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_ADDRESS,
+    ERROR_MORE_DATA, ERROR_NOT_FOUND, ERROR_NOT_SUPPORTED, GetLastError,
 };
+use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::core::{HRESULT, Result, s, w};
 
 const INLINE_RUNS: usize = 16;
@@ -51,23 +53,27 @@ type Acquire = unsafe extern "system" fn(u64, u64, *mut u64, *mut u64) -> i32;
 type AcquireRuns =
     unsafe extern "system" fn(u64, u64, *mut BackingRun, *mut u32, *mut u64) -> i32;
 type Release = unsafe extern "system" fn(u64);
+type IsBacked = unsafe extern "system" fn(u64, u64) -> i32;
+type SetInvalidationCallback =
+    unsafe extern "system" fn(Option<unsafe extern "system" fn(u64, u64)>);
 
 #[derive(Clone, Copy)]
 pub(super) struct Exports {
     acquire: Acquire,
     acquire_runs: Option<AcquireRuns>,
     release: Release,
+    is_backed: Option<IsBacked>,
 }
 
 impl Exports {
     #[cfg(test)]
     pub(super) fn new(acquire: Acquire, release: Release) -> Self {
-        Self { acquire, acquire_runs: None, release }
+        Self { acquire, acquire_runs: None, release, is_backed: None }
     }
 
     #[cfg(test)]
     pub(super) fn with_runs(acquire: Acquire, acquire_runs: AcquireRuns, release: Release) -> Self {
-        Self { acquire, acquire_runs: Some(acquire_runs), release }
+        Self { acquire, acquire_runs: Some(acquire_runs), release, is_backed: None }
     }
 }
 
@@ -80,10 +86,21 @@ fn lookup() -> Option<Exports> {
             |symbol| core::mem::transmute::<unsafe extern "system" fn() -> isize, AcquireRuns>(symbol),
         );
         let release = GetProcAddress(module, s!("TuxBoxReleasePhysicalBacking"))?;
+        let is_backed = GetProcAddress(module, s!("TuxBoxIsPhysicalBacked")).map(
+            |symbol| core::mem::transmute::<unsafe extern "system" fn() -> isize, IsBacked>(symbol),
+        );
+        if let Some(register) = GetProcAddress(module, s!("TuxBoxSetBackingInvalidationCallback")) {
+            let set_cb: SetInvalidationCallback = core::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                SetInvalidationCallback,
+            >(register);
+            set_cb(Some(crate::commands::page_mapping::retire_from_xmem));
+        }
         Some(Exports {
             acquire: core::mem::transmute::<unsafe extern "system" fn() -> isize, Acquire>(acquire),
             acquire_runs,
             release: core::mem::transmute::<unsafe extern "system" fn() -> isize, Release>(release),
+            is_backed,
         })
     }
 }
@@ -243,6 +260,161 @@ pub(super) fn acquire(base: u64, size: u64) -> Result<Backing> {
     match acquire_backing(base, size)? {
         AcquiredBacking::Contiguous(backing) => Ok(backing),
         AcquiredBacking::Scattered { .. } => Err(windows::Win32::Foundation::E_NOTIMPL.into()),
+    }
+}
+
+fn acquired_runs(base: u64, size: u64) -> Result<Option<(Vec<BackingRun>, Hold)>> {
+    match acquire_backing(base, size)? {
+        AcquiredBacking::Contiguous(Backing { hold: None, .. }) => Ok(None),
+        AcquiredBacking::Contiguous(Backing { address, hold: Some(hold) }) => {
+            Ok(Some((vec![BackingRun { address, bytes: size }], hold)))
+        }
+        AcquiredBacking::Scattered { runs, hold } => Ok(Some((runs, hold))),
+    }
+}
+
+fn visit_xmem_runs(
+    address: u64,
+    bytes: usize,
+    mut f: impl FnMut(u64, usize, usize) -> Result<()>,
+) -> Option<Result<()>> {
+    if bytes == 0 {
+        return Some(Ok(()));
+    }
+    let Some(end) = address.checked_add(bytes as u64) else {
+        return Some(Err(E_INVALIDARG.into()));
+    };
+    let page_start = address & !0xffff;
+    let Some(page_end) = end.checked_next_multiple_of(65536) else {
+        return Some(Err(E_INVALIDARG.into()));
+    };
+    let (runs, _hold) = match acquired_runs(page_start, page_end - page_start) {
+        Ok(Some(ok)) => ok,
+        Ok(None) => return None,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut guest_cursor = page_start;
+    for run in runs {
+        let Some(guest_next) = guest_cursor.checked_add(run.bytes) else {
+            return Some(Err(E_INVALIDARG.into()));
+        };
+        let copy_lo = guest_cursor.max(address);
+        let copy_hi = guest_next.min(end);
+        if copy_lo < copy_hi {
+            let len = (copy_hi - copy_lo) as usize;
+            let buf_off = (copy_lo - address) as usize;
+            let host_addr = run.address + (copy_lo - guest_cursor);
+            if let Err(err) = f(host_addr, buf_off, len) {
+                return Some(Err(err));
+            }
+        }
+        guest_cursor = guest_next;
+    }
+    Some(Ok(()))
+}
+
+pub(in super::super) fn is_backed_range(start: u64, end: u64) -> bool {
+    if end <= start {
+        return false;
+    }
+    let page_start = start & !0xffff;
+    let Some(page_end) = end.checked_next_multiple_of(65536) else {
+        return false;
+    };
+    let Some(exports) = exports() else {
+        return false;
+    };
+    if let Some(is_backed) = exports.is_backed {
+        return unsafe { is_backed(page_start, page_end - page_start) != 0 };
+    }
+    matches!(acquired_runs(page_start, page_end - page_start), Ok(Some(_)))
+}
+
+pub(in super::super) fn try_read_xmem_bytes(address: u64, dst: &mut [u8]) -> Option<bool> {
+    visit_xmem_runs(address, dst.len(), |host_addr, buf_off, len| {
+        let mut got = 0usize;
+        unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                host_addr as *const _,
+                dst[buf_off..buf_off + len].as_mut_ptr().cast(),
+                len,
+                Some(&mut got),
+            )
+        }?;
+        if got != len {
+            return Err(E_FAIL.into());
+        }
+        Ok(())
+    })
+    .map(|res| res.is_ok())
+}
+
+pub(in super::super) fn read_guest_bytes(address: u64, dst: &mut [u8]) -> bool {
+    if let Some(ok) = try_read_xmem_bytes(address, dst) {
+        return ok;
+    }
+    if dst.is_empty() {
+        return true;
+    }
+    let mut got = 0usize;
+    let res = unsafe {
+        ReadProcessMemory(
+            GetCurrentProcess(),
+            address as *const _,
+            dst.as_mut_ptr().cast(),
+            dst.len(),
+            Some(&mut got),
+        )
+    };
+    res.is_ok() && got == dst.len()
+}
+
+fn write_host_slice(host_addr: u64, slice: &[u8]) -> Result<()> {
+    let mut written = 0usize;
+    unsafe {
+        WriteProcessMemory(
+            GetCurrentProcess(),
+            host_addr as *const _,
+            slice.as_ptr().cast(),
+            slice.len(),
+            Some(&mut written),
+        )
+    }?;
+    if written != slice.len() {
+        return Err(E_FAIL.into());
+    }
+    Ok(())
+}
+
+pub(in super::super) fn try_write_xmem_bytes(address: u64, src: &[u8]) -> Option<Result<()>> {
+    match visit_xmem_runs(address, src.len(), |host_addr, buf_off, len| {
+        write_host_slice(host_addr, &src[buf_off..buf_off + len])
+    }) {
+        Some(Err(err)) if err.code() == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0) => {
+            let end = address.checked_add(src.len() as u64)?;
+            let page_start = address & !0xffff;
+            let page_end = end.checked_next_multiple_of(65536)?;
+            for page in (page_start..page_end).step_by(65536) {
+                let copy_lo = page.max(address);
+                let copy_hi = (page + 65536).min(end);
+                let slice = &src[(copy_lo - address) as usize..(copy_hi - address) as usize];
+                match acquired_runs(page, 65536) {
+                    Ok(Some((runs, _hold))) => {
+                        if let Some(run) = runs.first()
+                            && let Err(err) = write_host_slice(run.address + (copy_lo - page), slice)
+                        {
+                            return Some(Err(err));
+                        }
+                    }
+                    Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_ADDRESS.0) => continue,
+                    Ok(None) => continue,
+                    Err(other) => return Some(Err(other)),
+                }
+            }
+            Some(Ok(()))
+        }
+        other => other,
     }
 }
 

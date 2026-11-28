@@ -143,3 +143,23 @@ fn new_packed_integer_forms_accept_ordinary_sources_only() {
     assert!(expr.contains("(v6 & 0xffffu)"));
     assert!(expr.contains("(v6 >> 16)"));
 }
+
+#[test]
+fn unread_half_operand_selects_are_refused() {
+    use crate::hlsl::float64::tests::translate;
+    use crate::Stage;
+
+    // Each form selects the high half of a source; the translation reads only the low half.
+    for (word, mnemonic) in [
+        (0xd532_0803u32, "v_add_f16"),
+        (0xd58b_0803, "v_cvt_f32_f16"),
+        (0xd4ca_0800, "v_cmp_eq_f16"),
+    ] {
+        let words = [word & !0x7800, 0x0005_0501u32];
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(disassemble(&bytes)[0].mnemonic, mnemonic);
+        assert!(translate(Stage::Compute, &words).is_ok(), "{mnemonic}");
+        let error = translate(Stage::Compute, &[word, 0x0005_0501]).unwrap_err();
+        assert!(error.contains("16-bit operand select"), "{mnemonic}: {error}");
+    }
+}

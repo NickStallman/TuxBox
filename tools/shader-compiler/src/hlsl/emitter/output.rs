@@ -4,6 +4,9 @@ use super::*;
 impl<'a> Emitter<'a> {
     pub(in crate::hlsl) fn push_helpers(&self, h: &mut String) {
         h.push_str(CUBE_HELPERS);
+        if self.body.contains("tb_omod(") {
+            h.push_str(OMOD);
+        }
         if self.insns.iter().any(clamped_product24) {
             h.push_str(MAD24_SAT);
         }
@@ -144,8 +147,15 @@ uint tb_fmac_half(uint a, uint b, uint c) {
     pub(in crate::hlsl) fn reg_decls(&self) -> String {
         let is_v = |r: &str| r.len() > 1 && r.starts_with('v') && r[1..].bytes().all(|b| b.is_ascii_digit());
         let mut out = String::new();
+        // The VCC and other special registers are always declared by the header,
+        // so never repeat them here.
+        const ALWAYS_DECLARED: [&str; 7] = [
+            "exec_lo", "exec_hi", "vcc_lo", "vcc_hi", "scc", "m0", "nul",
+        ];
         let scalars: Vec<String> =
-            self.regs.iter().filter(|r| !(self.vreg_array && is_v(r))).map(|r| {
+            self.regs.iter()
+                .filter(|r| !ALWAYS_DECLARED.contains(&r.as_str()) && !(self.vreg_array && is_v(r)))
+                .map(|r| {
                 if r == "tb_fp_mode" { format!("{r} = 0xc0u") } else { format!("{r} = 0u") }
             }).collect();
         if !scalars.is_empty() {
@@ -414,13 +424,26 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {{");
                 self.regs.insert(format!("s{}", g + k));
             }
             let _ = writeln!(h, "{}", self.reg_decls());
+            // A group that takes derivatives and has rows is laid out two by two: lanes 4k
+            // to 4k+3 are one block of a row pair, on the console and on the hosts measured
+            // with tools/measure_compute_quads.py. A lane numbered from the thread follows.
+            let blocks = self.compute_derivatives && (ty_ > 1 || tz > 1) && tx % 2 == 0 && ty_ % 2 == 0;
+            let lane = if blocks {
+                format!("((gtid.z * {}u + gtid.y / 2u) * {}u + gtid.x / 2u) * 4u + (gtid.y & 1u) * 2u + (gtid.x & 1u)", ty_ / 2, tx / 2)
+            } else {
+                format!("gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z)")
+            };
+            if blocks {
+                // The portable reductions wrote their lane as the row-by-row thread number.
+                self.body = self.body.replace(&wave_sum::portable_lane_id([tx, ty_, tz]), &format!("({lane})"));
+            }
             if self.page_waves || self.wave_cull {
-                writeln!(h, "    uint tb_wave_tid = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
+                writeln!(h, "    uint tb_wave_tid = {lane};").unwrap();
             }
             let masked_dpp = self.insns.iter().any(|i| i.op == OP_DPP_BINARY && group_extrema::destination_mask(i).is_some());
             let remap_wave = self.resolve_wave32 && [tx, ty_, tz] != [32, 1, 1];
             if !remap_wave && (self.compute_swizzle || self.indexed_lane || self.single_wave32 || masked_dpp) {
-                writeln!(h, "    uint tb_lane = gtid.x + {tx}u * (gtid.y + {ty_}u * gtid.z);").unwrap();
+                writeln!(h, "    uint tb_lane = {lane};").unwrap();
             }
             if remap_wave {
                 // A full wave uses its immutable physical lane to reconstruct guest XYZ.

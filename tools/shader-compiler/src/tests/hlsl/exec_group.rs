@@ -427,6 +427,17 @@ fn quad_move_with_fi_clear_obeys_bound_control_for_inactive_sources() {
 }
 
 #[test]
+fn readfirstlane_finds_its_lane_by_ballot() {
+    // s0 = readfirstlane(v5); v1 = s0. Lanes 32-63 of a 64-lane host wave are in the ballot's second word.
+    let mut ex = compute_extract(&[0x7e000505, 0x7e020200, 0xbf810000]);
+    ex.isa_preamble = [0, 64, 1, 1];
+    let hlsl = super::super::translate(&ex).unwrap().hlsl;
+    assert!(hlsl.contains("WaveActiveBallot((exec_lo & 1u) != 0u)") && hlsl.contains("32u + firstbitlow("), "{hlsl}");
+    assert!(hlsl.contains("== 0xffffffffu ? 0u :"), "{hlsl}");
+    assert!(!hlsl.contains("WaveActiveMin("), "{hlsl}");
+}
+
+#[test]
 fn first_active_election_uses_the_guest_wave_boundary() {
     // Full lane index, FF1 of EXEC, independent adjacent move, equality comparison.
     let mut ex = compute_extract(&[0xd765_0006, 0x0001_00c1, 0xd766_0006, 0x0002_0cc1,
@@ -436,7 +447,10 @@ fn first_active_election_uses_the_guest_wave_boundary() {
     ex.isa_preamble = [0, 8, 4, 1];
     let translated = super::super::translate(&ex).unwrap();
     assert_eq!(translated.required_wave_size, Some(32));
-    assert!(translated.hlsl.contains("WaveActiveMin(") && !translated.hlsl.contains("InterlockedMin("));
+    // The first lane comes from a ballot: a minimum over lane indices lost the device on NVIDIA.
+    let hlsl = &translated.hlsl;
+    assert!(hlsl.contains("WaveActiveBallot((exec_lo & 1u) != 0u)") && hlsl.contains("32u + firstbitlow("), "{hlsl}");
+    assert!(!hlsl.contains("WaveActiveMin(") && !hlsl.contains("InterlockedMin("), "{hlsl}");
 }
 
 #[test]

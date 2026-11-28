@@ -1,5 +1,5 @@
 //! Device memory heaps and resources sharing their native GPU allocation.
-mod backing;
+pub(in super::super) mod backing;
 mod import;
 mod shadow;
 mod virtual_place;
@@ -20,7 +20,7 @@ use crate::proxy::{Proxy, Slots, check_output, child_slots, unwrap};
 use core::ffi::c_void;
 use crate::commands::page_mapping::{GPU_APERTURE, ImportPin};
 use std::sync::Arc;
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
+use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK};
 use windows::Win32::Graphics::Direct3D12::{ID3D12Pageable, *};
 use windows::core::{GUID, HRESULT, Interface};
 
@@ -46,6 +46,64 @@ fn strict_buffer_import() -> bool {
 }
 
 const IMPORTED_HEAP: GUID = GUID::from_u128(0xc2a3c751_1d00_470c_8efd_5da145efd165);
+const IMPORTED_BACKING: GUID = GUID::from_u128(0x8e4b912c_7a3f_4d9e_b512_6c8a0f3d2e19);
+const COMMITTED: GUID = GUID::from_u128(0x071c1ab8_fb96_4e54_b08a_a8ad2ddf7cfa);
+
+struct BackingGuard {
+    _shadow: Option<Arc<shadow::ShadowPages>>,
+    _backing: Option<backing::Hold>,
+}
+
+impl BackingGuard {
+    fn new(
+        shadow: Option<Arc<shadow::ShadowPages>>,
+        backing: Option<backing::Hold>,
+    ) -> Option<Arc<Self>> {
+        if shadow.is_none() && backing.is_none() {
+            return None;
+        }
+        Some(Arc::new(Self { _shadow: shadow, _backing: backing }))
+    }
+}
+
+unsafe extern "system" fn unknown_query<N, S>(
+    this: *mut Proxy<N, S>,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    if iid.is_null() {
+        return E_POINTER;
+    }
+    if unsafe { iid.read_unaligned() } != windows::core::IUnknown::IID {
+        return windows::Win32::Foundation::E_NOINTERFACE;
+    }
+    unsafe {
+        crate::proxy::add_ref(this);
+        out.write(this.cast());
+    }
+    windows::Win32::Foundation::S_OK
+}
+
+fn attach_heap_guard(
+    heap: &ID3D12Heap,
+    guard: &Arc<BackingGuard>,
+) -> windows::core::Result<()> {
+    static GUARD_SLOTS: Slots<3> = [
+        crate::slot!(unknown_query::<(), Arc<BackingGuard>>),
+        crate::slot!(crate::proxy::add_ref::<(), Arc<BackingGuard>>),
+        crate::slot!(crate::proxy::release::<(), Arc<BackingGuard>>),
+    ];
+    let mut out = core::ptr::null_mut();
+    unsafe {
+        crate::proxy::allocate(&GUARD_SLOTS, &[], (), None, guard.clone(), &mut out).ok()?;
+        let marker = windows::core::IUnknown::from_raw(out);
+        heap.SetPrivateDataInterface(&IMPORTED_BACKING, &marker)
+    }
+}
 
 fn attach_import(resource: &ID3D12Resource, heap: &Arc<ImportedHeap>) -> windows::core::Result<()> {
     static MARKER: Slots<8> = child_slots::<ID3D12Heap, Arc<ImportedHeap>, 8>();
@@ -146,38 +204,65 @@ pub(super) unsafe extern "system" fn residency_priority(
     };
     let owner = identity(device).as_raw();
     let mut native = Vec::new();
-    if native.try_reserve_exact(count as usize).is_err() {
+    let mut levels = Vec::new();
+    if native.try_reserve_exact(count as usize).is_err() || levels.try_reserve_exact(count as usize).is_err() {
         return E_OUTOFMEMORY;
     }
+    // The console takes any pageable. The desktop runtime takes only heaps and
+    // committed resources: a placed, reserved or display resource, a descriptor
+    // heap or a query heap fails with E_INVALIDARG and removes the device
+    // (DXGI_ERROR_INVALID_CALL). A priority is a hint, so it is dropped for those.
     for i in 0..count as usize {
         // SAFETY: the guest supplies count borrowed COM pointers. Each unwrap
         // verifies our vtable and owning device before accessing a native pointer.
         let object = unsafe { objects.add(i).read() };
         let pageable = unsafe {
             if let Some(resource) = super::resource(object, owner) {
-                resource.as_raw()
+                committed(resource).then(|| resource.as_raw())
             } else if let Some(heap) = unwrap::<ID3D12Heap, D3D12_HEAP_DESC>(object, owner, &HEAP) {
-                heap.native.as_raw()
-            } else if let Some(heap) = super::descriptor_heap(object, owner) {
-                heap.native.as_raw()
-            } else if let Some(heap) = super::queries::native(object, owner) {
-                heap.as_raw()
+                Some(heap.native.as_raw())
+            } else if super::descriptor_heap(object, owner).is_some()
+                || super::queries::native(object, owner).is_some()
+            {
+                None
             } else {
                 return E_INVALIDARG;
             }
         };
-        native.push(pageable);
+        if let Some(pageable) = pageable {
+            native.push(pageable);
+            // SAFETY: the guest supplies count priorities beside the objects.
+            levels.push(unsafe { priorities.add(i).read() });
+        }
     }
-    // SAFETY: all four interface types derive from ID3D12Pageable. The guest
-    // owns their references and the priority array until the host call returns.
+    if native.is_empty() {
+        return S_OK;
+    }
+    // SAFETY: heaps and resources derive from ID3D12Pageable. The guest owns
+    // their references until the host call returns.
     unsafe {
         (host.vtable().base__.SetResidencyPriority)(
             host.as_raw(),
-            count,
+            native.len() as u32,
             native.as_ptr(),
-            priorities,
+            levels.as_ptr(),
         )
     }
+}
+
+/// Marks a host resource that owns its memory, which residency priorities may name.
+pub(super) fn mark_committed(resource: &ID3D12Resource, flags: D3D12_HEAP_FLAGS) {
+    if flags.contains(D3D12_HEAP_FLAG_ALLOW_DISPLAY) {
+        return;
+    }
+    let mark = 1u8;
+    // A resource left unmarked only loses its priority hint.
+    let _ = unsafe { resource.SetPrivateData(&COMMITTED, 1, Some(core::ptr::from_ref(&mark).cast())) };
+}
+
+fn committed(resource: &ID3D12Resource) -> bool {
+    let (mut size, mut mark) = (1u32, 0u8);
+    unsafe { resource.GetPrivateData(&COMMITTED, &mut size, Some(core::ptr::from_mut(&mut mark).cast())) }.is_ok()
 }
 
 pub(super) unsafe extern "system" fn place(
@@ -486,11 +571,12 @@ unsafe fn place_gpu_target(
         crate::diagnostics::watch("device-memory image", address, allocation.SizeInBytes, || format!(
             "{}x{}x{} format={} flags={:#x}", desc.Width, desc.Height, desc.DepthOrArraySize, desc.Format.0, desc.Flags.0));
         let footprint = address.checked_add(allocation.SizeInBytes).ok_or(E_INVALIDARG)?;
-        if validate_shared_range(address, footprint).is_err() {
+        if validate_shared_range(address, footprint).is_err() && !backing::is_backed_range(address, footprint) {
             let base = address & !0xffff;
             let end = footprint.saturating_add(0xffff) & !0xffff;
             if !commit_guest_pages(base, end.saturating_sub(base))
-                || validate_shared_range(address, footprint).is_err() {
+                || (validate_shared_range(address, footprint).is_err()
+                    && !backing::is_backed_range(address, footprint)) {
                 static RESERVED: std::sync::Once = std::sync::Once::new();
                 crate::diagnostics::log_once(&RESERVED, || format!(
                     "placed GPU image at {address:#x} is not committed guest memory; keeping a device image"));

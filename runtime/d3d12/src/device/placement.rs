@@ -1,5 +1,6 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
 mod descriptors;
+mod digest;
 mod guarded_copy;
 mod publication;
 mod upload;
@@ -8,6 +9,7 @@ mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
 pub(crate) use guarded_copy::recover as recover_guarded_copy;
 pub(crate) use publication::QueueAccess;
+use digest::Digest;
 
 use super::Device;
 use core::{ffi::c_void, ops::Range};
@@ -17,7 +19,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use tuxbox_xg_layout::{Desc, Plane};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
 use windows::core::{HRESULT, Result};
 
 pub(crate) fn supported_state(state: D3D12_RESOURCE_STATES, flags: D3D12_RESOURCE_FLAGS) -> bool {
@@ -95,8 +96,9 @@ struct Mip {
 
 #[derive(Default)]
 struct Contents {
-    // An exact copy makes writes to shared pages and all-zero rewrites observable.
-    previous: Vec<Vec<u8>>,
+    // Each mip's guest bytes as last uploaded or published. `None` until then,
+    // so a first upload of zeros is still observed.
+    previous: Vec<Option<Digest>>,
     uploaded: u64,
     readers: Vec<(ID3D12Fence, u64)>,
 }
@@ -312,7 +314,7 @@ impl Texture {
             });
         }
         let contents = Mutex::new(Contents {
-            previous: vec![Vec::new(); mips.len()],
+            previous: vec![None; mips.len()],
             ..Default::default()
         });
         Ok(Arc::new(Self {
@@ -331,23 +333,25 @@ impl Texture {
         let size = (mip.source.end - mip.source.start) as usize;
         output.clear();
         output.try_reserve_exact(size).map_err(|_| E_OUTOFMEMORY)?;
-        let mut copied = 0;
-        // SAFETY: the OS checks the guest mapping. A partial transfer never
-        // exposes uninitialized bytes, including when pages are decommitted.
-        let result = unsafe {
-            ReadProcessMemory(
-                GetCurrentProcess(),
-                (self.address + mip.source.start) as *const _,
-                output.as_mut_ptr().cast(),
-                size,
-                Some(&mut copied),
-            )
-        };
-        if result.is_err() || copied != size {
+        output.resize(size, 0);
+        if !super::heap::backing::read_guest_bytes(self.address + mip.source.start, output) {
+            output.clear();
             return Ok(false);
         }
-        unsafe { output.set_len(size) };
         Ok(true)
+    }
+
+    /// Reads a mip into the front of `scratch`. The scratch buffer only
+    /// grows, so the bytes an earlier read left in it are read over rather
+    /// than zeroed again for every texture checked.
+    fn read_mip<'a>(&self, mip: &Mip, scratch: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
+        let size = (mip.source.end - mip.source.start) as usize;
+        if scratch.len() < size {
+            scratch.try_reserve_exact(size - scratch.len()).map_err(|_| E_OUTOFMEMORY)?;
+            scratch.resize(size, 0);
+        }
+        let bytes = &mut scratch[..size];
+        Ok(super::heap::backing::read_guest_bytes(self.address + mip.source.start, bytes).then_some(&*bytes))
     }
 
     fn changed(
@@ -357,15 +361,21 @@ impl Texture {
     ) -> Result<()> {
         let mut contents = lock(&self.contents);
         for (level, mip) in self.mips.iter().enumerate() {
-            if !self.snapshot_mip(mip, scratch)? {
-                contents.previous[level].clear();
+            let Some(bytes) = self.read_mip(mip, scratch)? else {
+                contents.previous[level] = None;
                 continue;
-            }
-            if *scratch != contents.previous[level] {
+            };
+            let digest = Digest::of(bytes);
+            if contents.previous[level] != Some(digest) {
+                // Only a changed mip is copied out of the scratch buffer.
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(bytes.len()).map_err(|_| E_OUTOFMEMORY)?;
+                owned.extend_from_slice(bytes);
                 changes.push(upload::Change {
                     texture: self.clone(),
                     level,
-                    bytes: std::mem::take(scratch),
+                    bytes: owned,
+                    digest,
                 });
             }
         }
@@ -811,3 +821,7 @@ pub(crate) unsafe fn submit(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/device/placement/contents.rs"]
+mod tests;

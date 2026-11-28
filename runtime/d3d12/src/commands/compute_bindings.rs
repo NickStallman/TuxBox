@@ -1,6 +1,7 @@
 //! Save the guest bindings displaced by an internal compute pass. Graphics
 //! root arguments other than tables and IA/OM/RS state survive the pass.
-use crate::device::compute::{ComputeTable, Pipeline as GuestPipeline, RootSource, SceneRoot, SceneSource};
+use crate::device::compute::{ComputeTable, GroupBase, RootSource, SceneRoot, SceneSource};
+use crate::device::late_pipeline::Resolved;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use windows::Win32::Foundation::E_INVALIDARG;
@@ -21,6 +22,9 @@ pub(super) struct Bindings {
     graphics_buffers: BTreeMap<u32, BufferView>,
     graphics_constants: BTreeMap<(u32,u32),u32>,
     graphics_tables: BTreeMap<u32, DescriptorTable>,
+    /// The root a split dispatch binds in place of the pipeline's, which it
+    /// extends with the group base (see `compute::record_split_dispatch`).
+    pub(super) split_root: Option<ID3D12RootSignature>,
 }
 
 // A private root descriptor captures its value when recording. A guest
@@ -72,8 +76,8 @@ impl SceneCheck {
 }
 
 pub(super) enum Pipeline {
-    /// The last field is `PipelineData::image_writes`.
-    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>, Option<Arc<[(u32, u32)]>>),
+    /// The last two fields are `PipelineData::image_writes` and `group_base`.
+    Regular(ID3D12PipelineState, Option<SceneRoot>, Option<Arc<ComputeTable>>, Option<Arc<ComputeTable>>, Option<[u32; 3]>, Option<ID3D12RootSignature>, Option<Arc<[(u32, u32)]>>, Option<Arc<GroupBase>>),
     Ray(ID3D12StateObject),
 }
 
@@ -111,18 +115,18 @@ pub(super) enum Argument {
     Constants(BTreeMap<u32, u32>),
 }
 
-impl From<&GuestPipeline> for Pipeline {
-    fn from(p: &GuestPipeline) -> Self {
-        Self::Regular(p.native.clone(), p.state.scene_root.clone(), p.state.reflected.clone(), p.state.raster_table.clone(), p.state.compute_threads, p.state.sampler_root.clone(), p.state.image_writes.clone())
+impl From<Resolved<'_>> for Pipeline {
+    fn from((native, state): Resolved<'_>) -> Self {
+        Self::Regular(native.clone(), state.scene_root.clone(), state.reflected.clone(), state.raster_table.clone(), state.compute_threads, state.sampler_root.clone(), state.image_writes.clone(), state.group_base.clone())
     }
 }
 
 impl Bindings {
-    pub(super) fn new(initial: Option<&GuestPipeline>) -> Self {
+    pub(super) fn new(initial: Option<Resolved<'_>>) -> Self {
         Self {
             pipeline: initial.map(Pipeline::from),
-            draw_trace: initial.and_then(|p| p.state.draw_trace.clone()),
-            null_usage: initial.and_then(|p| p.state.null_usage.clone()),
+            draw_trace: initial.and_then(|(_, state)| state.draw_trace.clone()),
+            null_usage: initial.and_then(|(_, state)| state.null_usage.clone()),
             ..Default::default()
         }
     }
@@ -272,7 +276,7 @@ impl Bindings {
         &self, table: &ComputeTable, heap: &super::descriptors::ResourceHeap,
         bases: &[Option<D3D12_GPU_DESCRIPTOR_HANDLE>],
     ) -> Option<Vec<std::ops::Range<usize>>> {
-        let Some(Pipeline::Regular(.., Some(slots))) = &self.pipeline else { return None };
+        let Some(Pipeline::Regular(.., Some(slots), _)) = &self.pipeline else { return None };
         slots.iter().map(|&(guest, slot)| {
             // The table is resident at its own parameter, or at an appended
             // parameter that binds the same guest table with another length.
@@ -345,7 +349,8 @@ impl Bindings {
             if COMPUTE {
                 // A ray-query program's scene root is the reflected root with
                 // its private scene SRVs appended.
-                list.SetComputeRootSignature(scene.map_or(&table.native, |(root, ..)| &root.native));
+                list.SetComputeRootSignature(self.split_root.as_ref()
+                    .unwrap_or(scene.map_or(&table.native, |(root, ..)| &root.native)));
                 // Changing root signatures invalidates the native arguments. Replay
                 // constants and descriptors, then substitute each reflected table.
                 self.apply_compute_args(list, bases);
@@ -358,6 +363,12 @@ impl Bindings {
                 }
                 if let Some((slot, address)) = strides {
                     list.SetComputeRootShaderResourceView(slot, address);
+                    static IDENTITY: std::sync::Once = std::sync::Once::new();
+                    static PAGED: std::sync::Once = std::sync::Once::new();
+                    let (site, kind) = if arena.is_some() { (&PAGED, "paged") } else { (&IDENTITY, "identity") };
+                    crate::diagnostics::log_once(site, || {
+                        format!("bound {kind} resource descriptor stride table at compute root slot {slot}")
+                    });
                 }
                 if let Some((slot, address)) = index_map {
                     list.SetComputeRootShaderResourceView(slot, address);
@@ -573,7 +584,15 @@ impl Bindings {
 
     pub(super) fn sampler_root(&self) -> Option<&ID3D12RootSignature> {
         match self.pipeline.as_ref() {
-            Some(Pipeline::Regular(.., root, _)) => root.as_ref(),
+            Some(Pipeline::Regular(.., root, _, _)) => root.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The bound pipeline and how it splits a dispatch, when it can.
+    pub(super) fn group_base(&self) -> Option<(ID3D12PipelineState, Arc<GroupBase>)> {
+        match self.pipeline.as_ref() {
+            Some(Pipeline::Regular(pso, .., Some(base))) => Some((pso.clone(), base.clone())),
             _ => None,
         }
     }
@@ -587,7 +606,7 @@ impl Bindings {
         dispatch: impl FnOnce(),
     ) {
         unsafe {
-            host.SetComputeRootSignature(root);
+            host.SetComputeRootSignature(self.split_root.as_ref().unwrap_or(root));
             self.apply_compute_args(host, &[]);
             dispatch();
             host.SetComputeRootSignature(self.compute.as_ref());

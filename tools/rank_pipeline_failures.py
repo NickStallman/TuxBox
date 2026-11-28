@@ -5,6 +5,11 @@ The provider writes tuxbox_shader_cache/pipeline-failures/<run>.tsv under the
 prefix's temporary folder. Shader preparation and live translation keep a
 refusal reason beside each unsupported shader in tuxbox_shader_cache/runtime.
 Both stay on your machine; the printed summary holds no paths or shader data.
+
+Each compiler build keeps its own runtime cache, so the newest one is ranked by
+default. Request keys do not name the translator version: the same key can be
+refused for different reasons by two builds, which is not a conflict. Merge
+every cache with --all-runtime-caches only when the version does not matter.
 """
 import argparse
 from collections import Counter
@@ -20,6 +25,26 @@ MIXED = "mixed translation lookups (causal refusal unknown)"
 STAND_IN = "stand-in after translation (cause not recorded)"
 NOT_LISTED = "unlisted pipelines (record limit reached)"
 CONFLICT = "conflicting refusal reasons across runtime caches"
+# Written by project_tuxbox/runtime_shaders.py beside each compiler build's cache.
+LAST_USED = "last-used"
+
+
+def newest_runtime_cache(cache):
+    """The runtime cache the latest launch used, or None when there is none.
+
+    Only the newest build's cache is ranked by default. Request keys do not
+    name the translator version, so an older build's reason for the same key
+    says nothing about this build and must not be merged into its counts.
+    """
+    def used(folder):
+        for path in (folder / LAST_USED, folder):
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                continue
+        return 0
+    folders = [path for path in (cache / "runtime").glob("*") if path.is_dir()]
+    return max(folders, key=used, default=None)
 
 
 def normalize(reason):
@@ -116,6 +141,8 @@ def main(argv=None):
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--runtime-cache", type=Path,
                         help="restrict refusal reasons to a known runtime version directory")
+    parser.add_argument("--all-runtime-caches", action="store_true",
+                        help="merge every runtime cache, including other compiler builds")
     args = parser.parse_args(argv)
     run = args.run or max((args.cache / "pipeline-failures").glob("*.tsv"),
                           key=lambda path: path.stat().st_mtime, default=None)
@@ -123,8 +150,15 @@ def main(argv=None):
         parser.error("no pipeline failure file found; run the game first")
     if args.runtime_cache is not None and not args.runtime_cache.is_dir():
         parser.error("--runtime-cache must be a directory")
-    caches = ([args.runtime_cache] if args.runtime_cache is not None else
-              [path for path in (args.cache / "runtime").glob("*") if path.is_dir()])
+    if args.runtime_cache is not None and args.all_runtime_caches:
+        parser.error("choose one of --runtime-cache and --all-runtime-caches")
+    if args.runtime_cache is not None:
+        caches = [args.runtime_cache]
+    elif args.all_runtime_caches:
+        caches = [path for path in (args.cache / "runtime").glob("*") if path.is_dir()]
+    else:
+        newest = newest_runtime_cache(args.cache)
+        caches = [newest] if newest is not None else []
     reasons = load_reasons(caches)
     pipelines, shaders, outcomes = rank(run.read_text(encoding="utf-8").splitlines(), reasons)
     total = sum(pipelines.values())

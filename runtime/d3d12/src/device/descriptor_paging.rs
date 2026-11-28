@@ -112,6 +112,9 @@ struct Tables {
     used: u32,
     free: FreeSpans,
     ranges: BTreeMap<(u32, u32), TableEntry>,
+    // No range in `ranges` is longer than this, so one that overlaps a slot
+    // starts at most this far before it.
+    longest: u32,
     by_id: HashMap<u64, (u32, u32)>,
     next_id: u64,
     tick: u64,
@@ -617,9 +620,14 @@ impl Arena {
             let Tables {
                 ranges,
                 resident_records,
+                longest,
                 ..
             } = tables;
-            for (&(start, length), entry) in ranges.iter() {
+            // Only tables that start less than the longest table's length
+            // before `first` can reach it. Walking every table made each
+            // descriptor write cost as much as the whole table set.
+            let low = first.saturating_sub(*longest);
+            for (&(start, length), entry) in ranges.range((low, 0)..(end, 0)) {
                 let resident = entry.slot;
                 let lo = start.max(first);
                 let hi = (start + length).min(end);
@@ -675,3 +683,13 @@ impl Drop for Write {
 #[cfg(test)]
 #[path = "../tests/device/descriptor_paging.rs"]
 mod tests;
+
+/// The host CPU handle that holds the view a guest CPU handle names, in
+/// whichever arena it lives, or the handle itself outside every arena.
+///
+/// # Safety
+/// `device` is a live provider device.
+pub(crate) unsafe fn host_handle(device: *mut core::ffi::c_void, handle: D3D12_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let device = unsafe { &*device.cast::<super::Device>() };
+    device.state.descriptor_arenas.copy_source(handle)
+}

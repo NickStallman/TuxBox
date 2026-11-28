@@ -35,17 +35,26 @@ fn covers(o: &Opnd, r: Reg, width: u16) -> bool {
     u16::from(k) <= u16::from(n) && u16::from(n) < u16::from(k) + width
 }
 
-fn reads(ins: &Insn, r: Reg) -> bool {
+/// Whether `ins` reads `r`. `refined` takes each operand at its own width, as the
+/// 64-lane scan needs. The other sequences keep the coarser reading they had.
+fn reads(ins: &Insn, r: Reg, refined: bool) -> bool {
     let m = ins.mnemonic.as_str();
     if let Some(width) = memory_width(m) {
         // Store and atomic data are decoded as destinations. MUBUF VADDR is
         // ignored when neither OFFEN nor IDXEN is set.
         let unused_vaddr = ins.enc == Enc::Mubuf && ins.aux.mask & 3 == 0;
         let data = !m.starts_with("s_") && !m.contains("_load");
-        return ins.src.iter().enumerate().any(|(i, o)| !(unused_vaddr && i == 0) && covers(o, r, width))
+        // The address and data of a 32-bit LDS access are one register each.
+        let width = if refined && ins.enc == Enc::Ds && m.ends_with("32") { 1 } else { width };
+        // MUBUF VADDR holds an index, an offset, or one after the other.
+        let address = if refined && ins.enc == Enc::Mubuf { (ins.aux.mask & 3).count_ones() as u16 } else { width };
+        return ins.src.iter().enumerate().any(|(i, o)| !(unused_vaddr && i == 0) && covers(o, r, if i == 0 { address } else { width }))
             || (data || m.contains("atomic")) && ins.dst.iter().any(|o| covers(o, r, width));
     }
     match r {
+        // Only a select or a carry reads its third source as the two words of a mask.
+        Reg::S(n) if refined && m.starts_with("v_") && !m.contains("64") && !m.starts_with("v_cndmask") && !m.contains("_ci_")
+            && !m.starts_with("v_div_fmas") => ins.src.contains(&Opnd::Sgpr(n)),
         Reg::S(n) => super::reads_sgpr(ins, n),
         Reg::V(_) => {
             let width = if m.contains("64") && m.starts_with("v_") { 2 } else { 1 };
@@ -73,23 +82,33 @@ fn kills(ins: &Insn, r: Reg, whole_wave: bool) -> bool {
 }
 
 /// Every path from `start` overwrites `r` before reading it.
-fn dead_from(insns: &[Insn], start: usize, r: Reg) -> bool {
+fn dead_from(insns: &[Insn], start: usize, r: Reg, refined: bool) -> bool {
     let index_of = |offset: i64| insns.iter().position(|i| i.offset as i64 == offset);
-    let mut stack = vec![(start, false)];
+    // `fresh`: a vector write under the EXEC still in force defined `r` in every
+    // lane that an instruction under that EXEC reads, as when a scan in a loop
+    // comes round to its own cross-row temporary. Lane reads, permutes and DPP
+    // reach other lanes.
+    let mut stack = vec![(start, false, false)];
     let mut seen = BTreeSet::new();
-    while let Some((mut at, mut whole)) = stack.pop() {
+    while let Some((mut at, mut whole, mut fresh)) = stack.pop() {
         loop {
-            if !seen.insert((at, whole)) { break; }
+            if !seen.insert((at, whole, fresh)) { break; }
             let Some(ins) = insns.get(at) else { break };
-            if reads(ins, r) {
+            let own_lane = matches!(ins.enc, Enc::Vop1 | Enc::Vop2 | Enc::Vop3 | Enc::Vopc)
+                && !ins.mnemonic.contains("lane") && !matches!(ins.src.first(), Some(Opnd::Raw(_)));
+            if !(fresh && own_lane) && reads(ins, r, refined) {
                 if std::env::var_os("TB_DFDEBUG").is_some() { eprintln!("wave_alloc: live at {:#x} {}", ins.offset, ins.mnemonic); }
                 return false;
             }
             if kills(ins, r, whole) { break; }
+            fresh |= refined && matches!(r, Reg::V(_)) && kills(ins, r, true);
             let m = ins.mnemonic.as_str();
-            if ins.dst.contains(&Opnd::ExecLo) || ins.dst.contains(&Opnd::ExecHi) || m.contains("saveexec") || m.starts_with("v_cmpx") {
+            if ins.dst.contains(&Opnd::ExecLo) || ins.dst.contains(&Opnd::ExecHi) || m.contains("saveexec") || m.contains("wrexec")
+                || m.starts_with("v_cmpx")
+            {
                 whole = m == "s_or_saveexec_b64" && ins.src == [Opnd::ConstInt(-1)]
                     || m == "s_mov_b64" && ins.dst == [Opnd::ExecLo] && ins.src == [Opnd::ConstInt(-1)];
+                fresh = false;
             }
             if matches!(m, "s_setpc_b64" | "s_swappc_b64") { return false; }
             if m == "s_endpgm" { break; }
@@ -102,7 +121,7 @@ fn dead_from(insns: &[Insn], start: usize, r: Reg) -> bool {
                 }
                 if Emitter::branch_cond(ins.op).is_some() {
                     let Some(t) = index_of(target) else { return false };
-                    stack.push((t, whole));
+                    stack.push((t, whole, fresh));
                 }
             }
             at += 1;
@@ -198,8 +217,8 @@ fn total(insns: &mut [Insn], a: usize) -> Option<()> {
     // later instruction overwrites them before reading them, so prove they are
     // dead before the rewrite.
     let end = c + 11;
-    if !(dead_from(insns, end, Reg::V(acc)) && dead_from(insns, end, Reg::V(tmp))
-        && (high == sum || dead_from(insns, end, Reg::S(high)))) {
+    if !(dead_from(insns, end, Reg::V(acc), false) && dead_from(insns, end, Reg::V(tmp), false)
+        && (high == sum || dead_from(insns, end, Reg::S(high), false))) {
         return None;
     }
     insns[c + 1..c + 9].iter_mut().for_each(nop);
@@ -246,7 +265,7 @@ fn total32(insns: &mut [Insn], a: usize) -> Option<()> {
     // overwrites them before reading them, so prove they are dead before the
     // rewrite.
     let end = c + 9;
-    if !(dead_from(insns, end, Reg::V(acc)) && dead_from(insns, end, Reg::V(tmp))) {
+    if !(dead_from(insns, end, Reg::V(acc), false) && dead_from(insns, end, Reg::V(tmp), false)) {
         return None;
     }
     insns[c + 1..c + 7].iter_mut().for_each(nop);
@@ -298,7 +317,7 @@ fn prefix(insns: &mut [Insn], a: usize) -> Option<()> {
     // before the rewrite. The accumulator holds the prefix in both the original
     // and the lowered form, so it needs no liveness check.
     let end = c + 18;
-    if !(dead_from(insns, end, Reg::V(tmp)) && dead_from(insns, end, Reg::S(half))) {
+    if !(dead_from(insns, end, Reg::V(tmp), true) && dead_from(insns, end, Reg::S(half), true)) {
         return None;
     }
     insns[c + 1..c + 16].iter_mut().for_each(nop);
@@ -359,7 +378,7 @@ fn prefix32(insns: &mut [Insn], a: usize) -> Option<()> {
     // safe when every later instruction overwrites it before reading it, so prove it
     // is dead before the rewrite.
     let end = c + 13;
-    if !dead_from(insns, end, Reg::V(tmp)) {
+    if !dead_from(insns, end, Reg::V(tmp), false) {
         return None;
     }
     insns[c + 1..c + 10].iter_mut().for_each(nop);
@@ -420,8 +439,8 @@ fn total_to_wave_active_sum(insns: &mut [Insn], start: usize, end: usize, width:
         None
     };
     let after = end + 1;
-    if !dead_from(insns, after, Reg::V(acc)) || !dead_from(insns, after, Reg::V(tmp))
-        || (high.is_some() && high.unwrap() != sum && !dead_from(insns, after, Reg::S(high.unwrap()))) {
+    if !dead_from(insns, after, Reg::V(acc), false) || !dead_from(insns, after, Reg::V(tmp), false)
+        || (high.is_some() && high.unwrap() != sum && !dead_from(insns, after, Reg::S(high.unwrap()), false)) {
         return None;
     }
     // Nop the body (c+1 .. end-1) so the accumulator keeps the per-lane values
@@ -524,3 +543,7 @@ pub(super) fn emit(em: &mut Emitter, ins: &Insn) -> Result<bool, String> {
     }
     Ok(true)
 }
+
+#[cfg(test)]
+#[path = "../tests/hlsl/wave_alloc.rs"]
+mod tests;

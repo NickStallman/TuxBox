@@ -1,8 +1,9 @@
 bool tb_nan_bits(uint bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
+// Computed without branches: a program inlines this at every conversion.
 uint tb_cvt_u32_f32(float x) {
-    if (!(x > 0.0) || tb_nan_bits(asuint(x))) return 0u;
-    if (x >= 4294967296.0) return 0xffffffffu;
-    return uint(x);
+    uint ok = uint(x > 0.0) & uint(!tb_nan_bits(asuint(x)));
+    uint big = uint(x >= 4294967296.0);
+    return (uint(x) & (0u - (ok & (big ^ 1u)))) | (0u - (ok & big));
 }
 uint tb_cvt_i32_f32(float x) {
     if (tb_nan_bits(asuint(x))) return 0u;

@@ -13,8 +13,16 @@
 #     renderer, and Xwayland is rootful so Wine can sample the root window.
 #
 # Re-running this script is safe: a display already answering with DRI3 is left
-# alone.
+# alone. It runs only inside a container, where /tmp/.X11-unix and the process
+# list are the container's own: on a desktop it could take over that session's
+# display. It stops only the Xwayland it started itself.
 set -euo pipefail
+
+# Docker and Podman each leave one of these in every container.
+if [[ ! -e /.dockerenv && ! -e /run/.containerenv ]]; then
+  echo "start-display: this is not a container; refusing to touch the host's X servers" >&2
+  exit 1
+fi
 
 display="${DISPLAY:-:99}"
 runtime="${XDG_RUNTIME_DIR:-/tmp/xdg-runtime}"
@@ -53,9 +61,23 @@ fi
 # Xwayland started a moment too early gives up on that and stays software-only.
 # Starting it again after the compositor has settled is cheap, so retry instead
 # of reporting a GPU failure that is really a startup race.
+pidfile="${runtime}/xwayland${display//:/-}.pid"
+
+# The process an earlier start recorded, if it is still that Xwayland.
+stop_xwayland() {
+  local pid
+  pid="$(cat "${pidfile}" 2>/dev/null)" || return 0
+  if [[ "${pid}" =~ ^[0-9]+$ ]] &&
+     tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline" | grep -qF "Xwayland ${display} "; then
+    kill "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${pidfile}"
+}
+
 start_xwayland() {
   WAYLAND_DISPLAY="${socket}" setsid nohup Xwayland "${display}" \
     -geometry "${geometry}" -noreset >"${runtime}/xwayland.log" 2>&1 &
+  echo "$!" >"${pidfile}"
   for _ in $(seq 1 60); do
     has_dri3 && return 0
     sleep 0.25
@@ -64,7 +86,7 @@ start_xwayland() {
 }
 
 for attempt in 1 2 3; do
-  pkill -x Xwayland 2>/dev/null || true
+  stop_xwayland
   sleep 1
   if start_xwayland; then
     echo "start-display: ${display} ready - Xwayland on headless weston, DRI3 and Present enabled (${geometry})"

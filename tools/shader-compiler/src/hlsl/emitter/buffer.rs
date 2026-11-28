@@ -201,6 +201,11 @@ impl<'a> Emitter<'a> {
         }
         let buf = self.bind_heap(HeapView::Typed, src);
         self.line(&format!("float4 t{t} = 0; if (exec_lo & 1u) t{t} = {buf}.Load({index});"));
+        if ins.mnemonic.contains("_d16_") {
+            // D16 returns each channel as an f16, two to a register.
+            let values: Vec<String> = (0..channels).map(|k| format!("t{t}.{}", XYZW[k as usize])).collect();
+            return self.write_d16(vd, &values);
+        }
         for k in 0..channels {
             self.wv(&Opnd::Vgpr(vd + k), &format!("asuint(t{t}.{})", XYZW[k as usize]))?;
         }
@@ -644,6 +649,20 @@ impl<'a> Emitter<'a> {
                     None => "float4",
                 };
                 self.line(&format!("{ety} t{t} = {nm}[{index}];"));
+                if ins.mnemonic.contains("_d16_") {
+                    // D16 returns each channel as 16 bits, two to a register.
+                    let channels: Vec<String> = (0..n).map(|k| format!("t{t}.{}", XYZW[k as usize])).collect();
+                    if ety == "float4" {
+                        self.write_d16(vd, &channels)?;
+                    } else {
+                        for (k, pair) in channels.chunks(2).enumerate() {
+                            let low = format!("((uint){} & 0xffffu)", pair[0]);
+                            let packed = pair.get(1).map_or(low.clone(), |high| format!("({low} | ((uint){high} << 16))"));
+                            self.wv(&Opnd::Vgpr(vd + k as u8), &packed)?;
+                        }
+                    }
+                    return Ok(());
+                }
                 for k in 0..n {
                     let c = XYZW[k as usize];
                     let e = match ety {
