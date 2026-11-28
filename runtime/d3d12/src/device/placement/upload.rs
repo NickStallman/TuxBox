@@ -1,4 +1,5 @@
 //! Fence a private copy queue against the guest queues that read these textures.
+use super::residency::Held;
 use super::{Digest, Texture, committed, lock};
 use core::mem::ManuallyDrop;
 use std::{collections::VecDeque, sync::Arc};
@@ -16,11 +17,19 @@ pub(super) struct Change {
 
 // These COM objects must survive the asynchronous copy, even if the guest
 // drops all associated resource and queue references immediately after Submit.
-struct Upload {
+pub(super) struct Upload {
     _buffer: ID3D12Resource,
     _allocator: ID3D12CommandAllocator,
     list: ID3D12CommandList,
-    _textures: Vec<ID3D12Resource>,
+    _textures: Vec<Held>,
+}
+
+/// What work queued on the transfer queue holds until its fence value.
+#[allow(dead_code)] // Held only to be dropped.
+pub(super) enum Pending {
+    Upload(Upload),
+    /// Reserved images whose tiles are being mapped.
+    Mapping(Vec<Held>),
 }
 
 /// Changed bytes that go into one upload. A title's first flush can change
@@ -33,7 +42,7 @@ pub(super) struct Transfer {
     pub(super) fence: ID3D12Fence,
     next: u64,
     pub(super) failed: Option<HRESULT>,
-    pending: VecDeque<(u64, Upload)>,
+    pending: VecDeque<(u64, Pending)>,
     scratch: Vec<u8>,
 }
 
@@ -56,6 +65,13 @@ impl Transfer {
     pub(super) fn tick(&mut self) -> Result<u64> {
         self.next = self.next.checked_add(1).ok_or(E_FAIL)?;
         Ok(self.next)
+    }
+
+    /// Hold `work` until the transfer fence reaches `tick`.
+    pub(super) fn keep(&mut self, tick: u64, work: Pending) -> Result<()> {
+        self.pending.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+        self.pending.push_back((tick, work));
+        Ok(())
     }
 
     pub(super) fn refresh(
@@ -129,7 +145,7 @@ impl Transfer {
         unsafe {
             self.queue.ExecuteCommandLists(&[Some(upload.list.clone())]);
         }
-        self.pending.push_back((tick, upload));
+        self.pending.push_back((tick, Pending::Upload(upload)));
         if let Err(error) = unsafe { self.queue.Signal(&self.fence, tick) } {
             self.failed = Some(error.code());
             return Err(error);
@@ -208,7 +224,8 @@ impl Upload {
         // SAFETY: this CPU-writeable buffer covers 'size' bytes; this command
         // list has not been executed and the pointer is scoped to the mapping.
         let output = unsafe { core::slice::from_raw_parts_mut(mapped.cast::<u8>(), size) };
-        let mut destinations = Vec::new();
+        let mut held = Vec::new();
+        let mut last = core::ptr::null();
         let result: Result<()> = changes
             .iter()
             .zip(offsets)
@@ -238,8 +255,10 @@ impl Upload {
                     ManuallyDrop::drop(&mut src.pResource);
                     ManuallyDrop::drop(&mut dst.pResource);
                 }
-                if destinations.last() != Some(&texture.native) {
-                    destinations.push(texture.native.clone());
+                // A texture's changed mips are adjacent.
+                if !core::ptr::eq(last, Arc::as_ptr(texture)) {
+                    last = Arc::as_ptr(texture);
+                    held.push(texture.hold());
                 }
                 Ok(())
             });
@@ -254,7 +273,7 @@ impl Upload {
             _buffer: buffer,
             _allocator: allocator,
             list: list.cast()?,
-            _textures: destinations,
+            _textures: held,
         })
     }
 }

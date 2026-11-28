@@ -15,6 +15,13 @@ use windows::core::Result;
 
 const TILE: u64 = D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES as u64;
 
+/// An image and the heap mapped under it. A mapping holds no reference to its
+/// heap, so queued work that names a reserved image has to hold both.
+pub(super) struct Held {
+    _image: ID3D12Resource,
+    _heap: Option<ID3D12Heap>,
+}
+
 pub(super) enum Residency {
     /// Created with its own memory.
     Committed,
@@ -101,6 +108,15 @@ pub(super) fn reserve(
 }
 
 impl Texture {
+    /// What queued work must keep until the GPU has finished with this image.
+    pub(super) fn hold(&self) -> Held {
+        let heap = match &self.residency {
+            Residency::Committed => None,
+            Residency::Reserved { heap, .. } => heap.get().cloned(),
+        };
+        Held { _image: self.native.clone(), _heap: heap }
+    }
+
     /// Map a reserved image's tiles onto a new heap through `queue`. Returns
     /// whether it mapped anything, in which case work on other queues must wait
     /// for `queue` before using the image.
@@ -154,15 +170,20 @@ impl super::upload::Transfer {
             return Err(error.into());
         }
         let mut mapped = Vec::new();
-        for texture in textures {
+        mapped.try_reserve(textures.len()).map_err(|_| windows::Win32::Foundation::E_OUTOFMEMORY)?;
+        // A failure still has to cover the mappings queued before it.
+        let result = textures.iter().try_for_each(|texture| {
             if texture.back(device, &self.queue)? {
                 mapped.push(texture);
             }
-        }
+            Ok(())
+        });
         if mapped.is_empty() {
-            return Ok(());
+            return result;
         }
         let tick = self.tick()?;
+        // The title can release an image before the queue has mapped it.
+        self.keep(tick, super::upload::Pending::Mapping(mapped.iter().map(|texture| texture.hold()).collect()))?;
         if let Err(error) = unsafe { self.queue.Signal(&self.fence, tick) } {
             self.failed = Some(error.code());
             return Err(error);
@@ -171,7 +192,7 @@ impl super::upload::Transfer {
             let mut contents = lock(&texture.contents);
             contents.uploaded = contents.uploaded.max(tick);
         }
-        Ok(())
+        result
     }
 }
 
