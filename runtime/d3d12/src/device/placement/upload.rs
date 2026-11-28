@@ -23,6 +23,11 @@ struct Upload {
     _textures: Vec<ID3D12Resource>,
 }
 
+/// Changed bytes that go into one upload. A title's first flush can change
+/// gigabytes, and each upload holds them twice: the bytes read from the title
+/// and the staging buffer they are detiled into.
+const BATCH_BYTES: usize = 128 << 20;
+
 pub(super) struct Transfer {
     queue: ID3D12CommandQueue,
     pub(super) fence: ID3D12Fence,
@@ -61,6 +66,22 @@ impl Transfer {
         if let Some(error) = self.failed {
             return Err(error.into());
         }
+        let mut changes = Vec::new();
+        let mut bytes = 0;
+        for texture in textures {
+            let found = changes.len();
+            texture.changed(&mut changes, &mut self.scratch)?;
+            bytes += changes[found..].iter().map(|change: &Change| change.bytes.len()).sum::<usize>();
+            // All of a texture's mips stay in one upload.
+            if bytes >= BATCH_BYTES {
+                self.upload(device, std::mem::take(&mut changes))?;
+                bytes = 0;
+            }
+        }
+        self.upload(device, changes)
+    }
+
+    fn upload(&mut self, device: &ID3D12Device, changes: Vec<Change>) -> Result<()> {
         let completed = unsafe { self.fence.GetCompletedValue() };
         while self
             .pending
@@ -68,10 +89,6 @@ impl Transfer {
             .is_some_and(|(tick, _)| *tick <= completed)
         {
             self.pending.pop_front();
-        }
-        let mut changes = Vec::new();
-        for texture in textures {
-            texture.changed(&mut changes, &mut self.scratch)?;
         }
         if changes.is_empty() {
             return Ok(());
