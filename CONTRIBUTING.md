@@ -6,7 +6,7 @@ Open pull requests against `main`. [Source layout](docs/SOURCE_LAYOUT.md) explai
 
 ## Prepare a checkout
 
-Use Python 3.10 or newer and Rust 1.95 or newer. CI uses Python 3.12 and Rust 1.95.0. From the repository root, install the Python dependency and the Windows target used by the D3D12 typecheck:
+Use Python 3.10 or newer and Rust 1.95 or newer. CI uses Python 3.10 and 3.12 and Rust 1.95.0. From the repository root, install the Python dependency and the Windows target used by the D3D12 typecheck:
 
 ```sh
 python -m pip install -r requirements.txt
