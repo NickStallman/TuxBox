@@ -411,6 +411,48 @@ static void run(int argc, wchar_t **argv) {
             "BC7 blocks and guards");
   }
   {
+    // Physical-page destinations through xmem.dll. ProjectScarlett fills some
+    // page arrays after EnqueueRequest and before Submit, so an entry still
+    // zero at enqueue is read when the request runs. One seen at enqueue is
+    // kept even if the title reuses the array.
+    HMODULE xmem = LoadLibraryW(L"xmem.dll");
+    require(xmem, "load xmem.dll");
+    using Allocate = BOOL(WINAPI *)(UINT64, SIZE_T *, UINT64 *);
+    using Map = void *(WINAPI *)(void *, SIZE_T, const UINT64 *);
+    using Free = BOOL(WINAPI *)(SIZE_T, const UINT64 *);
+    auto allocate = reinterpret_cast<Allocate>(
+        GetProcAddress(xmem, "XMemAllocatePhysicalPages"));
+    auto map = reinterpret_cast<Map>(GetProcAddress(xmem, "XMemMapPhysicalPages"));
+    auto release = reinterpret_cast<Free>(GetProcAddress(xmem, "XMemFreePhysicalPages"));
+    require(allocate && map && release, "xmem page exports");
+    UINT64 tokens[2];
+    SIZE_T count = 2;
+    require(allocate(0x20400000, &count, tokens) && count == 2, "allocate pages");
+    const UINT64 to_pages = (UINT64(1) << 22) | (UINT64(1) << 21);
+    UINT64 late[1] = {0}, early[1] = {tokens[1]};
+    Request p{to_pages, late, 0x4000, 16,
+              reinterpret_cast<IUnknown *>(expected.data()), 0, 16, 0, 0, nullptr};
+    memory->EnqueueRequest(&p);
+    late[0] = tokens[0];
+    p.dest = early;
+    p.pageOffset = 0x8000;
+    memory->EnqueueRequest(&p);
+    early[0] = 0;
+    memory->EnqueueStatus(status.Get(), 2);
+    memory->Submit();
+    check(wait_status(status.Get(), 2), "page array filled after enqueue");
+    auto *view = static_cast<unsigned char *>(
+        VirtualAlloc(nullptr, 2 << 16, MEM_RESERVE, PAGE_NOACCESS));
+    require(view && map(view, 2, tokens) == view, "map pages");
+    require(std::equal(expected.begin(), expected.begin() + 16, view + 0x4000) &&
+                std::equal(expected.begin(), expected.begin() + 16,
+                           view + (1 << 16) + 0x8000),
+            "page bytes");
+    require(map(view, 2, nullptr) == view && VirtualFree(view, 0, MEM_RELEASE) &&
+                release(2, tokens),
+            "release pages");
+  }
+  {
     // A request the title cancels while it is already running completes
     // without counting as a failure. 64 MiB of stored deflate blocks with a
     // wrong Adler-32 keep the inflate busy long enough to cancel it.
@@ -476,7 +518,7 @@ int wmain(int argc, wchar_t **argv) {
   try {
     run(argc, argv);
     constexpr auto result =
-        "raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 autosubmit=64 PASS";
+        "raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 pages=2 autosubmit=64 PASS";
     if (argc == 2 || argc == 6) {
       std::ofstream report(argv[argc - 1], std::ios::binary);
       if (argc == 6)

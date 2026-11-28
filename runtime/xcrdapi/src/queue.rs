@@ -1,13 +1,15 @@
 use super::*;
 use std::sync::atomic::AtomicBool;
 use crate::{decode, diag};
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 use std::sync::Condvar;
 use std::thread::{self, JoinHandle};
 use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
-use windows::Win32::System::Threading::{CreateEventW, ResetEvent, SetEvent};
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 #[implement(IQueue2)]
 struct Queue {
@@ -83,6 +85,7 @@ unsafe fn capture(queue_type: u64, req: *const Request) -> Result<Read, HRESULT>
         return Err(E_NOTIMPL);
     }
     // Snapshot the page array now: the title may reuse it after enqueueing.
+    // Entries still zero are read again when the request runs (`page_tokens`).
     let pages = if req.options & TO_PAGES != 0 {
         if req.destination.is_null() {
             return Err(E_INVALIDARG);
@@ -161,6 +164,41 @@ impl Read {
         let detail = if self.is_cancelled() { format!("{detail}; cancelled, not reported") } else { detail.to_owned() };
         diag::failure(self.options, stage, hr, &source, self.size, self.capacity, self.intermediate, pages, &detail);
         hr
+    }
+
+    /// The page tokens to write. ProjectScarlett enqueues some requests before
+    /// it fills their page arrays, and fills them before it submits, so an
+    /// entry that was zero at enqueue is read again from the array now. Zero
+    /// never names a page; entries seen at enqueue are kept, as the title may
+    /// have reused the array since.
+    fn page_tokens<'a>(&self, tokens: &'a [u64]) -> Cow<'a, [u64]> {
+        if !tokens.contains(&0) {
+            return Cow::Borrowed(tokens);
+        }
+        let mut live = vec![0u64; tokens.len()];
+        let mut got = 0;
+        // ReadProcessMemory fails instead of faulting if the array is gone.
+        let read = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                self.dest as *const c_void,
+                live.as_mut_ptr().cast(),
+                live.len() * size_of::<u64>(),
+                Some(&mut got),
+            )
+        };
+        if read.is_err() || got != live.len() * size_of::<u64>() {
+            return Cow::Borrowed(tokens);
+        }
+        for (now, seen) in live.iter_mut().zip(tokens) {
+            if *seen != 0 {
+                *now = *seen;
+            }
+        }
+        if live.as_slice() != tokens {
+            diag::late_pages(self.dest, tokens, &live);
+        }
+        Cow::Owned(live)
     }
 
     fn execute(&self) -> Result<(), HRESULT> {
@@ -252,8 +290,10 @@ impl Read {
                 return Ok(());
             }
             if let Some((tokens, offset)) = &self.pages {
-                return write_pages(tokens, *offset, &output)
-                    .map_err(|hr| self.failure("pages", hr, &format!("{} bytes", output.len())));
+                let tokens = self.page_tokens(tokens);
+                return write_pages(&tokens, *offset, &output).map_err(|hr| {
+                    self.failure("pages", hr, &format!("{} bytes, array {:#x}, tokens at run {}", output.len(), self.dest, diag::tokens(&tokens)))
+                });
             }
             unsafe {
                 core::ptr::copy_nonoverlapping(output.as_ptr(), self.dest as *mut u8, output.len())
@@ -262,8 +302,10 @@ impl Read {
             if self.is_cancelled() {
                 return Ok(());
             }
-            return write_pages(tokens, *offset, &plain)
-                .map_err(|hr| self.failure("pages", hr, &format!("{} bytes", plain.len())));
+            let tokens = self.page_tokens(tokens);
+            return write_pages(&tokens, *offset, &plain).map_err(|hr| {
+                self.failure("pages", hr, &format!("{} bytes, array {:#x}, tokens at run {}", plain.len(), self.dest, diag::tokens(&tokens)))
+            });
         }
         Ok(())
     }
