@@ -316,7 +316,8 @@ def render(report):
               "- Executed shaders run over generated inputs on a small grid, not the title's own; their outputs are "
               "compared between builds and cards, not with a console.",
               "- Programs that index the descriptor heap directly or read a ray tracing scene are not executed.",
-              "- Drivers' own pipeline builds are not run or timed.", ""]
+              "- Drivers' own pipeline builds are not run or timed here; `tools/stage_baseline.py` times them "
+              "for a fixed sample.", ""]
     return "\n".join(lines)
 
 
