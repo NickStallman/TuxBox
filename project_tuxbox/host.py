@@ -39,6 +39,10 @@ NVIDIA_CACHE_BYTES = 4 << 30
 NVIDIA_CACHE_ROTATE_BYTES = 1 << 30
 NVIDIA_CACHE_FILE = re.compile(r"tuxbox([0-9]+)[0-9]")
 
+# Room for the driver's compiled shaders on Mesa (RADV, ANV, NVK). One
+# ProjectScarlett boot on RADV writes about 1.2 GB, over Mesa's 1 GB default.
+MESA_CACHE_SIZE = "4G"
+
 
 def requires_offline(executable):
     return executable.name.casefold() in OFFLINE_EXECUTABLES
@@ -441,6 +445,41 @@ def configure_nvidia_shader_cache(env, report=None):
             report_unindexed_nvidia_cache(cache, report)
 
 
+def configure_mesa_shader_cache(env, report=None):
+    """Keep this prefix's compiled Mesa shaders for the next launch.
+
+    Mesa stores them in ~/.cache/mesa_shader_cache, shared by every program on
+    the desktop and capped at 1 GB. A desktop session's own GPU work then
+    evicts the title's shaders, and the next launch compiles them again, which
+    takes about half an hour for ProjectScarlett. A prefix-local directory is
+    the cache Steam gives each title. A disabled cache and an explicit
+    directory are kept; an explicit directory still gets room unless a size is
+    set.
+    """
+    if env.get("MESA_SHADER_CACHE_DISABLE", "").lower() in ("1", "true", "yes"):
+        return
+    explicit = env.get("MESA_SHADER_CACHE_DIR")
+    if explicit:
+        env.setdefault("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE)
+        if report:
+            report(f"Mesa shader cache: {explicit} (path set by the environment)")
+        return
+    prefix = env.get("WINEPREFIX")
+    if not prefix:
+        return
+    cache = Path(prefix) / "shadercache"
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if report:
+            report(f"Mesa shader cache stays in the default directory: {exc}")
+        return
+    env["MESA_SHADER_CACHE_DIR"] = str(cache)
+    env.setdefault("MESA_SHADER_CACHE_MAX_SIZE", MESA_CACHE_SIZE)
+    if report:
+        report(f"Mesa shader cache: {cache}")
+
+
 def configure_pipeline_cache(env, prefix):
     """Keep vkd3d-proton's pipeline cache in the prefix, beside the driver's.
 
@@ -502,6 +541,8 @@ class Host:
             seed_shader_cache(prefix, lambda line: print(f"tuxbox: {line}", file=sys.stderr))
         self.env["WINEPREFIX"] = str(prefix)
         configure_pipeline_cache(self.env, prefix)
+        # Before any GPU work, so Frosty's pipeline preparation fills the cache the title reads.
+        configure_mesa_shader_cache(self.env)
         self.command = [executable]
         if offline:
             self.isolate_network()

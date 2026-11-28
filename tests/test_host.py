@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_nvidia_shader_cache, configure_pipeline_cache, limit_malloc_growth, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
+from project_tuxbox.host import PINNED_PROTON, SHADER_CACHE, Host, claim_package_drive, configure_mesa_shader_cache, configure_nvidia_shader_cache, configure_pipeline_cache, limit_malloc_growth, proton_installation, report_unindexed_nvidia_cache, requires_offline, seed_shader_cache, warn_scarlett_dxc
 
 
 class ScarlettWindowsDxc(unittest.TestCase):
@@ -472,6 +472,55 @@ class MallocLimits(unittest.TestCase):
         self.assertEqual(env["MALLOC_ARENA_MAX"], "2")
         self.assertEqual(env["MALLOC_MMAP_THRESHOLD_"], "1048576")
         self.assertEqual(env["MALLOC_TRIM_THRESHOLD_"], "8388608")
+
+
+class MesaShaderCache(unittest.TestCase):
+    def test_prefix_gets_its_own_driver_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / "prefix"
+            env = {"WINEPREFIX": str(prefix)}
+            reports = []
+            configure_mesa_shader_cache(env, reports.append)
+            cache = prefix / "shadercache"
+            self.assertEqual(env["MESA_SHADER_CACHE_DIR"], str(cache))
+            self.assertEqual(env["MESA_SHADER_CACHE_MAX_SIZE"], "4G")
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(reports, [f"Mesa shader cache: {cache}"])
+
+    def test_explicit_directory_size_and_disabled_cache_stay(self):
+        env = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DIR": "/games/mesa"}
+        configure_mesa_shader_cache(env)
+        self.assertEqual(env["MESA_SHADER_CACHE_DIR"], "/games/mesa")
+        self.assertEqual(env["MESA_SHADER_CACHE_MAX_SIZE"], "4G")
+        sized = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DIR": "/games/mesa",
+                 "MESA_SHADER_CACHE_MAX_SIZE": "12G"}
+        reports = []
+        configure_mesa_shader_cache(sized, reports.append)
+        self.assertEqual(sized["MESA_SHADER_CACHE_MAX_SIZE"], "12G")
+        self.assertEqual(reports, ["Mesa shader cache: /games/mesa (path set by the environment)"])
+        for value in ("1", "true"):
+            disabled = {"WINEPREFIX": "/unused", "MESA_SHADER_CACHE_DISABLE": value}
+            configure_mesa_shader_cache(disabled)
+            self.assertEqual(list(disabled), ["WINEPREFIX", "MESA_SHADER_CACHE_DISABLE"])
+
+    def test_launch_without_a_prefix_leaves_the_default_cache(self):
+        env = {}
+        configure_mesa_shader_cache(env)
+        self.assertEqual(env, {})
+
+    def test_the_host_sets_it_before_any_gpu_work(self):
+        # Pipeline preparation runs with the host's own environment, so the
+        # directory must be there, not only in the title's launch environment.
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("project_tuxbox.host.shutil.which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+             patch("project_tuxbox.host.subprocess.check_output", return_value="wine-10.0\n"), \
+             patch.dict(os.environ, clear=False) as environ:
+            environ.pop("MESA_SHADER_CACHE_DIR", None)
+            environ.pop("MESA_SHADER_CACHE_DISABLE", None)
+            host = Host("wine", None, Path(tmp))
+            cache = Path(tmp).resolve() / "shadercache"
+            self.assertEqual(host.env["MESA_SHADER_CACHE_DIR"], str(cache))
+            self.assertEqual(host.env["VKD3D_SHADER_CACHE_PATH"], str(cache))
 
 
 class NvidiaShaderCache(unittest.TestCase):
