@@ -50,6 +50,26 @@ fn only_uniform_values_can_bypass_a_wave_broadcast() {
 }
 
 #[test]
+fn a_scalar_add_reads_the_number_a_multiply_left_in_vcc() {
+    let validate = |words: &[u32]| {
+        let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+        let body = disassemble(&bytes);
+        validate_lane_ops(&body, &waterfall_reads(&body), true, false)
+    };
+    let multiply = 0x936a_0100; // s_mul_i32 vcc_lo, s0, s1
+    let add = [0x8102_ff6a, 0x80]; // s_add_i32 s2, vcc_lo, 128
+    let compare = 0x7d84_0000; // v_cmp_eq_u32 vcc, s0, v0
+    let branch = 0xbf84_0000; // s_cbranch_scc0 to the next instruction
+    assert_eq!(validate(&[multiply, add[0], add[1]]), Ok(()));
+    // VCC as a compare left it holds one bit per lane.
+    assert!(validate(&[compare, add[0], add[1]]).is_err());
+    assert!(validate(&[multiply, compare, add[0], add[1]]).is_err());
+    // Nothing proves what VCC holds on another path into the add.
+    assert!(validate(&[add[0], add[1]]).is_err());
+    assert!(validate(&[multiply, branch, add[0], add[1]]).is_err());
+}
+
+#[test]
 fn class5_mesh_pointer_is_eight_above_the_user_location() {
     assert_class5_mesh_pointer();
 }

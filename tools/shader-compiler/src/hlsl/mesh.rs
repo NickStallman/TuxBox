@@ -709,7 +709,7 @@ fn validate_lane_ops(body: &[Insn], own: &BTreeSet<usize>, wave_control: bool, s
             || (ins.enc == Enc::Mtbuf && ins.op >= 4)
             || (ins.enc == Enc::Mubuf && !m.starts_with("buffer_load"))
             || (ins.enc == Enc::Vop1 && m.contains("lane") && m != "v_readfirstlane_b32")
-            || (wave_control && !wave_mask_operands(ins))
+            || (wave_control && !wave_mask_operands(ins) && !scalar_in_vcc(body, index))
             || (ins.enc == Enc::Sopp
                 && !matches!(
                     m,
@@ -890,6 +890,23 @@ fn wave_mask_operands(ins: &Insn) -> bool {
         );
     }
     ins.mnemonic != "s_mov_b32" || ins.dst != [Opnd::ExecLo]
+}
+
+/// Whether the scalar add at `index` reads VCC as the plain number a scalar
+/// multiply left there, in the same straight run. The compiler uses `vcc_lo` as
+/// a spare scalar register for an index into a table, and every invocation
+/// computes the whole product, so no invocation holds only one bit of it.
+fn scalar_in_vcc(body: &[Insn], index: usize) -> bool {
+    use Opnd::VccLo;
+    let ins = &body[index];
+    if !matches!(ins.mnemonic.as_str(), "s_add_i32" | "s_add_u32") || ins.dst.contains(&VccLo)
+        || ins.src.iter().chain(&ins.dst).any(|op| matches!(op, Opnd::ExecLo | Opnd::ExecHi | Opnd::VccHi))
+    {
+        return false;
+    }
+    let start = super::operand_fields::run_start(body, index);
+    body[start..index].iter().rev().find(|op| op.dst.contains(&VccLo))
+        .is_some_and(|op| op.mnemonic == "s_mul_i32")
 }
 
 // The guest builds a division seed from a scalar divisor through four VALU
