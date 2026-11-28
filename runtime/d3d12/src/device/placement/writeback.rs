@@ -22,13 +22,60 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 }
 
+/// A readback buffer with the allocator and list that copy into it, kept for
+/// the queue's next publication once the GPU has finished with them.
+pub(super) struct Parts {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    buffer: ID3D12Resource,
+}
+
+pub(super) type Spares = super::spares::Spares<Parts>;
+
 pub(super) struct Readback {
     pub(super) list: ID3D12CommandList,
-    _allocator: ID3D12CommandAllocator,
-    buffer: ID3D12Resource,
+    parts: Parts,
+    capacity: u64,
+    spares: Arc<Spares>,
     size: usize,
     // One footprint offset per mip (including array slices) in the readback buffer.
     textures: Vec<(Arc<Texture>, Vec<u64>)>,
+}
+
+impl Parts {
+    fn new(device: &ID3D12Device, kind: D3D12_COMMAND_LIST_TYPE, size: u64) -> Result<Self> {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let buffer = committed(
+            device,
+            D3D12_HEAP_TYPE_READBACK,
+            &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+        )?;
+        // SAFETY: the new allocator and command list belong to this device.
+        let allocator = unsafe { device.CreateCommandAllocator(kind)? };
+        let list = unsafe { device.CreateCommandList(0, kind, &allocator, None)? };
+        Ok(Self { allocator, list, buffer })
+    }
+
+    /// Reopen a spare for recording. Its last copy has completed on the GPU.
+    fn reopen(self) -> Option<Self> {
+        unsafe { self.allocator.Reset() }.ok()?;
+        unsafe { self.list.Reset(&self.allocator, None) }.ok()?;
+        Some(self)
+    }
 }
 
 impl Readback {
@@ -36,6 +83,7 @@ impl Readback {
         device: &ID3D12Device,
         kind: D3D12_COMMAND_LIST_TYPE,
         writers: &[Arc<Texture>],
+        spares: &Arc<Spares>,
     ) -> Result<Self> {
         let mut total = 0u64;
         let mut textures = Vec::new();
@@ -54,31 +102,30 @@ impl Readback {
             .ok()
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or(E_OUTOFMEMORY)?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: total,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
+        let capacity = super::spares::rounded(total).ok_or(E_OUTOFMEMORY)?;
+        let spare = spares
+            .take(capacity, std::time::Instant::now())
+            .and_then(|(parts, capacity)| Some((parts.reopen()?, capacity)));
+        let created = spare.is_none();
+        let (parts, capacity) = match spare {
+            Some(spare) => spare,
+            None => (Parts::new(device, kind, capacity)?, capacity),
         };
-        let buffer = committed(
-            device,
-            D3D12_HEAP_TYPE_READBACK,
-            &desc,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-        )?;
-        // SAFETY: the new allocator and command list belong to this device;
-        // both, the buffer and the source textures are retained to completion.
-        let allocator = unsafe { device.CreateCommandAllocator(kind)? };
-        let list: ID3D12GraphicsCommandList =
-            unsafe { device.CreateCommandList(0, kind, &allocator, None)? };
+        if super::readback_stats::enabled() {
+            super::readback_stats::recorded(
+                kind,
+                writers.iter().map(|texture| super::readback_stats::Recorded {
+                    key: Arc::as_ptr(texture).addr(),
+                    desc: &texture.desc,
+                    address: texture.address,
+                    subresources: texture.mips.len(),
+                    sources: texture.sources.swap(0, std::sync::atomic::Ordering::Relaxed),
+                    copied: texture.mips.iter().map(|mip| mip.bytes).sum(),
+                }),
+                created.then_some(capacity),
+            );
+        }
+        let Parts { list, buffer, .. } = &parts;
         for (texture, offsets) in &textures {
             for (level, &offset) in offsets.iter().enumerate() {
                 let mut footprint = texture.mips[level].footprint;
@@ -106,29 +153,40 @@ impl Readback {
                 }
             }
         }
+        // The buffer and the source textures are retained until the worker
+        // has seen this list complete.
         unsafe { list.Close()? };
         Ok(Self {
             list: list.cast()?,
-            _allocator: allocator,
-            buffer,
+            parts,
+            capacity,
+            spares: spares.clone(),
             size,
             textures,
         })
     }
 
+    /// Keep the buffer and recording for the queue's next publication. The
+    /// native fence covering this list has completed.
+    pub(super) fn recycle(self) {
+        self.spares.put(self.parts, self.capacity, std::time::Instant::now());
+    }
+
     /// Called after the native fence covering every footprint has completed.
-    pub(super) fn complete(self) -> Result<()> {
+    pub(super) fn complete(&self) -> Result<()> {
         let mut mapped = core::ptr::null_mut();
         let range = D3D12_RANGE {
             Begin: 0,
             End: self.size,
         };
-        unsafe { self.buffer.Map(0, Some(&range), Some(&mut mapped))? };
+        unsafe { self.parts.buffer.Map(0, Some(&range), Some(&mut mapped))? };
         // SAFETY: this is a completed GPU readback. The mapping covers this
         // allocation, remains live for the loop and is only accessed for reads.
         let data = unsafe { core::slice::from_raw_parts(mapped.cast::<u8>(), self.size) };
         let mut tiled = Vec::new();
         let mut valid = Vec::new();
+        let mut guest = Vec::new();
+        let stats = super::readback_stats::enabled();
         let result = self.textures.iter().try_for_each(|(texture, offsets)| {
             let mut state = lock(&texture.contents);
             for (level, &offset) in offsets.iter().enumerate() {
@@ -142,6 +200,10 @@ impl Readback {
                 // the guest can commit backing after creating the texture.
                 if region.0 - address >= size && !mapped_region(&region.1) {
                     state.previous[level] = None;
+                    if stats {
+                        let key = Arc::as_ptr(texture).addr();
+                        super::readback_stats::published(key, size as u64, super::readback_stats::Outcome::Unmapped);
+                    }
                     continue;
                 }
                 tiled.clear();
@@ -172,28 +234,86 @@ impl Readback {
                     }
                     Ok(())
                 })?;
-                // Coalesce adjacent texels in physical address order. Never
-                // write row padding, partial-tile holes or neighbouring mips.
-                if dense {
-                    write_mapped(address, &tiled, 0..size, &mut region)?;
-                } else {
-                    let mut first = next_bit(&valid, 0, elements, true);
-                    while first < elements {
-                        let end = next_bit(&valid, first, elements, false);
-                        write_mapped(address, &tiled, first * element..end * element, &mut region)?;
-                        first = next_bit(&valid, end, elements, true);
-                    }
+                let valid = (!dense).then(|| (&valid[..], element));
+                let (baseline, outcome) =
+                    publish_mip(address, &tiled, valid, &mut region, state.previous[level], &mut guest)?;
+                state.previous[level] = baseline;
+                if stats {
+                    super::readback_stats::published(Arc::as_ptr(texture).addr(), size as u64, outcome);
                 }
-                // Include padding from guest memory in the comparison baseline:
-                // upload::refresh compares the entire physical mip snapshot.
-                state.previous[level] = texture.snapshot_mip(mip, &mut tiled)?.then(|| Digest::of(&tiled));
             }
             Ok(())
         });
         // SAFETY: no CPU writes were made to the GPU readback allocation.
-        unsafe { self.buffer.Unmap(0, Some(&D3D12_RANGE::default())) };
+        unsafe { self.parts.buffer.Unmap(0, Some(&D3D12_RANGE::default())) };
         result
     }
+}
+
+/// Write one detiled mip to title memory at `address` and return the new
+/// comparison baseline with what the publication did. `valid` marks the
+/// elements the GPU image covers when the mip has holes; without it every
+/// byte is the GPU's. `previous` is the baseline from the last upload or
+/// publication.
+fn publish_mip(
+    address: usize,
+    tiled: &[u8],
+    valid: Option<(&[u64], usize)>,
+    region: &mut Region,
+    previous: Option<Digest>,
+    guest: &mut Vec<u8>,
+) -> Result<(Option<Digest>, super::readback_stats::Outcome)> {
+    use super::readback_stats::Outcome;
+    let size = tiled.len();
+    // Without holes every byte of the mip is the GPU's.
+    let whole = valid.is_none().then(|| Digest::of(tiled));
+    // A pass that did not change the texture, or rewrote the same texels,
+    // reads back what title memory last held. While the title's bytes are
+    // still those, writing them again changes nothing: leave the pages alone,
+    // as the console's GPU leaves them for a CPU write watch.
+    if let Some(digest) = whole
+        && previous == Some(digest)
+        && snapshot(address as u64, size, guest)?
+        && Digest::of(guest) == digest
+    {
+        return Ok((previous, Outcome::Skipped));
+    }
+    // Coalesce adjacent texels in physical address order. Never write row
+    // padding, partial-tile holes or neighbouring mips.
+    match valid {
+        None => write_mapped(address, tiled, 0..size, region)?,
+        Some((valid, element)) => {
+            let elements = size.div_ceil(element);
+            let mut first = next_bit(valid, 0, elements, true);
+            while first < elements {
+                let end = next_bit(valid, first, elements, false);
+                write_mapped(address, tiled, first * element..end * element, region)?;
+                first = next_bit(valid, end, elements, true);
+            }
+        }
+    }
+    // upload::refresh compares the entire physical mip. A whole mip now holds
+    // the GPU's bytes, and a CPU write landing after this publication is the
+    // title's, to be uploaded. A mip with holes takes its padding from guest
+    // memory.
+    let baseline = match whole {
+        Some(digest) => Some(digest),
+        None => snapshot(address as u64, size, guest)?.then(|| Digest::of(guest)),
+    };
+    let outcome = if baseline.is_some() && baseline == previous { Outcome::Rewritten } else { Outcome::Changed };
+    Ok((baseline, outcome))
+}
+
+/// Read `size` guest bytes at `address` into `output`.
+pub(super) fn snapshot(address: u64, size: usize, output: &mut Vec<u8>) -> Result<bool> {
+    output.clear();
+    output.try_reserve_exact(size).map_err(|_| E_OUTOFMEMORY)?;
+    output.resize(size, 0);
+    if !super::super::heap::backing::read_guest_bytes(address, output) {
+        output.clear();
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn mark_valid(valid: &mut [u64], mut range: Range<usize>) {

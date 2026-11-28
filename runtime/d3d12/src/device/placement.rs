@@ -3,18 +3,21 @@ mod descriptors;
 mod digest;
 mod guarded_copy;
 mod publication;
+mod readback_stats;
+mod spares;
 mod upload;
 mod waits;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
 pub(crate) use guarded_copy::recover as recover_guarded_copy;
 pub(crate) use publication::QueueAccess;
+pub(crate) use readback_stats::Source as WriteSource;
 use digest::Digest;
 
 use super::Device;
 use core::{ffi::c_void, ops::Range};
 use std::collections::{BTreeMap, btree_map::Entry};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use tuxbox_xg_layout::{Desc, Plane};
 use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER};
@@ -120,6 +123,9 @@ pub(crate) struct Texture {
     mips: Vec<Mip>,
     contents: Mutex<Contents>,
     images: Weak<Images>,
+    /// Why batches since the last readback counted this texture as written,
+    /// kept only for `TUXBOX_LOG`.
+    sources: AtomicU8,
 }
 
 impl Drop for Texture {
@@ -217,6 +223,11 @@ impl Texture {
 
     pub(crate) fn flags(&self) -> D3D12_RESOURCE_FLAGS {
         self.desc.Flags
+    }
+
+    /// Note for the readback log why a recorded command writes this texture.
+    pub(crate) fn note_write(&self, source: WriteSource) {
+        readback_stats::note(&self.sources, source);
     }
 
     fn new(
@@ -326,19 +337,13 @@ impl Texture {
             mips,
             contents,
             images: Arc::downgrade(images),
+            sources: AtomicU8::new(0),
         }))
     }
 
     fn snapshot_mip(&self, mip: &Mip, output: &mut Vec<u8>) -> Result<bool> {
         let size = (mip.source.end - mip.source.start) as usize;
-        output.clear();
-        output.try_reserve_exact(size).map_err(|_| E_OUTOFMEMORY)?;
-        output.resize(size, 0);
-        if !super::heap::backing::read_guest_bytes(self.address + mip.source.start, output) {
-            output.clear();
-            return Ok(false);
-        }
-        Ok(true)
+        writeback::snapshot(self.address + mip.source.start, size, output)
     }
 
     fn changed(
@@ -748,7 +753,7 @@ pub(crate) unsafe fn submit(
             .map_err(|_| E_OUTOFMEMORY)?;
         let worker = access.worker(&device.native, &placements.memory.failed)?;
         let readback =
-            writeback::Readback::record(&device.native, unsafe { queue.GetDesc() }.Type, writes)?;
+            writeback::Readback::record(&device.native, unsafe { queue.GetDesc() }.Type, writes, &worker.spares)?;
         Some((worker, readback))
     };
     if let Some(waits) = &holds {

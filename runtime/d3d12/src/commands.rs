@@ -420,11 +420,12 @@ unsafe extern "system" fn clear_rtv(
         return;
     }
     crate::diagnostics::display::clear(handle.ptr);
-    if let Some(target) = unsafe { placement::render_target(parent(&list.parent), handle.ptr) }
-        && let Err(error) = Recording::track_texture(&mut state.placed_writes, &target)
-    {
-        state.error = error;
-        return;
+    if let Some(target) = unsafe { placement::render_target(parent(&list.parent), handle.ptr) } {
+        target.note_write(placement::WriteSource::Clear);
+        if let Err(error) = Recording::track_texture(&mut state.placed_writes, &target) {
+            state.error = error;
+            return;
+        }
     }
     let cmd = state.native();
     unsafe {

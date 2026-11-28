@@ -141,7 +141,12 @@ impl DescriptorMap<PlacedView> {
         for heap in heaps {
             for (_, view) in views.range(heap.clone()) {
                 if let Some(texture) = view.texture.upgrade() {
-                    if view.writable { writes.push(texture); } else { reads.push(texture); }
+                    if view.writable {
+                        texture.note_write(super::WriteSource::HeapView);
+                        writes.push(texture);
+                    } else {
+                        reads.push(texture);
+                    }
                 }
             }
         }
