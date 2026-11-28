@@ -314,11 +314,13 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             ("mesh_groups", "mesh", "ms_6_5", "mesh_ms_payload", "mesh_ms_payload"),
             ("mesh_groups", "amplify", "as_6_5", "mesh_as", "mesh_as"),
             ("mesh_groups", "pixel", "ps_6_5", "mesh_ps", "mesh_ps"),
+            ("address_uav", "main", "cs_6_0", "address_uav", "address_uav_dxil"),
         ):
             payload = ["-DWITH_PAYLOAD=1"] if header == "mesh_ms_payload" else []
             subprocess.run([dxc, "-T", profile, "-E", entry, "-O3", *payload, "-Fh", f"{header}.h",
                             "-Vn", variable, str(src / f"{shader}.hlsl")], cwd=out, check=True)
         for name, source in (("tables", "table_guest.cpp"), ("indirect", "indirect_guest.cpp"),
+                             ("address-uav", "address_uav_guest.cpp"),
                              ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp"),
                              ("null-usage", "null_usage_guest.cpp"), ("root-cbv-window", "root_cbv_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX", f"/I{out}")
