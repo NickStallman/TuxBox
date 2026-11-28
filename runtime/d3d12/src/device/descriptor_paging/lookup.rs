@@ -72,6 +72,7 @@ impl Arena {
                     self.copy(first, slot, length, &mut retired);
                 }
                 let id = tables.alloc_id();
+                tables.longest = tables.longest.max(length);
                 tables.ranges.insert(
                     key,
                     TableEntry {
