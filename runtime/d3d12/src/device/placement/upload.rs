@@ -16,11 +16,27 @@ pub(super) struct Change {
 
 // These COM objects must survive the asynchronous copy, even if the guest
 // drops all associated resource and queue references immediately after Submit.
+// Once the copy completes, the buffer and command list are reused.
 struct Upload {
-    _buffer: ID3D12Resource,
-    _allocator: ID3D12CommandAllocator,
-    list: ID3D12CommandList,
-    _textures: Vec<ID3D12Resource>,
+    buffer: ID3D12Resource,
+    capacity: u64,
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+    executable: ID3D12CommandList,
+    textures: Vec<ID3D12Resource>,
+}
+
+/// Completed uploads kept for reuse, by their buffers' total size. The
+/// first flush can queue gigabytes; only this much stays allocated after it.
+const IDLE_BYTES: u64 = 256 << 20;
+
+/// Buffer sizes are rounded up so that later batches of similar size fit.
+fn upload_capacity(size: u64) -> Option<u64> {
+    if size <= 32 << 20 {
+        Some(size.next_power_of_two().max(1 << 20))
+    } else {
+        size.checked_next_multiple_of(16 << 20)
+    }
 }
 
 /// Changed bytes that go into one upload. A title's first flush can change
@@ -34,7 +50,14 @@ pub(super) struct Transfer {
     next: u64,
     pub(super) failed: Option<HRESULT>,
     pending: VecDeque<(u64, Upload)>,
+    idle: Vec<Upload>,
     scratch: Vec<u8>,
+    // Kept between submissions so a steady stream of changes does not allocate.
+    changes: Vec<Change>,
+    offsets: Vec<u64>,
+    reader_waits: Vec<(ID3D12Fence, u64)>,
+    #[cfg(test)]
+    pub(super) buffers_created: usize,
 }
 
 impl Transfer {
@@ -49,7 +72,13 @@ impl Transfer {
             next: 0,
             failed: None,
             pending: VecDeque::new(),
+            idle: Vec::new(),
             scratch: Vec::new(),
+            changes: Vec::new(),
+            offsets: Vec::new(),
+            reader_waits: Vec::new(),
+            #[cfg(test)]
+            buffers_created: 0,
         })
     }
 
@@ -66,7 +95,8 @@ impl Transfer {
         if let Some(error) = self.failed {
             return Err(error.into());
         }
-        let mut changes = Vec::new();
+        let mut changes = std::mem::take(&mut self.changes);
+        changes.clear();
         let mut bytes = 0;
         for texture in textures {
             let found = changes.len();
@@ -74,27 +104,31 @@ impl Transfer {
             bytes += changes[found..].iter().map(|change: &Change| change.bytes.len()).sum::<usize>();
             // All of a texture's mips stay in one upload.
             if bytes >= BATCH_BYTES {
-                self.upload(device, std::mem::take(&mut changes))?;
+                self.upload(device, &mut changes)?;
                 bytes = 0;
             }
         }
-        self.upload(device, changes)
+        self.upload(device, &mut changes)?;
+        self.changes = changes;
+        Ok(())
     }
 
-    fn upload(&mut self, device: &ID3D12Device, changes: Vec<Change>) -> Result<()> {
+    fn upload(&mut self, device: &ID3D12Device, changes: &mut Vec<Change>) -> Result<()> {
         let completed = unsafe { self.fence.GetCompletedValue() };
         while self
             .pending
             .front()
             .is_some_and(|(tick, _)| *tick <= completed)
         {
-            self.pending.pop_front();
+            if let Some((_, upload)) = self.pending.pop_front() {
+                self.recycle(upload);
+            }
         }
         if changes.is_empty() {
             return Ok(());
         }
         if crate::diagnostics::display::trace_views() {
-            for change in &changes {
+            for change in changes.iter() {
                 let desc = change.texture.desc;
                 if desc.Height == 1 && desc.Width <= 1024 {
                     use windows::core::Interface;
@@ -106,8 +140,9 @@ impl Transfer {
                 }
             }
         }
-        let upload = Upload::record(device, &changes)?;
-        let mut reader_waits = Vec::new();
+        let upload = self.record(device, changes)?;
+        let mut reader_waits = std::mem::take(&mut self.reader_waits);
+        reader_waits.clear();
         for mips in changes.chunk_by(|a, b| Arc::ptr_eq(&a.texture, &b.texture)) {
             // A guest may use a different queue on each submission. Order
             // replacement writes after every outstanding reader of this texture.
@@ -120,21 +155,22 @@ impl Transfer {
                 }
             }
         }
-        for (fence, value) in reader_waits {
+        for (fence, value) in reader_waits.drain(..) {
             unsafe { self.queue.Wait(&fence, value)? };
             crate::commands::queue_trace::waited(&self.queue, "upload waits for texture reads", &fence, value);
         }
+        self.reader_waits = reader_waits;
         let tick = self.tick()?;
         self.pending.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
         unsafe {
-            self.queue.ExecuteCommandLists(&[Some(upload.list.clone())]);
+            self.queue.ExecuteCommandLists(&[Some(upload.executable.clone())]);
         }
         self.pending.push_back((tick, upload));
         if let Err(error) = unsafe { self.queue.Signal(&self.fence, tick) } {
             self.failed = Some(error.code());
             return Err(error);
         }
-        for change in changes {
+        for change in changes.drain(..) {
             let mut state = lock(&change.texture.contents);
             state.previous[change.level] = Some(change.digest);
             self.scratch = change.bytes;
@@ -142,6 +178,74 @@ impl Transfer {
             state.readers.clear();
         }
         Ok(())
+    }
+
+    /// Keeps a completed upload for reuse, up to `IDLE_BYTES` of buffers.
+    fn recycle(&mut self, mut upload: Upload) {
+        upload.textures.clear();
+        if self.idle.try_reserve(1).is_err() {
+            return;
+        }
+        self.idle.push(upload);
+        let mut idle: u64 = self.idle.iter().map(|u| u.capacity).sum();
+        while idle > IDLE_BYTES {
+            let Some(largest) = (0..self.idle.len()).max_by_key(|&i| self.idle[i].capacity) else {
+                break;
+            };
+            idle -= self.idle.swap_remove(largest).capacity;
+        }
+    }
+
+    /// An open command list and a buffer of at least `size` bytes, reused
+    /// from a completed upload when one is large enough.
+    fn begin(&mut self, device: &ID3D12Device, size: u64) -> Result<Upload> {
+        while let Some(index) = (0..self.idle.len())
+            .filter(|&i| self.idle[i].capacity >= size)
+            .min_by_key(|&i| self.idle[i].capacity)
+        {
+            let upload = self.idle.swap_remove(index);
+            // SAFETY: the fence showed this upload's copy as complete.
+            let reset = unsafe { upload.allocator.Reset().and_then(|()| upload.list.Reset(&upload.allocator, None)) };
+            if reset.is_ok() {
+                return Ok(upload);
+            }
+        }
+        let capacity = upload_capacity(size).ok_or(E_OUTOFMEMORY)?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: capacity,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let buffer = committed(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+        )?;
+        #[cfg(test)]
+        {
+            self.buffers_created += 1;
+        }
+        let allocator: ID3D12CommandAllocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)? };
+        let list: ID3D12GraphicsCommandList =
+            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)? };
+        Ok(Upload {
+            buffer,
+            capacity,
+            allocator,
+            executable: list.cast()?,
+            list,
+            textures: Vec::new(),
+        })
     }
 }
 
@@ -160,11 +264,13 @@ impl Drop for Transfer {
     }
 }
 
-impl Upload {
-    fn record(device: &ID3D12Device, changes: &[Change]) -> Result<Self> {
+impl Transfer {
+    fn record(&mut self, device: &ID3D12Device, changes: &[Change]) -> Result<Upload> {
         let alignment = u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
         let mut total = 0u64;
-        let mut offsets = Vec::with_capacity(changes.len());
+        let offsets = &mut self.offsets;
+        offsets.clear();
+        offsets.try_reserve(changes.len()).map_err(|_| E_OUTOFMEMORY)?;
         for change in changes {
             let offset = total
                 .checked_next_multiple_of(alignment)
@@ -178,41 +284,19 @@ impl Upload {
             .ok()
             .filter(|n| *n <= isize::MAX as usize)
             .ok_or(E_OUTOFMEMORY)?;
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: total,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let buffer = committed(
-            device,
-            D3D12_HEAP_TYPE_UPLOAD,
-            &desc,
-            D3D12_RESOURCE_STATE_GENERIC_READ,
-            None,
-        )?;
-        let allocator = unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)? };
-        let list: ID3D12GraphicsCommandList =
-            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)? };
+        let mut upload = self.begin(device, total)?;
+        let Upload { buffer, list, textures: destinations, .. } = &mut upload;
         let mut mapped = core::ptr::null_mut();
         let empty = D3D12_RANGE::default();
         unsafe {
             buffer.Map(0, Some(&empty), Some(&mut mapped))?;
         }
-        // SAFETY: this CPU-writeable buffer covers 'size' bytes; this command
-        // list has not been executed and the pointer is scoped to the mapping.
+        // SAFETY: this CPU-writeable buffer covers at least 'size' bytes; no
+        // copy from it is pending and the pointer is scoped to the mapping.
         let output = unsafe { core::slice::from_raw_parts_mut(mapped.cast::<u8>(), size) };
-        let mut destinations = Vec::new();
         let result: Result<()> = changes
             .iter()
-            .zip(offsets)
+            .zip(self.offsets.iter().copied())
             .try_for_each(|(change, offset)| {
                 change.detile(&mut output[offset as usize..])?;
                 let texture = &change.texture;
@@ -240,6 +324,7 @@ impl Upload {
                     ManuallyDrop::drop(&mut dst.pResource);
                 }
                 if destinations.last() != Some(&texture.native) {
+                    destinations.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
                     destinations.push(texture.native.clone());
                 }
                 Ok(())
@@ -251,12 +336,7 @@ impl Upload {
         unsafe {
             list.Close()?;
         }
-        Ok(Self {
-            _buffer: buffer,
-            _allocator: allocator,
-            list: list.cast()?,
-            _textures: destinations,
-        })
+        Ok(upload)
     }
 }
 

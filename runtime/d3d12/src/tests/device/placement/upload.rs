@@ -117,6 +117,39 @@ fn placed_mips_detile_from_every_element_address() {
     }
 }
 
+/// Once a batch's copy has completed, the next batch records into its upload
+/// buffer and command list instead of creating new ones.
+#[test]
+fn completed_uploads_lend_their_buffer_to_the_next_change() {
+    let Some(device) = hardware_device() else {
+        eprintln!("skipped: no hardware adapter");
+        return;
+    };
+    let images = Arc::new(Images::default());
+    let placed = Placed::new(&device, &images, &texture(DXGI_FORMAT_R8G8B8A8_UNORM, 256, 256, 1, 9, 0x105));
+    let mut transfer = Transfer::new(&device).unwrap();
+    for round in 0..4u8 {
+        placed.guest.iter_mut().enumerate().for_each(|(i, b)| *b = (i as u8).wrapping_mul(7).wrapping_add(round));
+        transfer.refresh(&device, std::slice::from_ref(&placed.texture)).unwrap();
+        let tick = transfer.pending.back().expect("a changed texture is uploaded").0;
+        unsafe { transfer.fence.SetEventOnCompletion(tick, HANDLE::default()).unwrap() };
+        assert_eq!(transfer.buffers_created, 1, "round {round}");
+    }
+    // Unchanged contents upload nothing and return the last buffer to the pool.
+    transfer.refresh(&device, std::slice::from_ref(&placed.texture)).unwrap();
+    assert!(transfer.pending.is_empty());
+    assert_eq!(transfer.idle.len(), 1);
+}
+
+#[test]
+fn upload_buffers_round_up_to_shared_sizes() {
+    assert_eq!(super::upload_capacity(1), Some(1 << 20));
+    assert_eq!(super::upload_capacity((3 << 20) + 1), Some(4 << 20));
+    assert_eq!(super::upload_capacity(32 << 20), Some(32 << 20));
+    assert_eq!(super::upload_capacity((32 << 20) + 1), Some(48 << 20));
+    assert_eq!(super::upload_capacity(u64::MAX), None);
+}
+
 /// What uploading a changed mip chain costs per MiB, beyond reading and
 /// digesting it, for the layouts titles place. Run with `--ignored
 /// --nocapture` on a release build and a GPU.
