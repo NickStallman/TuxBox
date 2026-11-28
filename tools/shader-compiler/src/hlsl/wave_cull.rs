@@ -168,12 +168,40 @@ pub(super) fn prepare_insn(em: &mut Emitter<'_>, idx: usize, i: &Insn) -> Result
             em.line(&code);
         }
     }
-    if matches!(i.mnemonic.as_str(), "s_cbranch_scc0" | "s_cbranch_scc1") {
-        if let Some(prev) = idx.checked_sub(1).and_then(|p| em.insns.get(p)).filter(|p| p.mnemonic == "s_andn2_b64") {
-            em.line(&format!("scc = any(tb_page_ballot(tb_wave_tid, ({} & 1u) != 0u));", r(&prev.dst[0])?));
-        }
+    if em.hoisted_votes.contains(&idx) {
+        em.line(&format!("scc = any(mask_scc{idx});"));
+    } else if let Some(mask) = mask_branch(em, idx, i) {
+        em.line(&format!("scc = any(tb_page_ballot(tb_wave_tid, ({} & 1u) != 0u));", r(&mask)?));
     }
     Ok(())
+}
+
+/// The mask an SCC branch tests when the instruction before it clears lanes
+/// from it, as a loop over remaining lanes does to decide another iteration.
+fn mask_branch(em: &Emitter<'_>, idx: usize, i: &Insn) -> Option<Opnd> {
+    if !matches!(i.mnemonic.as_str(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+        return None;
+    }
+    let prev = em.insns.get(idx.checked_sub(1)?).filter(|p| p.mnemonic == "s_andn2_b64")?;
+    prev.dst.first().copied()
+}
+
+/// A vote `emit` takes over the guest wave inside the guest branch guard, here
+/// taken before the guard instead. Where exchanges are hoisted the guards differ
+/// between the guest waves of a group, and a group loop's body skips threads that
+/// are done: every thread must reach the barriers. A thread the guard skips
+/// votes false, as it voted nothing when it did not call.
+pub(super) fn guarded_vote(em: &Emitter<'_>, idx: usize, i: &Insn, active: &[usize]) -> Option<String> {
+    if !em.hoist_wave_exchanges || em.own_lane_reads.contains(&idx) {
+        return None;
+    }
+    let (name, mask) = match i.mnemonic.as_str() {
+        "s_cmp_lg_u32" if i.src == [Opnd::ExecHi, Opnd::ConstInt(0)] => ("exec_words", "exec_lo".to_string()),
+        "s_cselect_b32" if i.src == [Opnd::ExecHi, Opnd::ExecLo] => ("exec_words", "exec_lo".to_string()),
+        _ => ("mask_scc", r(&mask_branch(em, idx, i)?).ok()?),
+    };
+    let vote = super::group_loops::guarded(active, &format!("({mask} & 1u) != 0u"));
+    Some(format!("uint2 {name}{idx} = tb_page_ballot(tb_wave_tid, {vote});"))
 }
 
 pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, i: &Insn, target: Option<usize>) -> Result<bool,String> {
@@ -207,10 +235,16 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, i: &Insn, target: Option<us
     }
     match op {
         "s_cmp_lg_u32" if i.src == [Opnd::ExecHi, Opnd::ConstInt(0)] => {
-            em.line("scc = (tb_page_ballot(tb_wave_tid, (exec_lo & 1u) != 0u).y != 0u);");
+            if em.hoisted_votes.contains(&idx) {
+                em.line(&format!("scc = (exec_words{idx}.y != 0u);"));
+            } else {
+                em.line("scc = (tb_page_ballot(tb_wave_tid, (exec_lo & 1u) != 0u).y != 0u);");
+            }
         }
         "s_cselect_b32" if i.src == [Opnd::ExecHi, Opnd::ExecLo] => {
-            em.line(&format!("uint2 exec_words{idx} = tb_page_ballot(tb_wave_tid, (exec_lo & 1u) != 0u);"));
+            if !em.hoisted_votes.contains(&idx) {
+                em.line(&format!("uint2 exec_words{idx} = tb_page_ballot(tb_wave_tid, (exec_lo & 1u) != 0u);"));
+            }
             em.ws(&i.dst[0], &format!("(scc != 0u ? exec_words{idx}.y : exec_words{idx}.x)"))?;
         }
         "s_cbranch_vccnz" | "s_cbranch_vccz" if op == "s_cbranch_vccnz" || em.ex.stage == Stage::Mesh => {

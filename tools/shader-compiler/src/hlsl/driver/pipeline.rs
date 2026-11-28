@@ -736,6 +736,7 @@ fn translate_outputs_once_impl(ex: &ShaderExtract, feeds_ps: Option<&InputInterp
         hlsl.insert_str(0, instance_cull_hzb::HIDDEN_DECLARATIONS);
     }
     if light_grid { hlsl.insert_str(0, light_grid::DECLARATIONS); }
+    if em.group_votes { hlsl.insert_str(0, group_loops::GROUP_ANY); }
     if em.portable_wave64 { hlsl.insert_str(0, &wave_sum::portable_declarations(compute_group(ex))); }
     if shared_mask {
         hlsl.insert_str(0, &page_waves::ballot_declarations(compute_group(ex).into_iter().product()));
