@@ -262,7 +262,17 @@ impl Upload {
 
 impl Change {
     fn detile(&self, output: &mut [u8]) -> Result<()> {
-        self.texture.layout_runs(self.level, |tiled, linear| {
+        let texture = &self.texture;
+        if let Some(table) = texture.addresses(self.level) {
+            let mip = &texture.mips[self.level];
+            let pitch = mip.footprint.Footprint.RowPitch as usize;
+            return if table.detile(&self.bytes, mip.source.start, output, pitch) {
+                Ok(())
+            } else {
+                Err(E_INVALIDARG.into())
+            };
+        }
+        texture.layout_runs(self.level, |tiled, linear| {
             output
                 .get_mut(linear)
                 .ok_or(E_INVALIDARG)?
@@ -303,23 +313,28 @@ impl Texture {
             }
             return Ok(());
         }
-        // In layout 0x105, X occupies the low address bits through byte 15.
-        let run = if self.desc.Layout.0 == 0x100 {
-            mip.elements as usize
-        } else {
-            16 / element
-        };
+        if let Some(table) = self.addresses(level) {
+            return table.try_for_each_run(|offset, y, x, count| {
+                let tiled = offset.checked_sub(mip.source.start).ok_or(E_INVALIDARG)? as usize;
+                let linear = y as usize * pitch + x as usize * element;
+                visit(tiled..tiled + count, linear..linear + count)
+            });
+        }
+        // Without a table, one element at a time.
         for y in 0..mip.rows {
-            for x in (0..mip.elements).step_by(run) {
-                let count = (mip.elements - x).min(run as u32) as usize * element;
+            for x in 0..mip.elements {
                 let tiled = plane
                     .element_offset_in_slice(mip.slice, mip.level, x.into(), y)
                     .and_then(|a| a.checked_sub(mip.source.start))
                     .ok_or(E_INVALIDARG)? as usize;
                 let linear = y as usize * pitch + x as usize * element;
-                visit(tiled..tiled + count, linear..linear + count)?;
+                visit(tiled..tiled + element, linear..linear + element)?;
             }
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/device/placement/upload.rs"]
+mod tests;

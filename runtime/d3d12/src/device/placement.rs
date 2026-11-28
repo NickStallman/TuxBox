@@ -1,4 +1,5 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
+mod addresses;
 mod descriptors;
 mod digest;
 mod guarded_copy;
@@ -118,6 +119,7 @@ pub(crate) struct Texture {
     plane: Option<Plane>,
     size: u64,
     mips: Vec<Mip>,
+    addresses: Box<[addresses::Slot]>,
     contents: Mutex<Contents>,
     images: Weak<Images>,
 }
@@ -323,6 +325,7 @@ impl Texture {
             address,
             plane,
             size,
+            addresses: mips.iter().map(|_| addresses::Slot::new()).collect(),
             mips,
             contents,
             images: Arc::downgrade(images),
