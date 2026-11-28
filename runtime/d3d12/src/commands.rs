@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, RECT, S_OK};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringA;
-use windows::core::{HRESULT, IUnknown, Interface, s};
+use windows::core::{HRESULT, IUnknown, Interface};
 
 use crate::device;
 use crate::device::placement::{self, Texture};
