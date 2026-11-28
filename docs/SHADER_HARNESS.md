@@ -38,7 +38,7 @@ Put the paths in `build/shader-harness.json`, which Git ignores:
 | Execute | Runs a sample of recorded compute shaders, as both builds translate them, over the same generated resources on each card, and compares what they write ([below](#executing-recorded-shaders)) | a shader computes something different, or ran before and no longer runs |
 | Coverage | Lists instructions the recorded shaders use that no GPU check program holds, and the largest refusals | never; it shows where to add tests |
 
-The report is `report.md` in the run folder under `build/shader-harness/`, with request names and details in `report.json`. Neither holds shader bytes or HLSL. It names any of AMD and NVIDIA that did not run.
+The report is `report.md` in the run folder under `build/shader-harness/`, with request names and details in `report.json`. Neither holds shader bytes or HLSL. It gives the HLSL size and translation time of both builds for each host, and names any of AMD and NVIDIA that did not run.
 
 Options for common cases:
 
