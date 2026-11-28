@@ -96,9 +96,11 @@ def record(instructions):
 
 
 def inspect(path, executable):
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    require(digest == BUILD, "Unknown executable hash. RVAs are scoped to the documented Fortnite XSX build.")
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    require(digest.hexdigest() == BUILD, "Unknown executable hash. RVAs are scoped to the documented Fortnite XSX build.")
     with closing(pefile.PE(str(path), fast_load=True)) as pe:
         require(pe.FILE_HEADER.Machine == 0x8664, "Expected AMD64 PE")
         pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
