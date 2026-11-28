@@ -146,6 +146,8 @@ impl<'a> Emitter<'a> {
             fspx_wave: None,
             hair_multisample: false,
             hoist_wave_exchanges: false,
+            hoisted_votes: BTreeSet::new(),
+            group_votes: false,
             regs: if has_mode { BTreeSet::from(["tb_fp_mode".into()]) } else { BTreeSet::new() },
             body: String::new(),
             heap_locals: BTreeSet::new(),

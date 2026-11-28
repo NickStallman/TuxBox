@@ -114,6 +114,7 @@ use params::Param;
 mod light_grid;
 mod lone_lane;
 mod page_waves;
+mod group_loops;
 mod wave_cull;
 mod ray_resolve;
 mod fspx_wave;
@@ -410,6 +411,10 @@ struct Emitter<'a> {
     fspx_wave: Option<u32>,
     hair_multisample: bool,
     hoist_wave_exchanges: bool,
+    /// Rendezvous whose vote `emit_program` took outside the guest branch guard.
+    hoisted_votes: BTreeSet<usize>,
+    /// The program calls `tb_group_any` (see `group_loops`).
+    group_votes: bool,
     regs: BTreeSet<String>,
     body: String,
     tmp: usize,

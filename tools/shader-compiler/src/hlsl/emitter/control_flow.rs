@@ -97,7 +97,14 @@ impl<'a> Emitter<'a> {
         for (&branch, &label) in &target {
             earliest.entry(label).and_modify(|first| *first = (*first).min(branch)).or_insert(branch);
         }
-        if !labels.is_empty() {
+        // Loops that hold a group rendezvous iterate as a group (see `group_loops`).
+        let grouped = if self.hoist_wave_exchanges || self.page_waves {
+            group_loops::select(&loops, |i| self.group_exchange(i, &self.insns[i]).is_ok_and(|code| code.is_some())
+                || wave_cull::guarded_vote(self, i, &self.insns[i], &[]).is_some())
+        } else {
+            BTreeSet::new()
+        };
+        if !labels.is_empty() || !grouped.is_empty() {
             // See `skip_to`.
             self.line("uint tb_skip = 0u;");
         }
@@ -106,7 +113,11 @@ impl<'a> Emitter<'a> {
             for &(_, b) in &loops {
                 self.line(&format!("bool tb_c{b} = false;"));
             }
+            for &b in &grouped {
+                group_loops::declare(self, b);
+            }
         }
+        let mut group_depth = 0usize;
 
         let insns = self.insns.clone();
         let view_cull = self.view_cull;
@@ -154,6 +165,10 @@ impl<'a> Emitter<'a> {
             if let Some(&b) = heads.get(&i) {
                 self.end_guard(&mut open);
                 cur.clear();
+                if grouped.contains(&b) {
+                    group_loops::enter(self, b);
+                    group_depth += 1;
+                }
                 self.line("do {");
                 // The back edge can store the index after a use. Bind again inside the loop.
                 self.drop_heap_handles();
@@ -163,19 +178,21 @@ impl<'a> Emitter<'a> {
             }
             let mut active: Vec<usize> =
                 labels.iter().copied().filter(|&t| t > i && earliest.get(&t).is_some_and(|&b| b < i)).collect();
-            if self.page_waves || self.hoist_wave_exchanges {
-                let exchange = if self.page_waves {
-                    page_waves::rendezvous(i, ins)?
-                } else {
-                    let local = self.own_lane_reads.contains(&i)
-                        || (matches!(ins.mnemonic.as_str(), "s_cbranch_execz" | "s_cbranch_vccz" | "s_cbranch_vccnz") && self.in_loop(i));
-                    if local { None } else { wave_cull::exchange(i, ins, self.ex.stage == Stage::Mesh)? }
-                };
-                if let Some(code) = exchange {
-                    self.end_guard(&mut open);
-                    cur.clear();
-                    self.line(&code);
-                }
+            if group_depth != 0 {
+                // A thread done with an enclosing group loop skips all of its body.
+                active.push(group_loops::SKIP_ALL);
+            }
+            if let Some(code) = self.group_exchange(i, ins)? {
+                self.end_guard(&mut open);
+                cur.clear();
+                self.line(&code);
+            }
+            if let Some(code) = wave_cull::guarded_vote(self, i, ins, &active) {
+                // Every invocation reaches the barriers; the guard decides its vote.
+                self.end_guard(&mut open);
+                cur.clear();
+                self.line(&code);
+                self.hoisted_votes.insert(i);
             }
             let mesh_condition = self.hoist_wave_exchanges && self.ex.stage == Stage::Mesh
                 && reads_scc(ins) && !self.in_loop(i) && scc_from_mask(&insns, i);
@@ -381,7 +398,9 @@ impl<'a> Emitter<'a> {
                     self.line(&format!("tb_skip *= uint(tb_skip > {i}u);"));
                 }
                 let exits = labels.range(i + 1..).next().is_some();
-                let guard = if self.wave_cull || self.light_grid || probe_trace
+                // A mesh loop without a rendezvous may leave early by itself:
+                // the group loops keep their own count.
+                let guard = if (self.wave_cull && self.ex.stage != Stage::Mesh) || self.light_grid || probe_trace
                     || self.wave_bounded_latches.contains(&i)
                     || self.packed.as_ref().is_some_and(|p| p.copy_backedges.contains(&i) || p.bounded_backedges.contains(&i))
                 {
@@ -393,6 +412,10 @@ impl<'a> Emitter<'a> {
                     // The guest iterates cb0[12] views. Retired lanes must
                     // participate in the barriers for each remaining view.
                     self.line("} while (++cull_view < cb0[3].x);");
+                } else if grouped.contains(&i) {
+                    let exit = if exits { format!(" && tb_skip <= {i}u") } else { String::new() };
+                    group_loops::close(self, i, &format!("tb_c{i}{exit}"));
+                    group_depth -= 1;
                 } else if vote {
                     // Keep the whole wave in the loop while any lane still needs to
                     // run; finished lanes stay in the loop, masked, and still hit the barriers.
@@ -411,6 +434,19 @@ impl<'a> Emitter<'a> {
             self.end_guard(&mut open);
         }
         Ok(())
+    }
+
+    /// The rendezvous emitted at `i` outside every guest branch guard.
+    fn group_exchange(&self, i: usize, ins: &Insn) -> Result<Option<String>, String> {
+        if self.page_waves {
+            return page_waves::rendezvous(i, ins);
+        }
+        if !self.hoist_wave_exchanges {
+            return Ok(None);
+        }
+        let local = self.own_lane_reads.contains(&i)
+            || (matches!(ins.mnemonic.as_str(), "s_cbranch_execz" | "s_cbranch_vccz" | "s_cbranch_vccnz") && self.in_loop(i));
+        if local { Ok(None) } else { wave_cull::exchange(i, ins, self.ex.stage == Stage::Mesh) }
     }
 
     /// Follow guest basic blocks from `entry`. Each block sets the next block id
