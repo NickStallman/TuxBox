@@ -12,11 +12,13 @@ from time import monotonic
 
 from . import dxil_store, persistent_dxc
 from .inspect import digest
-from .prep_progress import PrepPhase, desktop_progress, report_progress
-from .runtime_shaders import REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache
+from .prep_progress import ProgramPhase, desktop_progress, report_progress
+from .runtime_shaders import (
+    MAX_SHADER_BYTES, REQUEST_PATTERNS, ShaderRefused, compile_request, snapshot_compiler_cache,
+)
 from .shader_prep import SOURCE_CACHE
 from .shader_diagnostics import normalize_refusal
-from .shader_pack import seed_requests
+from .shader_pack import count_programs, program_digest, seed_requests
 from .scarlett_report import aggregate, refusal_bucket, failure_bucket, expected_at_preparation
 
 
@@ -71,6 +73,38 @@ def seed_from_pack(executable, archive, env):
                     f"in {monotonic() - started:.1f}s.")
 
 
+def shader_total(executable, remembered, env):
+    """Count the programs in shaders.rpf and tell the title's progress panel."""
+    pack = executable.with_name("shaders.rpf")
+    try:
+        total = count_programs(pack, remembered)
+    except OSError as exc:
+        report_progress(None, f"Could not count the programs in ProjectScarlett's shader pack: {exc}")
+        return 0
+    if total:
+        env["TUXBOX_SHADER_PROGRAMS"] = str(total)
+    return total
+
+
+def announce_programs(executable, host):
+    """Give a ProjectScarlett launch, which skips preparation, the shader total."""
+    prefix = host.env.get("WINEPREFIX")
+    archive = prefix and scarlett_requests(executable, Path(prefix) / SOURCE_CACHE.parent)
+    if archive:
+        shader_total(executable, archive.parent / "pack-programs.json", host.env)
+
+
+def request_program(source):
+    """The program a request translates; for a linked pair, its producer."""
+    path = source / "producer.dxbc" if source.suffix == ".link" else source
+    try:
+        with path.open("rb") as stream:
+            program = program_digest(stream.read(MAX_SHADER_BYTES))
+    except OSError:
+        program = None
+    return program or source.stem[:64]
+
+
 def bounded_results(executor, compile_one, sources, jobs):
     """Keep at most twice the worker count in flight, including queued jobs."""
     if jobs < 1:
@@ -96,6 +130,7 @@ def prepare_scarlett(executable, host):
     archive = scarlett_requests(executable, cache_root)
     if archive is None:
         return False
+    total = shader_total(executable, archive.parent / "pack-programs.json", host.env)
     seed_from_pack(executable, archive, host.env)
     sources = sorted(
         path for path in archive.iterdir()
@@ -122,9 +157,13 @@ def prepare_scarlett(executable, host):
         pinned = {"dxc_helper": persistent.helper} if persistent is not None else {}
         tools, cache = snapshot_compiler_cache(Path(tmp) / "xshader", cache_root, **pinned)
         options = {"persistent": persistent} if persistent is not None else {}
-        phase = PrepPhase(progress, "Previously used Xbox shaders", len(sources))
+        phase = ProgramPhase(progress, "ProjectScarlett", len(sources), total)
 
         def compile_one(source):
+            program = request_program(source)
+            return (program, *translate(source))
+
+        def translate(source):
             try:
                 compiled = compile_request(source, source.stem, tools, cache, None, **options)
                 return ("compiled" if compiled else "cached"), None, None, source.suffix, None
@@ -136,7 +175,8 @@ def prepare_scarlett(executable, host):
         workers = ThreadPoolExecutor(max_workers=jobs)
         try:
             for completed, result in enumerate(bounded_results(workers, compile_one, sources, jobs), 1):
-                category, error, bucket, suffix, reason = result
+                program, category, error, bucket, suffix, reason = result
+                phase.count(program, category)
                 totals[category] += 1
                 request_counts[suffix] += 1
                 if category == "unsupported":
@@ -154,7 +194,8 @@ def prepare_scarlett(executable, host):
 
         elapsed = monotonic() - started
         unsupported = totals["unsupported"]
-        report_progress(progress, f"ProjectScarlett shader preparation took {elapsed:.1f}s. "
+        report_progress(None, f"ProjectScarlett: {phase.summary()}")
+        report_progress(progress, f"ProjectScarlett shader preparation took {elapsed:.1f}s. Requests: "
                         f"{totals['compiled']} compiled, {totals['cached']} cached, "
                         f"{totals['unsupported']} unsupported, {totals['failed']} failed.", 1, 1)
         reused = dxil_store.reused["dxil"] - reused_before

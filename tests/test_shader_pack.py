@@ -9,7 +9,7 @@ from unittest.mock import patch
 import zlib
 
 from project_tuxbox.scarlett_prep import prep_jobs, prepare_scarlett
-from project_tuxbox.shader_pack import records, seed_requests
+from project_tuxbox.shader_pack import count_programs, program_digest, records, seed_requests
 
 
 def deflate(data):
@@ -70,6 +70,40 @@ class ShaderPackRecords(unittest.TestCase):
             self.assertEqual((requests / (hashlib.sha256(a).hexdigest() + ".dxbc")).read_bytes(), a)
             self.assertEqual(seed_requests(pack, requests), (2, 0))
             self.assertEqual(sorted(p.suffix for p in requests.iterdir()), [".dxbc", ".dxbc"])
+
+
+class ShaderPrograms(unittest.TestCase):
+    @staticmethod
+    def container(*parts):
+        table = 32 + 4 * len(parts)
+        body, offsets = b"", []
+        for tag, data in parts:
+            offsets.append(table + len(body))
+            body += tag + len(data).to_bytes(4, "little") + data
+        head = b"DXBC" + bytes(20) + (table + len(body)).to_bytes(4, "little") + len(parts).to_bytes(4, "little")
+        return head + b"".join(at.to_bytes(4, "little") for at in offsets) + body
+
+    def test_an_added_root_signature_keeps_the_program(self):
+        plain = self.container((b"DXIL", b"program"), (b"PSV0", b"info"))
+        rooted = self.container((b"RTS0", b"root"), (b"DXIL", b"program"))
+        self.assertEqual(program_digest(plain), program_digest(rooted))
+        self.assertNotEqual(program_digest(plain), program_digest(self.container((b"DXIL", b"another"))))
+        for data in (b"", b"DXBC", self.container((b"PSV0", b"info")), plain[:40]):
+            self.assertIsNone(program_digest(data))
+
+    def test_the_pack_is_counted_once_until_it_changes(self):
+        a, b = self.container((b"DXIL", b"a")), self.container((b"DXIL", b"b"))
+        rooted = self.container((b"DXIL", b"a"), (b"RTS0", b"root"))
+        with TemporaryDirectory() as tmp:
+            pack, remembered = Path(tmp) / "shaders.rpf", Path(tmp) / "new/count.json"
+            pack.write_bytes(b"9FPR" + record("CS_A", a) + record("PS_B", b) + record("CS_Again", rooted))
+            self.assertEqual(count_programs(pack, remembered), 2)
+            with patch("project_tuxbox.shader_pack.records", side_effect=AssertionError("read again")):
+                self.assertEqual(count_programs(pack, remembered), 2)
+            pack.write_bytes(b"9FPR" + record("CS_A", a))
+            self.assertEqual(count_programs(pack, remembered), 1)
+            remembered.write_text("torn")
+            self.assertEqual(count_programs(pack, remembered), 1)
 
 
 class ScarlettPreparationOptions(unittest.TestCase):

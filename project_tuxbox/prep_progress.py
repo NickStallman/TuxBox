@@ -29,13 +29,55 @@ class PrepPhase:
         if completed not in (0, self.total) and now - self.last_report < 1:
             return
         self.last_report = now
+        report_progress(self.progress, self.message(completed, compiled, unsupported, failed),
+                        completed, self.total)
+
+    def message(self, completed, compiled, unsupported, failed):
         skipped = unsupported + failed
         reused = completed - compiled - skipped
         status = "checked" if skipped else "ready"
         message = f"{self.label} · {completed}/{self.total} {status} · {compiled} compiled · {reused} reused"
         if skipped:
             message += f" · {unsupported} unsupported · {failed} failed"
-        report_progress(self.progress, message, completed, self.total)
+        return message
+
+
+class ProgramPhase(PrepPhase):
+    """Preparation counted in shader programs. One program can take many
+    requests, so the requests only measure the work left."""
+
+    def __init__(self, progress, label, total, programs=0):
+        self.programs = programs
+        self.compiled_programs = set()
+        self.refused_programs = set()
+        self.failed_programs = set()
+        super().__init__(progress, label, total)
+
+    def count(self, program, category):
+        """Note one request's result: compiled, cached, unsupported or failed."""
+        group = {"unsupported": self.refused_programs, "failed": self.failed_programs}.get(
+            category, self.compiled_programs)
+        group.add(program)
+
+    def outcome(self):
+        """Programs compiled, then those with no compiled request that were
+        refused, then the rest that failed."""
+        refused = self.refused_programs - self.compiled_programs
+        failed = self.failed_programs - self.compiled_programs - refused
+        return len(self.compiled_programs), len(refused), len(failed)
+
+    def summary(self):
+        compiled, refused, failed = self.outcome()
+        of = f" of {self.programs:,}" if self.programs else ""
+        text = f"{compiled:,}{of} shaders compiled"
+        if refused:
+            text += f" · {refused:,} unsupported"
+        if failed:
+            text += f" · {failed:,} failed"
+        return text
+
+    def message(self, completed, compiled, unsupported, failed):
+        return f"{self.label} · {self.summary()} · {completed:,}/{self.total:,} requests"
 
 
 @contextmanager

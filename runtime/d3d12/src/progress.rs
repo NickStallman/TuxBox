@@ -1,11 +1,13 @@
 //! Counts of shader translation and pipeline building, shown by the on-screen
 //! progress panel.
 //!
-//! A shader is counted once, by its request key, however often the title asks
-//! for it. A refused attempt that a later one overcame is not counted. A pipeline is counted once per creation call from the title; that
-//! call includes any translation wait and the driver's own compile.
+//! A shader is a program, counted once however many requests it takes: one for
+//! each root signature it is bound with, each linked consumer and each host
+//! variant. It is compiled when any of them is, and unsupported only when none
+//! are. A pipeline is counted once per creation call from the title; that call
+//! includes any translation wait and the driver's own compile.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -40,7 +42,7 @@ pub(crate) struct ShaderCounts {
 }
 
 impl ShaderCounts {
-    /// Distinct shaders the title received in compiled form.
+    /// Programs the title received in compiled form.
     pub(crate) fn compiled(&self) -> u32 {
         self.translated + self.cached
     }
@@ -55,45 +57,44 @@ impl ShaderCounts {
     }
 }
 
-/// The distinct shaders seen so far. The first result for a key stands, except
-/// that a timed-out request is replaced by whatever it produces later.
+impl Shader {
+    /// Which result stands when a program's requests differ.
+    fn rank(self) -> u8 {
+        match self {
+            Self::TimedOut => 0,
+            Self::Unsupported => 1,
+            Self::Translated | Self::Cached => 2,
+        }
+    }
+}
+
+/// The programs seen so far.
 #[derive(Default)]
 struct Shaders {
+    /// The program each source file holds, both as hex digests. The same
+    /// program arrives in many files, which differ in their appended roots.
+    sources: HashMap<String, String>,
     seen: HashMap<String, Shader>,
-    /// Attempts whose refusal is expected, because a retry replaces them.
-    superseded: HashSet<String>,
     counts: ShaderCounts,
 }
 
 impl Shaders {
-    /// Returns whether anything changed.
+    /// Count the result of one request. A request key begins with the digest
+    /// of its source file. Returns whether anything changed.
     fn record(&mut self, key: &str, shader: Shader) -> bool {
-        if shader == Shader::Unsupported && self.superseded.contains(key) {
-            return false;
-        }
-        match self.seen.get(key).copied() {
+        let source = key.get(..64).unwrap_or(key);
+        let program = self.sources.get(source).map_or(source, String::as_str);
+        match self.seen.get_mut(program) {
             None => {
-                self.seen.insert(key.to_owned(), shader);
+                self.seen.insert(program.to_owned(), shader);
             }
-            Some(Shader::TimedOut) if shader != Shader::TimedOut => {
-                *self.counts.slot(Shader::TimedOut) -= 1;
-                self.seen.insert(key.to_owned(), shader);
+            Some(held) if shader.rank() > held.rank() => {
+                *self.counts.slot(*held) -= 1;
+                *held = shader;
             }
             Some(_) => return false,
         }
         *self.counts.slot(shader) += 1;
-        true
-    }
-
-    /// Stop counting `key` as unsupported, now and if it is refused again.
-    /// Returns whether a count changed.
-    fn supersede(&mut self, key: &str) -> bool {
-        self.superseded.insert(key.to_owned());
-        if self.seen.get(key) != Some(&Shader::Unsupported) {
-            return false;
-        }
-        self.seen.remove(key);
-        self.counts.unsupported -= 1;
         true
     }
 }
@@ -103,6 +104,8 @@ pub(crate) struct Snapshot {
     /// Translations the title is waiting on.
     pub in_flight: u32,
     pub shaders: ShaderCounts,
+    /// Programs in the title's shader pack, or zero when the launcher gave none.
+    pub total: u32,
     /// Pipeline creation calls running now.
     pub building: u32,
     pub built: u32,
@@ -134,12 +137,25 @@ pub(crate) fn record(key: &str, shader: Shader) {
     }
 }
 
-/// A retry compiled the program, so the refusal of `key` was one attempt on the
-/// way to it.
-pub(crate) fn supersede(key: &str) {
-    if SHADERS.lock().unwrap_or_else(|e| e.into_inner()).supersede(key) {
-        touch();
-    }
+/// Whether the program in source file `source` is known.
+pub(crate) fn identified(source: &str) -> bool {
+    SHADERS.lock().unwrap_or_else(|e| e.into_inner()).sources.contains_key(source)
+}
+
+/// Note that source file `source` holds `program`.
+pub(crate) fn identify(source: &str, program: String) {
+    SHADERS.lock().unwrap_or_else(|e| e.into_inner()).sources.insert(source.to_owned(), program);
+}
+
+/// `TUXBOX_SHADER_PROGRAMS`: how many programs the title's shader pack holds.
+fn total() -> u32 {
+    static TOTAL: LazyLock<u32> =
+        LazyLock::new(|| parse_total(std::env::var("TUXBOX_SHADER_PROGRAMS").ok().as_deref()));
+    *TOTAL
+}
+
+fn parse_total(value: Option<&str>) -> u32 {
+    value.and_then(|text| text.trim().parse().ok()).unwrap_or(0)
 }
 
 /// One translation the title is waiting on. Dropping it ends the wait.
@@ -195,6 +211,7 @@ pub(crate) fn snapshot() -> Snapshot {
     Snapshot {
         in_flight: IN_FLIGHT.load(Relaxed),
         shaders: SHADERS.lock().unwrap_or_else(|e| e.into_inner()).counts,
+        total: total(),
         building: BUILDING.load(Relaxed),
         built: BUILT.load(Relaxed),
         failed: FAILED.load(Relaxed),
@@ -268,10 +285,14 @@ pub(crate) fn lines(snapshot: &Snapshot) -> [String; 4] {
     if shaders.timed_out > 0 {
         problems.push_str(&format!("  |  {} timed out", grouped(shaders.timed_out)));
     }
+    let of = match snapshot.total {
+        0 => String::new(),
+        total => format!(" of {}", grouped(total)),
+    };
     [
         format!("TuxBox  |  {}", state.join(", ")),
         format!(
-            "{} shaders compiled  ({} new)",
+            "{}{of} shaders compiled  ({} new)",
             grouped(shaders.compiled()),
             grouped(shaders.translated)
         ),

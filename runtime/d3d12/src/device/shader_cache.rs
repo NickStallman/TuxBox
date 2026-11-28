@@ -200,13 +200,32 @@ fn read_portable_file(path: &std::path::Path, stage: Stage) -> Option<Vec<u8>> {
 }
 
 pub(super) fn source_digest(shader: &[u8]) -> Option<String> {
-    if shader.len() > MAX_BYTES {
+    let source = sha256(shader)?;
+    // Progress counts programs, and one program arrives in many source files.
+    if !crate::progress::identified(&source)
+        && let Some(program) = program_part(shader).and_then(sha256)
+    {
+        crate::progress::identify(&source, program);
+    }
+    Some(source)
+}
+
+/// The part of a shader container that holds the program: the same bytes
+/// whichever root signature has been added beside it.
+fn program_part(shader: &[u8]) -> Option<&[u8]> {
+    let container = tuxbox_dxbc::Dxbc::parse(shader).ok()?;
+    let part = container.chunks.iter().find(|part| &part.fourcc == b"DXIL")?;
+    shader.get(part.offset..part.offset.checked_add(part.size)?)
+}
+
+fn sha256(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_BYTES {
         return None;
     }
     let mut digest = [0u8; 32];
     // SAFETY: the system SHA-256 pseudo-handle takes no secret, and the
     // bounded input and 32-byte output remain live through this call.
-    unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, shader, &mut digest) }
+    unsafe { BCryptHash(BCRYPT_SHA256_ALG_HANDLE, None, bytes, &mut digest) }
         .ok()
         .ok()?;
     let mut source = String::with_capacity(64);
@@ -343,16 +362,6 @@ pub(super) fn refused_for_heap_strides(shader: &[u8], root: &[u8]) -> bool {
     let variant = with_root(shader, root);
     let Some(key) = source_digest(variant.as_deref().unwrap_or(shader)) else { return false };
     compile::refusal_reason(&key).is_some_and(|reason| reason.contains("IDXEN needs the console descriptor stride"))
-}
-
-/// A retry with the stride table translated `shader`, so the attempts without
-/// it, on `root` and root-less, are not unsupported shaders.
-pub(super) fn superseded(shader: &[u8], root: &[u8]) {
-    for attempt in [with_root(shader, root).as_deref(), Some(shader)].into_iter().flatten() {
-        if let Some(key) = source_digest(attempt) {
-            crate::progress::supersede(&key);
-        }
-    }
 }
 
 /// The original table layout has already been verified. A program whose

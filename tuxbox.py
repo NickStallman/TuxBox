@@ -23,6 +23,7 @@ from project_tuxbox.host import Host, requires_offline
 from project_tuxbox.inspect import binary_file, image, launch_target, package, package_root
 from project_tuxbox.d3d12_status import d3d12_table
 from project_tuxbox.progress_map import library_table, shader_table, write_map
+from project_tuxbox.scarlett_prep import announce_programs
 from project_tuxbox.shader_prep import prepare_for_launch
 from project_tuxbox.check import run_checks
 from project_tuxbox.symbols import lookup_symbols
@@ -80,6 +81,9 @@ def run_game(args, exe, host, package_dir, profile=None):
                         log.status("Shader preparation complete." if supported else
                                    "No matching shader preparation profile for this title and provider.")
                         return 0 if supported else 1
+            if scarlett and host.backend in ("wine", "proton"):
+                with redirect_stderr(log):
+                    announce_programs(exe, host)
             if args.overlay:
                 host.env["TUXBOX_OVERLAY"] = "1"
             log.status("Starting game")

@@ -19,6 +19,7 @@ stencil variants and programs that receive their root signature at pipeline
 creation are still discovered by playing.
 """
 import hashlib
+import json
 import mmap
 import os
 from pathlib import Path
@@ -82,6 +83,46 @@ def records(data):
         name, offset, payload, end = accepted
         yield name, offset, payload
         pos = end + 1
+
+
+def program_digest(data):
+    """The SHA-256 of a shader container's DXIL part, or ``None`` without one.
+
+    The part holds the program. It is the same whichever root signature was
+    added beside it, so it counts a program once however many requests it takes.
+    """
+    if data[:4] != b"DXBC" or len(data) < 32:
+        return None
+    for index in range(min(_u32(data, 28), 64)):
+        at = _u32(data, 32 + index * 4)
+        if data[at:at + 4] == b"DXIL":
+            body = data[at + 8:at + 8 + _u32(data, at + 4)]
+            return hashlib.sha256(body).hexdigest() if body else None
+    return None
+
+
+def count_programs(pack, remembered):
+    """How many different programs ``pack`` holds, kept in ``remembered``
+    until the pack changes, since reading it all takes a while."""
+    stat = os.stat(pack)
+    stamp = [stat.st_size, stat.st_mtime_ns]
+    remembered = Path(remembered)
+    try:
+        saved = json.loads(remembered.read_text(encoding="utf-8"))
+        if saved["pack"] == stamp:
+            return int(saved["programs"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    programs = set()
+    if stat.st_size:
+        with open(pack, "rb") as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            for _, _, payload in records(data):
+                programs.add(program_digest(payload) or hashlib.sha256(payload).hexdigest())
+    remembered.parent.mkdir(parents=True, exist_ok=True)
+    staged = remembered.with_name(remembered.name + ".new")
+    staged.write_text(json.dumps({"pack": stamp, "programs": len(programs)}), encoding="utf-8")
+    os.replace(staged, remembered)
+    return len(programs)
 
 
 def seed_requests(pack, requests, report=None):

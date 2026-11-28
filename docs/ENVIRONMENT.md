@@ -36,6 +36,7 @@ The launcher sets these for a Proton or Wine launch. A value you set yourself is
 | `__GL_SHADER_DISK_CACHE_SIZE` | 4 GiB | Size limit; larger cache files stopped being indexed |
 | `__GL_SHADER_DISK_CACHE_APP_NAME` | `tuxbox<n>` | Cache file this launch writes. A new number starts at 1 GiB, because the driver cannot index past 4 GiB |
 | `__GL_SHADER_DISK_CACHE_READ_ONLY_APP_NAME` | every other file | Cache files the driver also reads. Setting either name yourself leaves both alone |
+| `TUXBOX_SHADER_PROGRAMS` | the count in `shaders.rpf` | ProjectScarlett only: the total the progress panel counts compiled shader programs against |
 | `TUXBOX_LOG` | `1` (`stderr` on Windows) | Sends provider messages to the game log |
 | `WINEDEBUG`, `VKD3D_DEBUG`, `DXVK_LOG_LEVEL` | warnings and errors | Backend messages in the game log |
 | `UMU_RUNTIME_UPDATE` | `0` for offline launches (always set) | Stops umu-run from needing the network |
