@@ -33,11 +33,15 @@ fn writes_vgpr(i: &Insn, v: u8) -> bool {
         if u16::from(n) <= u16::from(v) && u16::from(v) < u16::from(n) + heap_offsets::result_words(i).max(1)))
 }
 
-/// Whether `i` may write `s` or `s + 1`: a load fills a register per word, any other
+/// Whether `i` may write `s` or `s + 1`: a load fills a register per word, a scalar
+/// operation without a 64-bit operand and a lane read one register, any other
 /// instruction at most a 64-bit pair.
 fn writes_sgpr_pair(i: &Insn, s: u8) -> bool {
     let words = if i.enc == Enc::Smem {
         i.mnemonic.split_once("dwordx").and_then(|(_, n)| n.parse::<u16>().ok()).unwrap_or(1)
+    } else if matches!(i.enc, Enc::Sop1 | Enc::Sop2 | Enc::Sopk) && !i.mnemonic.contains("64")
+        || matches!(i.mnemonic.as_str(), "v_readfirstlane_b32" | "v_readlane_b32") {
+        1
     } else { 2 };
     i.dst.iter().any(|o| matches!(*o, Opnd::Sgpr(n) if u16::from(n) <= u16::from(s) + 1 && u16::from(s) < u16::from(n) + words))
 }

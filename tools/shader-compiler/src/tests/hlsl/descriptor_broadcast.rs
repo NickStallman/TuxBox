@@ -96,3 +96,19 @@ fn a_restored_exec_counts_from_where_it_was_saved() {
     let unkept = program(vec![copy(57, 8), branch(5, 3), keep(10), restore(10), read(12, 57), end()]);
     assert_eq!(find(&unkept).1, BTreeSet::new());
 }
+
+#[test]
+fn a_32_bit_scalar_result_beside_a_kept_mask_leaves_it_alone() {
+    let keep = |s: u8| plain(op("s_mov_b64", Enc::Sop1, vec![Opnd::Sgpr(s)], vec![Opnd::ExecLo]));
+    let restore = |s: u8| plain(op("s_mov_b64", Enc::Sop1, vec![Opnd::ExecLo], vec![Opnd::Sgpr(s)]));
+    let scalar = |name: &str, s: u8| plain(op(name, Enc::Sop2, vec![Opnd::Sgpr(s)], vec![Opnd::Sgpr(s), Opnd::ConstInt(0)]));
+    let after = |between: (Insn, usize)| program(vec![copy(57, 8), keep(10), between, restore(10), read(12, 57), end()]);
+    // The carry half of a 64-bit add writes s9 only, as does a lane read into s9.
+    assert_eq!(find(&after(scalar("s_addc_u32", 9))).1, BTreeSet::from([4]));
+    let lane = plain(op("v_readfirstlane_b32", Enc::Vop1, vec![Opnd::Sgpr(9)], vec![Opnd::Vgpr(3)]));
+    assert_eq!(find(&after(lane)).1, BTreeSet::from([4]));
+    // Writes into the kept pair still lose it, a 64-bit result from the word below too.
+    for (name, s) in [("s_addc_u32", 10), ("s_add_u32", 11), ("s_lshl_b64", 9)] {
+        assert_eq!(find(&after(scalar(name, s))).1, BTreeSet::new(), "{name} s{s}");
+    }
+}
