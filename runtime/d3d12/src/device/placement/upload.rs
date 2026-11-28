@@ -137,7 +137,6 @@ impl Transfer {
         for change in changes {
             let mut state = lock(&change.texture.contents);
             state.previous[change.level] = Some(change.digest);
-            self.scratch = change.bytes;
             state.uploaded = tick;
             state.readers.clear();
         }

@@ -341,6 +341,19 @@ impl Texture {
         Ok(true)
     }
 
+    /// Reads a mip into the front of `scratch`. The scratch buffer only
+    /// grows, so the bytes an earlier read left in it are read over rather
+    /// than zeroed again for every texture checked.
+    fn read_mip<'a>(&self, mip: &Mip, scratch: &'a mut Vec<u8>) -> Result<Option<&'a [u8]>> {
+        let size = (mip.source.end - mip.source.start) as usize;
+        if scratch.len() < size {
+            scratch.try_reserve_exact(size - scratch.len()).map_err(|_| E_OUTOFMEMORY)?;
+            scratch.resize(size, 0);
+        }
+        let bytes = &mut scratch[..size];
+        Ok(super::heap::backing::read_guest_bytes(self.address + mip.source.start, bytes).then_some(&*bytes))
+    }
+
     fn changed(
         self: &Arc<Self>,
         changes: &mut Vec<upload::Change>,
@@ -348,16 +361,20 @@ impl Texture {
     ) -> Result<()> {
         let mut contents = lock(&self.contents);
         for (level, mip) in self.mips.iter().enumerate() {
-            if !self.snapshot_mip(mip, scratch)? {
+            let Some(bytes) = self.read_mip(mip, scratch)? else {
                 contents.previous[level] = None;
                 continue;
-            }
-            let digest = Digest::of(scratch);
+            };
+            let digest = Digest::of(bytes);
             if contents.previous[level] != Some(digest) {
+                // Only a changed mip is copied out of the scratch buffer.
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(bytes.len()).map_err(|_| E_OUTOFMEMORY)?;
+                owned.extend_from_slice(bytes);
                 changes.push(upload::Change {
                     texture: self.clone(),
                     level,
-                    bytes: std::mem::take(scratch),
+                    bytes: owned,
                     digest,
                 });
             }
