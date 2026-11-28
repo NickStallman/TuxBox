@@ -610,15 +610,9 @@ fn unique(textures: &mut Vec<Arc<Texture>>) {
     textures.dedup_by(|a, b| Arc::ptr_eq(a, b));
 }
 
-/// Add the placed textures viewed in `heaps` to a batch's reads. The batch
-/// cannot write through these ranges, so a writable view there is a read too.
-pub(crate) unsafe fn gather_reads(device: *mut c_void, heaps: &[Range<usize>], textures: &mut Vec<Arc<Texture>>) {
-    let device = unsafe { &*device.cast::<Device>() };
-    device.state.placements.views.gather_reads(heaps, textures);
-}
-
 // Descriptor contents may change after command-list Close. Resolve SRVs in the
 // shader-visible heaps that actually participated in a draw or dispatch.
+// The batch cannot write through `read_heaps`, so a writable view there is a read.
 pub(crate) unsafe fn submit(
     device: *mut c_void,
     queue: &ID3D12CommandQueue,
@@ -626,12 +620,13 @@ pub(crate) unsafe fn submit(
     textures: &mut Vec<Arc<Texture>>,
     writes: &mut Vec<Arc<Texture>>,
     heaps: &[Range<usize>],
+    read_heaps: &[Range<usize>],
     holds: Option<held::Waits>,
     execute: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let device = unsafe { &*device.cast::<Device>() };
     let placements = &device.state.placements;
-    placements.views.gather(heaps, textures, writes);
+    placements.views.gather(heaps, read_heaps, textures, writes);
     unique(writes);
     textures
         .try_reserve(writes.len())
