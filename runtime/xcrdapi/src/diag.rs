@@ -162,13 +162,7 @@ pub(crate) fn failure(
         return;
     }
     let pages = pages.map_or(String::new(), |(tokens, offset)| {
-        let shown: Vec<String> = tokens.iter().take(4).map(|t| format!("{t:#x}")).collect();
-        format!(
-            ", {} pages from offset {offset:#x} [{}{}]",
-            tokens.len(),
-            shown.join(" "),
-            if tokens.len() > 4 { " ..." } else { "" }
-        )
+        format!(", {} pages from offset {offset:#x} {}", tokens.len(), self::tokens(tokens))
     });
     crate::queue::debug(&format!(
         "TuxBox xcrdapi: request failed #{} at {stage} ({:#010x}{}{detail}): options {}, {source}, \
@@ -177,6 +171,29 @@ pub(crate) fn failure(
         hr.0 as u32,
         if detail.is_empty() { "" } else { ", " },
         describe(options),
+    ));
+}
+
+/// The first four page tokens, as `[0x10 0x20 ...]`.
+pub(crate) fn tokens(tokens: &[u64]) -> String {
+    let shown: Vec<String> = tokens.iter().take(4).map(|t| format!("{t:#x}")).collect();
+    format!("[{}{}]", shown.join(" "), if tokens.len() > 4 { " ..." } else { "" })
+}
+
+/// Logs a page array whose zero entries were filled after the request was
+/// enqueued: the first 16, then every 4096th.
+pub(crate) fn late_pages(array: usize, enqueued: &[u64], now: &[u64]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    let n = LATE.fetch_add(1, Ordering::Relaxed);
+    if n >= 16 && !n.is_multiple_of(4096) {
+        return;
+    }
+    crate::queue::debug(&format!(
+        "TuxBox xcrdapi: page array #{} at {array:#x} was filled after its request was enqueued: {} then, {} when it ran",
+        n + 1,
+        tokens(enqueued),
+        tokens(now)
     ));
 }
 

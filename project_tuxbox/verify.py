@@ -1148,8 +1148,9 @@ def verify(host, output, adapter, selected=None, samples=1):
                   providers={"xapu/xapu.dll": ("XApuConnect", "XApuEnqueueCommand", "XApuDequeueResult")})
         if "xcrdapi" in selected:
             check("xcrdapi", "xcrdapi/xcrdapi-read.exe", [],
-                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 autosubmit=64 PASS",
-                  providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)})
+                  r"raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 pages=2 autosubmit=64 PASS",
+                  providers={"xcrdapi/xcrdapi.dll": ("DStorageGetFactory",)},
+                  dependencies=("xmem-smoke/xmem.dll",))
         if "xmem" in selected:
             check("xmem-heaps", "xmem-smoke/xmem-smoke.exe", ["--heaps", "--report"],
                   r"xmem-heaps PASS title=1 private=4 invalid=2 pool-commits=2 pool-decommits=2 heap-callbacks=2 stats=1 dump=1 history=2 page-classes=3",
