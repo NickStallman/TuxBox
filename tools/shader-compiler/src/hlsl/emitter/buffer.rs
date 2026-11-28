@@ -254,11 +254,9 @@ impl<'a> Emitter<'a> {
             let offset = format!("{address} + {}u", 4 * k);
             let reg = Opnd::Vgpr(base.checked_add(k).ok_or("raw buffer register overflow")?);
             if load {
-                if ins.aux.mask & 2 != 0 {
-                    self.line(&format!("uint t{t}_{k} = 0u; if (exec_lo & 1u) t{t}_{k} = {buffer}.Load({offset});"));
-                } else {
-                    self.line(&format!("uint t{t}_{k} = {buffer}.Load({offset});"));
-                }
+                // A lane outside EXEC reads nothing: its address register can hold any
+                // value, and a root descriptor has no bounds to stop the read.
+                self.line(&format!("uint t{t}_{k} = 0u; if (exec_lo & 1u) t{t}_{k} = {buffer}.Load({offset});"));
             } else {
                 self.touch(&reg);
                 self.line(&format!("if (exec_lo & 1u) {buffer}.Store({offset}, {});", r(&reg)?));
