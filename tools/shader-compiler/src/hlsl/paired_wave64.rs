@@ -550,7 +550,11 @@ pub(super) fn emit(em: &mut Emitter<'_>, idx: usize, ins: &Insn, is_ps: bool, br
     }) {
         return Err(format!("paired wave64: {m} needs {word}"));
     }
-    let mut written: Vec<[String; 2]> = ins.dst.iter().filter_map(mask_words).collect();
+    // RDNA2's `v_cmpx` writes EXEC only. The decoder still names VCC as the
+    // compare's destination, and rebuilding it would clear the VCC bits of
+    // every lane the compare left out.
+    let mut written: Vec<[String; 2]> = if m.starts_with("v_cmpx_") { Vec::new() }
+        else { ins.dst.iter().filter_map(mask_words).collect() };
     // `v_cmpx` and the two-operand carry forms name their mask destination only in the opcode.
     let implied = if m.starts_with("v_cmpx_") { Some(Opnd::ExecLo) }
         else if ins.enc == Enc::Vop2 && (m.contains("_co_") || m.ends_with("_co_u32")) { Some(Opnd::VccLo) }

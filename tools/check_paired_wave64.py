@@ -73,6 +73,12 @@ PROGRAMS = {
                   'v_lshlrev_b32_e32 v6, 8, v10', 'v_add_nc_u32_e32 v10, v6, v5', 'v_add_nc_u32_e32 v11, s14, v11',
                   's_add_u32 s21, s21, 1', 's_andn2_b64 exec, s[12:13], exec', ('branch', 's_cbranch_execnz', 'again'),
                   's_mov_b64 exec, s[10:11]'],
+    # RDNA2's compare-to-EXEC leaves VCC alone, including the bits of lanes it turns off.
+    # Lanes another mask already turned off keep their VCC bits too.
+    'cmpx_vcc': ['v_cmp_lt_u32_e32 vcc, 0x3e8, v0', 'v_cmp_lt_u32_e64 s[30:31], v0, 0x5dc',
+                 's_and_saveexec_b64 s[10:11], s[30:31]', 'v_cmpx_lt_u32_e32 0x64, v0', 'v_add_nc_u32_e32 v11, 1, v0',
+                 's_mov_b64 exec, s[10:11]', 'v_cndmask_b32_e32 v10, 5, v0, vcc', 's_bcnt1_i32_b64 s20, vcc',
+                 's_bcnt1_i32_b64 s21, exec'],
     'cmpx_carry': ['v_cmpx_lt_u32_e32 0x64, v0', 'v_add_co_u32 v10, s[30:31], v0, 0xfffffc00',
                    'v_add_co_ci_u32_e64 v11, s[32:33], v1, 7, s[30:31]', 's_bcnt1_i32_b64 s20, s[30:31]',
                    's_bcnt1_i32_b64 s21, exec'],
