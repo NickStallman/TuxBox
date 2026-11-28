@@ -122,6 +122,18 @@ class Report(unittest.TestCase):
         self.assertIn("Still missing: AMD.", text)
         self.assertIn("Shader harness: PASS", text)
 
+    def test_executed_shaders_are_reported_per_card(self):
+        kinds = {"same": 50, "equivalent": 3, "changed": 2, "unstable": 1, "lost": 0, "gained": 1, "neither": 40}
+        card = {"name": "n", "adapter": "10de:0001", "host": "wave32", "sample": 97, "ran": {"before": 54, "after": 55},
+                "wrote_nothing": 7, "kinds": kinds, "reasons": [("skipped: indexes the descriptor heap directly", 40)]}
+        text = harness.render({"baseline": "a", "head": "b", "dirty": False, "problems": ["n: 2 changed"],
+                               "gpu": [], "execute": [card, {**card, "name": "m"}], "cross_adapter": ["r"]})
+        self.assertIn("| n (`10de:0001`, wave32) | 97 | 54 | 55 | 50 | 3 | 2 | 1 | 0 | 1 |", text)
+        self.assertIn("7 of the 55 programs that ran", text)
+        self.assertIn("| 40 | skipped: indexes the descriptor heap directly |", text)
+        self.assertIn("**Unstable**", text)
+        self.assertIn("1 executed requests differ between the cards", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@
   3. translates a sample twice, to catch output that changes between runs;
   4. compiles changed and recovered programs through DXC and DXV;
   5. runs the translator's GPU checks and the shader Lanes suites on each card;
-  6. reports instructions the recorded shaders use that no GPU check runs.
+  6. runs a sample of recorded compute shaders, as translated by both builds,
+     over the same generated resources on each card and compares their outputs;
+  7. reports instructions the recorded shaders use that no GPU check runs.
 
 The other commands run one stage. Paths come from a JSON file (`--config`,
 default build/shader-harness.json); see docs/SHADER_HARNESS.md. Everything is
@@ -33,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 from project_tuxbox import instruction_inventory as inventory  # noqa: E402
 from project_tuxbox import shader_survey as survey  # noqa: E402
 from tools.compare_scarlett_shaders import compile_one  # noqa: E402
+from tools import execute_recorded_shaders as executed  # noqa: E402
 
 TARGET = "x86_64-unknown-linux-gnu"
 LANES = ("lanes-shader-cache", "lanes-raster-tables", "lanes-compute-root",
@@ -190,6 +193,31 @@ def run_gpu(adapter, config, folder, *, lanes=True):
     return result
 
 
+def run_execute(builds, config, adapter, folder, args):
+    """The execute stage on one card."""
+    say(f"{adapter['name']}: running {args.execute_sample} recorded compute shaders with both builds")
+    env = {**adapter.get("env", {})}
+    saved = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        host = {"proton": Path(config["proton"]).resolve(), "prefix": Path(adapter["prefix"]).expanduser().resolve(),
+                "compiler_dir": Path(config["windows_dxc"]).resolve()}
+        report = executed.execute_stage(builds, config["requests"], config["dxc"], host, folder,
+                                        sample=args.execute_sample, seed=args.execute_seed, jobs=args.jobs)
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    report["name"] = adapter["name"]
+    kinds = report["kinds"]
+    say(f"{adapter['name']}: {report['ran']['after']} of {report['sample']} ran; {kinds['same']} same, "
+        f"{kinds['equivalent']} equivalent, "
+        f"{kinds['changed']} changed, {kinds['unstable']} unstable, {kinds['lost']} lost, {kinds['gained']} gained")
+    return report
+
+
 def exercised(folders):
     found = survey.exercised_mnemonics(folders)
     for folder in folders:
@@ -234,9 +262,35 @@ def render(report):
     if not report.get("gpu"):
         lines.append("- Not run.")
     ran = {VENDORS.get(card["id"].split(":")[0], "other") for card in report.get("gpu", [])}
+    ran |= {VENDORS.get(card["adapter"].split(":")[0], "other") for card in report.get("execute", [])}
     absent = [vendor for vendor in ("AMD", "NVIDIA") if vendor not in ran]
     if absent:
         lines.append(f"- **Still missing: {' and '.join(absent)}.**")
+    if report.get("execute"):
+        lines += ["", "## Recorded shaders executed", "",
+                  "Each request's two translations ran over the same generated resources; equal outputs mean the "
+                  "change didn't alter what it computes for those inputs. *Equivalent* translations changed and "
+                  "wrote the same; *unstable* ones didn't repeat their own results when the baseline ran twice.", "",
+                  "| Card | Sample | Ran before | after | Same | Equivalent | Changed | Unstable | Lost | Gained |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        for card in report["execute"]:
+            k = card["kinds"]
+            lines.append(f"| {card['name']} (`{card['adapter']}`, {card['host']}) | {card['sample']} | "
+                         f"{card['ran']['before']} | {card['ran']['after']} | {k['same']} | {k['equivalent']} | {k['changed']} | "
+                         f"{k['unstable']} | {k['lost']} | {k['gained']} |")
+        card = report["execute"][0]
+        lines += ["", f"On {card['name']}, {card['wrote_nothing']} of the {card['ran']['after']} programs that ran left "
+                  "every writable resource as seeded, so they show little for these inputs."]
+        if card["reasons"]:
+            lines += ["", "Why requests did not run (candidate, first card):", "", "| Requests | Reason |", "|---:|---|"]
+            lines += [f"| {count} | {reason} |" for reason, count in card["reasons"][:10]]
+        if any(card["kinds"]["unstable"] for card in report["execute"]):
+            lines += ["", "**Unstable** programs wrote different results, or none, in two runs of the baseline "
+                      "translation over the same inputs: a race, an uninitialised read, a driver fault or a loaded "
+                      "host. They don't block a change."]
+        if report.get("cross_adapter") is not None:
+            lines += ["", f"{len(report['cross_adapter'])} executed requests differ between the cards "
+                      "(reported, not blocking)."]
     if "coverage" in report:
         c = report["coverage"]
         lines += ["", "## Instruction coverage", "",
@@ -247,7 +301,9 @@ def render(report):
         lines += ["", "## Largest remaining refusals", "", "| Translations | Reason |", "|---:|---|"]
         lines += [f"| {count} | {reason} |" for reason, count in c["refusals"][:15]]
     lines += ["", "## Not covered", "",
-              "- Recorded shaders are not executed, so a changed output is not proven correct.",
+              "- Executed shaders run over generated inputs on a small grid, not the title's own; their outputs are "
+              "compared between builds and cards, not with a console.",
+              "- Programs that index the descriptor heap directly or read a ray tracing scene are not executed.",
               "- Drivers' own pipeline builds are not run or timed.", ""]
     return "\n".join(lines)
 
@@ -380,6 +436,12 @@ def full_run(args, config):
         report["gpu"] = [run_gpu(card, config, folder / "gpu" / card["name"], lanes=not args.no_lanes)
                          for card in config["adapters"]]
         problems += [f"{card['name']}: {name}" for card in report["gpu"] for name in card["failed"]]
+        if args.execute_sample:
+            report["execute"] = [run_execute(builds, config, card, folder / "execute" / card["name"], args)
+                                 for card in config["adapters"]]
+            problems += [f"{card['name']}: {p}" for card in report["execute"] for p in card["problems"]]
+            if len(report["execute"]) > 1:
+                report["cross_adapter"] = executed.cross_adapter(report["execute"])
         report["coverage"] = survey.coverage(surveys["after"], exercised([folder / "gpu"]))
     (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     (folder / "report.md").write_text(render(report))
@@ -387,6 +449,31 @@ def full_run(args, config):
     for problem in problems:
         print(f"BLOCKING  {problem}")
     return int(bool(problems))
+
+
+def execute_only(args, config):
+    need(config, "requests", "dxc", "proton", "windows_dxc", "adapters")
+    folder = (args.output or ROOT / "build/shader-harness" / strftime("execute-%Y%m%d-%H%M%S")).resolve()
+    folder.mkdir(parents=True, exist_ok=False)
+    say("building the baseline and the working tree")
+    builds = {"before": args.baseline_xshader or build_ref(args.baseline, folder / "xshader-baseline"),
+              "after": args.candidate_xshader or build_translator(ROOT, folder / "xshader-candidate")}
+    cards = [card for card in config["adapters"] if not args.adapter or card["name"] == args.adapter]
+    if not cards:
+        raise SystemExit(f"no configured card is named {args.adapter}")
+    report = {"baseline": git("rev-parse", "--short", args.baseline), "head": git("rev-parse", "--short", "HEAD"),
+              "dirty": bool(git("status", "--porcelain")), "problems": []}
+    report["execute"] = [run_execute(builds, config, card, folder / card["name"], args) for card in cards]
+    if len(cards) > 1:
+        report["cross_adapter"] = executed.cross_adapter(report["execute"])
+    report["problems"] = [f"{card['name']}: {p}" for card in report["execute"] for p in card["problems"]]
+    report["gpu"] = []
+    (folder / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+    (folder / "report.md").write_text(render(report))
+    say(f"report: {folder / 'report.md'}")
+    for problem in report["problems"]:
+        print(f"BLOCKING  {problem}")
+    return int(bool(report["problems"]))
 
 
 def main(argv=None):
@@ -405,6 +492,17 @@ def main(argv=None):
     run.add_argument("--no-gpu", action="store_true", help="CPU stages only; blocks unless --allow-no-gpu")
     run.add_argument("--allow-no-gpu", action="store_true")
     run.add_argument("--no-lanes", action="store_true", help="translator GPU checks without the Lanes suites")
+    run.add_argument("--execute-sample", type=int, default=100,
+                     help="recorded compute shaders to run with both builds on each card; 0 skips the stage")
+    run.add_argument("--execute-seed", type=int, default=0, help="which sample to run")
+    ran = commands.add_parser("execute", help="run a sample of recorded compute shaders with both builds")
+    ran.add_argument("--baseline", default="origin/main", help="git ref to compare with")
+    ran.add_argument("--output", type=Path, help="new run folder")
+    ran.add_argument("--execute-sample", "--sample", type=int, default=100, dest="execute_sample")
+    ran.add_argument("--execute-seed", "--seed", type=int, default=0, dest="execute_seed")
+    ran.add_argument("--adapter", help="only the configured card with this name")
+    ran.add_argument("--baseline-xshader", type=Path, help="a built baseline translator, instead of building --baseline")
+    ran.add_argument("--candidate-xshader", type=Path, help="a built candidate translator, instead of the working tree")
     one = commands.add_parser("survey", help="translate every recorded request with one build")
     one.add_argument("--xshader", type=Path, required=True)
     one.add_argument("--output", type=Path, required=True)
@@ -423,6 +521,8 @@ def main(argv=None):
     config = load_config(args.config)
     if args.command == "run":
         return full_run(args, config)
+    if args.command == "execute":
+        return execute_only(args, config)
     if args.command == "inventory":
         if args.compile:
             compile_inventory(config)

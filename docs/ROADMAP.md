@@ -25,7 +25,7 @@ HLSL is how we get there today. It stays for as long as it is the best route, an
 | Instructions the recorded shaders use | 372 |
 | Of those, run by a GPU check | 372 |
 | Encodings with no translation | 210, and 186 more unproven: no recorded shader uses them |
-| Recorded shaders executed and compared with a reference | none |
+| Recorded shaders executed and compared with a reference | none; a sample of compute shaders is executed and compared between builds and cards |
 | Share of translate-and-compile time spent in DXC | nearly all; the translator itself averages about 30 ms a shader |
 | Translated HLSL | median 97 KB; one shader in a hundred is over 1.8 MB |
 
@@ -44,7 +44,7 @@ Nothing later is safe without this.
 | T1 | **Done: [INSTRUCTIONS.md](INSTRUCTIONS.md).** Instruction inventory. Generate a table of every RDNA 2 instruction from AMD's published instruction set reference: decoded, translated, run by a GPU check, used by recorded shaders. Generate it from code and check it in CI, as `RESULTS.md` is generated from evidence | The table is in `docs/`, and CI fails when it is stale |
 | T2 | **Done: 372 of 372.** GPU checks for used instructions. Every instruction the recorded shaders use is run by a GPU check on AMD and NVIDIA, the last three (`s_swappc_b64`, `s_setpc_b64` and `flat_load_ushort`) in programs shaped as the title's | Every instruction recorded shaders use is run on AMD and NVIDIA |
 | T3 | **In progress.** Operand forms and lane states. A check that holds an instruction doesn't cover every form. Every modifier and memory field (VOP3, VOP3P, SDWA, DPP16, DPP8, buffer, typed buffer, image, LDS, flat and scalar loads) has been flipped one at a time to see whether the translation reads it. A field it can't honour now refuses instead of being ignored. Every field recorded shaders set is honoured, and `v_fma_mix` clamp, fused rounding and inline half constants were fixed. Left: GPU checks for each form, and showing forms in the inventory | The inventory shows forms, not only names |
-| T4 | **Run real shaders.** Execute recorded compute shaders with generated inputs and bound resources, and compare outputs: before and after a change, and between an AMD and an NVIDIA card. Add it to the harness as a stage. Graphics stages follow | A change that alters a real shader's results fails the harness |
+| T4 | **In progress ([#379](https://github.com/brcly/TuxBox/issues/379)).** Run real shaders. The harness's [execute stage](SHADER_HARNESS.md#executing-recorded-shaders) runs a sample of recorded compute shaders over generated resources with both builds, blocks a change whose shaders compute something different, and compares cards without blocking. Still to do: programs that index the descriptor heap directly, which are half of ProjectScarlett's compute programs, inputs that reach more paths, and graphics stages | A change that alters a real shader's results fails the harness |
 | T5 | **A console reference.** Where an RDNA 2 desktop card is available, run the same instructions natively through its Vulkan driver and compare. It is the closest thing to the console we can measure | One documented, repeatable comparison |
 
 ### Stage B: translate everything

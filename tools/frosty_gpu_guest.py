@@ -8,7 +8,7 @@ from project_tuxbox.runtime_shaders import shader_session
 from project_tuxbox.shader_prep import SOURCE_CACHE
 
 
-def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None, link_libraries=(), extra_env=None, fresh_shader_cache=False, warm_shader_cache=None):
+def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, compiler_dir, *, vkd3d_dir=None, link_libraries=(), extra_env=None, fresh_shader_cache=False, warm_shader_cache=None, timeout=45):
     files = proton / "files"
     tools = Toolchain()
     obj = tools.compile(source, trial, "/W4", "/WX", f"/I{ROOT / 'runtime/d3d12'}")
@@ -29,7 +29,8 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
             shutil.rmtree(shader_cache)
         if warm_shader_cache is not None:
             shutil.copytree(warm_shader_cache, shader_cache / "runtime")
-    shutil.copyfile(provider, trial / "d3d12_xs.dll")
+    if provider is not None:
+        shutil.copyfile(provider, trial / "d3d12_xs.dll")
     for lib in ("dxcompiler.dll", "dxil.dll"):
         shutil.copyfile(compiler_dir / lib, trial / lib)
     wine_libs = files / "lib/wine"
@@ -58,8 +59,8 @@ def run_gpu_guest(source, name, trial, work, proton, prefix_source, provider, co
         with shader_session(prefix / SOURCE_CACHE.parent, environment, report):
             for key, value in environment.items():
                 command.extend(["--setenv", key, str(value)])
-            command.extend(["--", "xvfb-run", "-a", "timeout", "-k", "2s", "45s", str(files / "bin/wine"), str(exe)])
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=55)
+            command.extend(["--", "xvfb-run", "-a", "timeout", "-k", "2s", f"{timeout}s", str(files / "bin/wine"), str(exe)])
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=timeout + 10)
     raw = trial / "result.txt"
     observed = dict(line.split("=", 1) for line in raw.read_text().splitlines()) if raw.exists() else {}
     return exe, result.returncode, observed
