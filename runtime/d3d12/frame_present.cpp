@@ -164,11 +164,13 @@ bool DisplayCheck::splash_shows(ULONGLONG milliseconds) const {
 }
 
 void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UINT64 token,
-                          COLORREF corner, COLORREF center) {
+                          COLORREF corner, COLORREF center, ID3D12Resource* overlay) {
     struct FullPlane {
         frame_abi::Plane prefix;
         UINT options[12];
-    } plane{{token, 1, 0, &source}, {}};
+    } planes[2]{{{token, 1, 0, &source}, {}}, {{token, 1, 0, &overlay}, {}}};
+    auto& plane = planes[0];
+    const UINT count = overlay ? 2 : 1;
     struct Parameters {
         float threshold;
         UINT options[7];
@@ -190,7 +192,7 @@ void DisplayCheck::verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UIN
     }
     // Frosty's main thread owns the game window while a render thread presents.
     const auto submit = [&] {
-        auto render = std::async(std::launch::async, [&] { return present(queue, 1, &plane.prefix, &params); });
+        auto render = std::async(std::launch::async, [&] { return present(queue, count, &plane.prefix, &params); });
         while (render.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) pump();
         // The present may resize the title window asynchronously just before it returns; apply
         // that move before the client area is measured.

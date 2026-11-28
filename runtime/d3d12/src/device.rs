@@ -31,7 +31,7 @@ use crate::commands::{wrap_command_list, wrap_command_queue};
 use crate::proxy::{Proxy, Slot, Slots, allocate, check_output, child_slots, object_slots, unwrap};
 
 pub(crate) mod allocation;
-mod fallback;
+pub(crate) mod fallback;
 pub(crate) mod blas;
 pub(crate) mod compute;
 pub(crate) mod late_pipeline;

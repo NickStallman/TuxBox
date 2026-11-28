@@ -1,8 +1,11 @@
 //! Present one RGBA8 or RGB10A2 guest texture through a double-buffered DXGI swap chain.
 
+mod compose;
 mod overlay;
 mod splash;
 mod window;
+use compose::Composer;
+pub(crate) use compose::MAX_LAYERS;
 use crate::performance::Monitor;
 use overlay::{Overlay, PerformancePanel};
 use window::OutputWindow;
@@ -12,7 +15,7 @@ pub(crate) use splash::install as install_splash;
 
 use std::mem::{ManuallyDrop, swap};
 use std::sync::Mutex;
-use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, HANDLE, S_OK};
+use windows::Win32::Foundation::{E_FAIL, E_INVALIDARG, E_NOTIMPL, HANDLE, RECT, S_OK};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
@@ -21,42 +24,64 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{HRESULT, Interface, Result};
 
+/// One plane of a present: a texture, the part of it that is shown and where on the screen.
+pub(crate) struct Layer<'a> {
+    pub(crate) source: &'a ID3D12Resource,
+    pub(crate) from: Option<RECT>,
+    pub(crate) to: Option<[f32; 4]>,
+}
+
+impl Layer<'_> {
+    /// Whether this layer is its whole texture on the whole screen.
+    fn is_plain(&self, desc: &D3D12_RESOURCE_DESC) -> bool {
+        self.from.is_none_or(|r| {
+            (r.left, r.top, r.right as u64, r.bottom as u32) == (0, 0, desc.Width, desc.Height)
+        }) && self.to.is_none_or(|r| r == [0.0, 0.0, 1.0, 1.0])
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Presentation {
     session: Mutex<Option<SwapChain>>,
 }
 
 impl Presentation {
-    pub(crate) fn present(&self, queue: &ID3D12CommandQueue, source: &ID3D12Resource) -> HRESULT {
-        self.present_texture(queue, source)
+    pub(crate) fn present(&self, queue: &ID3D12CommandQueue, layers: &[Layer]) -> HRESULT {
+        self.present_layers(queue, layers)
             .unwrap_or_else(|error| error.code())
     }
 
-    fn present_texture(
-        &self,
-        queue: &ID3D12CommandQueue,
-        source: &ID3D12Resource,
-    ) -> Result<HRESULT> {
-        // SAFETY: source is a live native resource held by the caller.
-        let desc = unsafe { source.GetDesc() };
-        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-            || !matches!(
-                desc.Format,
-                DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM
-            )
-            || desc.DepthOrArraySize != 1
-            || desc.MipLevels != 1
-            || desc.SampleDesc.Count != 1
-            || desc.SampleDesc.Quality != 0
-            || desc.Width > u64::from(u32::MAX)
-        {
-            return Err(E_NOTIMPL.into());
-        }
-        let owner = device_of(source)?;
-        let device = device_of(queue)?;
-        if owner.as_raw() != device.as_raw() {
+    fn present_layers(&self, queue: &ID3D12CommandQueue, layers: &[Layer]) -> Result<HRESULT> {
+        if layers.is_empty() || layers.len() > MAX_LAYERS {
             return Err(E_INVALIDARG.into());
         }
+        let device = device_of(queue)?;
+        // the swap chain takes the size of the widest plane.
+        let mut largest: Option<D3D12_RESOURCE_DESC> = None;
+        for layer in layers {
+            // SAFETY: the source is a live native resource held by the caller.
+            let desc = unsafe { layer.source.GetDesc() };
+            if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                || !matches!(
+                    desc.Format,
+                    DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM
+                )
+                || desc.DepthOrArraySize != 1
+                || desc.MipLevels != 1
+                || desc.SampleDesc.Count != 1
+                || desc.SampleDesc.Quality != 0
+                || desc.Width > u64::from(u32::MAX)
+            {
+                return Err(E_NOTIMPL.into());
+            }
+            if device_of(layer.source)?.as_raw() != device.as_raw() {
+                return Err(E_INVALIDARG.into());
+            }
+            if largest.is_none_or(|l| desc.Width > l.Width) {
+                largest = Some(desc);
+            }
+        }
+        let desc = largest.ok_or(E_FAIL)?;
 
         let mut session = self.session.lock().map_err(|_| E_FAIL)?;
         let chain = match session.as_mut() {
@@ -69,7 +94,7 @@ impl Presentation {
             }
             None => session.insert(SwapChain::new(queue, &device, &desc)?),
         };
-        let status = chain.present(queue, source, &desc)?;
+        let status = chain.present(queue, &device, layers, &desc)?;
         if status == S_OK {
             crate::diagnostics::presented(desc.Width, desc.Height);
         }
@@ -88,7 +113,7 @@ struct Frame {
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     // ExecuteCommandLists does not retain resource references until GPU completion.
-    source: Option<ID3D12Resource>,
+    sources: Vec<ID3D12Resource>,
     retire: u64,
 }
 
@@ -103,7 +128,7 @@ impl Frame {
             Ok(Self {
                 allocator,
                 list,
-                source: None,
+                sources: Vec::new(),
                 retire: 0,
             })
         }
@@ -119,6 +144,8 @@ struct SwapChain {
     /// Present only when `TUXBOX_OVERLAY` or `TUXBOX_FRAME_LOG` is set.
     monitor: Option<Monitor>,
     performance: PerformancePanel,
+    // made when a present first needs more than a copy.
+    composer: Option<Composer>,
     window: OutputWindow,
     width: u32,
     height: u32,
@@ -164,6 +191,7 @@ impl SwapChain {
                 overlay: Overlay::new(params.Format, params.Width, params.Height),
                 monitor: Monitor::from_env(device),
                 performance: PerformancePanel::new(params.Format, params.Width, params.Height),
+                composer: None,
                 window,
                 width: params.Width,
                 height: params.Height,
@@ -177,7 +205,8 @@ impl SwapChain {
     fn present(
         &mut self,
         queue: &ID3D12CommandQueue,
-        source: &ID3D12Resource,
+        device: &ID3D12Device,
+        layers: &[Layer],
         desc: &D3D12_RESOURCE_DESC,
     ) -> Result<HRESULT> {
         if let Some((failure, _)) = &self.failed_signal {
@@ -189,11 +218,13 @@ impl SwapChain {
             if !self.window.is_open() {
                 return Err(DXGI_ERROR_ACCESS_LOST.into());
             }
-            if u64::from(self.width) != desc.Width
-                || self.height != desc.Height
-                || self.format != desc.Format
-            {
-                return Err(E_NOTIMPL.into());
+            // A single whole-surface plane of the swap chain's size is copied, as upstream does.
+            let copy = matches!(layers, [only] if only.is_plain(desc))
+                && u64::from(self.width) == desc.Width
+                && self.height == desc.Height
+                && self.format == desc.Format;
+            if !copy && self.composer.is_none() {
+                self.composer = Some(Composer::new(device, self.format)?);
             }
             // The maximum fence value reports device removal and must stay reserved.
             let next_value = self.next.checked_add(1).ok_or(E_FAIL)?;
@@ -215,10 +246,18 @@ impl SwapChain {
             ];
             frame.allocator.Reset()?;
             frame.list.Reset(&frame.allocator, None)?;
-            record_copy(&frame.list, source, &buffer, &panels);
+            let source = layers[0].source;
+            match &self.composer {
+                // composed frames draw the panels over the layers.
+                Some(composer) if !copy => {
+                    composer.record(device, &frame.list, index as usize, &buffer, (self.width, self.height), layers);
+                    record_panels(&frame.list, &buffer, &panels);
+                }
+                _ => record_copy(&frame.list, source, &buffer, &panels),
+            }
             let sample = sampler::due().then(|| sampler::record(&frame.list, source, D3D12_RESOURCE_STATE_COMMON)).flatten();
             frame.list.Close()?;
-            frame.source = Some(source.clone());
+            frame.sources = layers.iter().map(|layer| layer.source.clone()).collect();
             queue.ExecuteCommandLists(&[Some(ID3D12CommandList::clone(&frame.list))]);
             if let Err(error) = queue.Signal(&self.fence, self.next) {
                 self.failed_signal = Some((error.code(), queue.clone()));
@@ -283,6 +322,37 @@ fn wait_for(fence: &ID3D12Fence, value: u64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// copy the panels onto a back buffer the compositor left in PRESENT.
+fn record_panels(list: &ID3D12GraphicsCommandList, buffer: &ID3D12Resource, panels: &[Option<overlay::Placement>]) {
+    if panels.iter().all(Option::is_none) {
+        return;
+    }
+    let mut barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: ManuallyDrop::new(Some(buffer.clone())),
+                Subresource: 0,
+                StateBefore: D3D12_RESOURCE_STATE_PRESENT,
+                StateAfter: D3D12_RESOURCE_STATE_COPY_DEST,
+            }),
+        },
+    };
+    // SAFETY: the union arm is Transition; D3D12 copies the descriptor, and the
+    // owned pointer is released after both transitions.
+    unsafe {
+        list.ResourceBarrier(core::slice::from_ref(&barrier));
+        for panel in panels.iter().flatten() {
+            overlay::record(list, buffer, panel);
+        }
+        let transition = &mut *barrier.Anonymous.Transition;
+        swap(&mut transition.StateBefore, &mut transition.StateAfter);
+        list.ResourceBarrier(core::slice::from_ref(&barrier));
+        ManuallyDrop::drop(&mut (*barrier.Anonymous.Transition).pResource);
+    }
 }
 
 fn record_copy(

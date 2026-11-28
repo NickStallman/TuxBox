@@ -284,6 +284,9 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         rgb10 = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_RGB10")
         tools.link(out / "xbox-frame-rgb10.exe", rgb10, display, "d3d12_xs.lib", "dxgi.lib",
                    "user32.lib", "gdi32.lib", "kernel32.lib")
+        planes = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_PLANES")
+        tools.link(out / "xbox-frame-planes.exe", planes, display, "d3d12_xs.lib", "dxgi.lib",
+                   "user32.lib", "gdi32.lib", "kernel32.lib")
         size = tools.compile(src / "frame_guest.cpp", out, "/W4", "/WX", "/DGUEST_FRAME_RGB10", "/DGUEST_FRAME_4K")
         tools.link(out / "xbox-frame-4k.exe", size, display, "d3d12_xs.lib", "dxgi.lib",
                    "user32.lib", "gdi32.lib", "kernel32.lib")

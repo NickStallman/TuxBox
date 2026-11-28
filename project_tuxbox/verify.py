@@ -1282,6 +1282,8 @@ def verify(host, output, adapter, selected=None, samples=1):
                             frame_match + r" displayed=2/2", providers=frame_provider, device_factory="xbox")
                     present("guest-present-rgb10", "d3d12-smoke/xbox-frame-rgb10.exe", [*gpu_args, "--present", "--report"],
                             frame_match + r" format=rgb10a2 displayed=2/2", providers=frame_provider, device_factory="xbox")
+                    present("guest-present-planes", "d3d12-smoke/xbox-frame-planes.exe", [*gpu_args, "--present", "--report"],
+                            frame_match + r" displayed=2/2 planes=2", providers=frame_provider, device_factory="xbox")
                     for mode in ("owned", "oversized", "fit", "splash"):
                         if mode == "splash" and splash_skip:
                             skipped.append({"gate": f"guest-present-4k-{mode}", "reason": splash_skip})
@@ -1456,6 +1458,7 @@ GATE_LABELS = {
     "guest-present-4k-fit": "4K RGB10 display scaled inside a smaller title window",
     "guest-present-4k-splash": "Package splash over a fitted 4K title window until frames come steadily",
     "guest-present-rgb10": "Two RGB10A2 frames sampled from the desktop window",
+    "guest-present-planes": "Two frames presented as two planes, the second blended over the first",
     "d3d12-frame-events": "Frame origins, timeout tokens, completed presentation events and display statistics",
     "d3d12-heaps": "Placed resources and allocation offsets in a shared memory heap",
     "d3d12-placement": "Virtual-address BC1 cubes and R8 textures across page changes",

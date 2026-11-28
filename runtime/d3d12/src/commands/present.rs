@@ -27,6 +27,54 @@ pub(super) unsafe extern "system" fn present(
     result
 }
 
+/// Several planes. Only the retail record has a size that lets a second plane follow it.
+unsafe fn present_composed(
+    queue: &Queue, count: u32, planes: *const PresentPlane, params: *const PresentParameters,
+) -> HRESULT {
+    use crate::present::{Layer, MAX_LAYERS};
+    if count as usize > MAX_LAYERS || params.is_null() {
+        return E_NOTIMPL;
+    }
+    let params = unsafe { &*params };
+    if !(0.0..=100.0).contains(&params.immediate_threshold_percent) {
+        return E_INVALIDARG;
+    }
+    let plane = unsafe { &*planes };
+    let mut layers = Vec::with_capacity(count as usize);
+    for index in 0..count as usize {
+        let full = unsafe { &*planes.cast::<RetailPresentPlane>().add(index) };
+        let prefix = &full.prefix;
+        if prefix.resource_count == 0 || prefix.resources.is_null() {
+            // A later plane without a texture shows nothing.
+            if index != 0 { continue; }
+            return E_INVALIDARG;
+        }
+        if prefix.resource_count != 1 {
+            return E_NOTIMPL;
+        }
+        let Some(source) = (unsafe { device::resource(*prefix.resources, parent(&queue.parent)) })
+        else {
+            return E_INVALIDARG;
+        };
+        let from = unsafe { full.source_rects.as_ref() }.copied();
+        let to = unsafe { full.destination.as_ref() }.copied();
+        static SEEN: [std::sync::Once; MAX_LAYERS] = [const { std::sync::Once::new() }; MAX_LAYERS];
+        let desc = unsafe { source.GetDesc() };
+        crate::diagnostics::log_once(&SEEN[index], || format!(
+            "present plane {index} of {count} {}x{} format {} token {} source {from:?} destination {to:?} color {} remaining {:?} parameters {:?}",
+            desc.Width, desc.Height, desc.Format.0, prefix.token, full.color_space, full.remaining, params.options
+        ));
+        layers.push(Layer { source, from, to });
+    }
+    let result = queue.state.presentation.present(&queue.native, &layers);
+    if result == S_OK {
+        frame_heartbeat(plane.token);
+    }
+    // Frame pacing must advance even if the host present failed.
+    unsafe { device::frame_events::display_flip(parent(&queue.parent), plane.token) };
+    result
+}
+
 /// Say every ten seconds how many frames reached the screen.
 pub(super) fn frame_heartbeat(token: u64) {
     static FRAMES: Mutex<Option<(std::time::Instant, u64, u64)>> = Mutex::new(None);
@@ -63,8 +111,9 @@ pub(super) unsafe fn present_planes(
     if count == 0 || planes.is_null() {
         return E_INVALIDARG;
     }
-    if count != 1 {
-        return E_NOTIMPL;
+    if count > 1 {
+        // several planes (Series S: scaled 3D picture and full-size interface), composed.
+        return unsafe { present_composed(queue, count, planes, params) };
     }
     let plane = unsafe { &*planes };
     if plane.resource_count == 0 || plane.resources.is_null() {
@@ -96,7 +145,8 @@ pub(super) unsafe fn present_planes(
             return E_NOTIMPL;
         }
     }
-    let result = queue.state.presentation.present(&queue.native, source);
+    let layers = [crate::present::Layer { source, from: None, to: None }];
+    let result = queue.state.presentation.present(&queue.native, &layers);
     if result == S_OK {
         frame_heartbeat(plane.token);
     }

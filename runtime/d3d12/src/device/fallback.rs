@@ -37,7 +37,7 @@ pub(super) fn shader(stage: Stage) -> Option<&'static [u8]> {
     CODE[index].get_or_init(|| compile(source, profile)).as_deref()
 }
 
-fn compile(source: &str, profile: windows::core::PCSTR) -> Option<Vec<u8>> {
+pub(crate) fn compile(source: &str, profile: windows::core::PCSTR) -> Option<Vec<u8>> {
     type Compile = unsafe extern "system" fn(
         *const core::ffi::c_void, usize, *const i8, *const core::ffi::c_void, *const core::ffi::c_void,
         *const u8, *const u8, u32, u32, *mut *mut core::ffi::c_void, *mut *mut core::ffi::c_void,
@@ -56,7 +56,7 @@ fn compile(source: &str, profile: windows::core::PCSTR) -> Option<Vec<u8>> {
     }
 }
 
-pub(super) fn bytecode(code: &[u8]) -> windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE {
+pub(crate) fn bytecode(code: &[u8]) -> windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE {
     windows::Win32::Graphics::Direct3D12::D3D12_SHADER_BYTECODE {
         pShaderBytecode: code.as_ptr().cast(),
         BytecodeLength: code.len(),

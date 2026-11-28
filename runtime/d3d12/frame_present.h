@@ -12,8 +12,10 @@ public:
     const std::string& sizing() const { return sizing_; }
     DisplayCheck(const DisplayCheck&) = delete;
     DisplayCheck& operator=(const DisplayCheck&) = delete;
+    // With an overlay, each frame is presented as two planes: source, then the
+    // overlay blended over it.
     void verify(ID3D12CommandQueue* queue, ID3D12Resource* source, UINT64 token,
-                COLORREF corner, COLORREF center);
+                COLORREF corner, COLORREF center, ID3D12Resource* overlay = nullptr);
 private:
     void measure(RECT& client, POINT& origin);
     std::array<COLORREF, 5> sample() const;
