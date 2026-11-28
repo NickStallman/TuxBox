@@ -683,3 +683,13 @@ impl Drop for Write {
 #[cfg(test)]
 #[path = "../tests/device/descriptor_paging.rs"]
 mod tests;
+
+/// The host CPU handle that holds the view a guest CPU handle names, in
+/// whichever arena it lives, or the handle itself outside every arena.
+///
+/// # Safety
+/// `device` is a live provider device.
+pub(crate) unsafe fn host_handle(device: *mut core::ffi::c_void, handle: D3D12_CPU_DESCRIPTOR_HANDLE) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    let device = unsafe { &*device.cast::<super::Device>() };
+    device.state.descriptor_arenas.copy_source(handle)
+}

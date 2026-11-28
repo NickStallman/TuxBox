@@ -80,17 +80,14 @@ pub(super) unsafe extern "system" fn clear_uav<const FLOAT: bool>(
                 return;
             }
         };
-        (
-            handle,
-            if arena.contains(cpu.ptr as u64) {
-                arena.cpu(cpu.ptr)
-            } else {
-                cpu
-            },
-        )
+        (handle, cpu)
     } else {
         (gpu, cpu)
     };
+    // The view to clear with may be in this heap, in another arena, or in a
+    // CPU-only heap: map it wherever it lives. A guest handle passed raw to the
+    // driver is read as a host pointer (FSR4's first clear faulted there).
+    let cpu = unsafe { crate::device::descriptor_paging::host_handle(parent(&list.parent), cpu) };
     if let Err(error) = recording.prepare_copy(resource.state.placed(), None) {
         recording.error = error;
         return;
