@@ -237,7 +237,7 @@ impl<'a> Emitter<'a> {
                 // `descriptor_broadcast` proved returns this copy brings it back.
                 Enc::Vop1 if self.descriptor_copies.contains(&idx) => {
                     if let (Some(Opnd::Vgpr(v)), Some(source)) = (ins.dst.first(), ins.src.first().and_then(sg)) {
-                        match sym.get(&source).copied().filter(|s| heap_origins::tracked(*s)) {
+                        match sym.get(&source).copied().filter(|s| broadcast_word(*s)) {
                             Some(word) => sym.insert(2000 + *v as u16, word),
                             None => sym.remove(&(2000 + *v as u16)),
                         };
@@ -260,7 +260,7 @@ impl<'a> Emitter<'a> {
                     };
                     let word = match ins.src.first() {
                         Some(Opnd::Vgpr(v)) if self.descriptor_reads.contains(&idx) => sym.get(&(2000 + *v as u16)).copied()
-                            .filter(|s| heap_origins::tracked(*s)),
+                            .filter(|s| broadcast_word(*s)),
                         _ => None,
                     };
                     // Judged again on each visit: the last one sees the block's final state.
@@ -700,4 +700,11 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
+}
+
+/// A descriptor word a proven waterfall copy carries to its read: one fetched at a
+/// run-time heap index, or one loaded from a table at a known offset. The read is
+/// a word of the same descriptor only if every copy reaching it held that word.
+fn broadcast_word(s: Sym) -> bool {
+    heap_origins::tracked(s) || matches!(s, Sym::Desc { .. })
 }

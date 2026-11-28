@@ -138,6 +138,67 @@ HEAP_STRIDE_PIXEL_CODE = (
     0xF8001801, 0x00000000,            # exp mrt0 v0, off, off, off done vm
     0xBF810000,                        # s_endpgm
 )
+
+# The `raster-sampler-waterfall` vertex program, checked the same way. It takes a
+# texture from the resource heap (base in s8, the FSSM class-5 record) and a
+# sampler from the sampler heap at a constant index (base in s10, class 6), the way
+# RAGE's VfxVBuffer vertex programs do: both arms of an if/else copy the sampler
+# into v[10:13], and a waterfall loop reads it back for the sample. The sampled
+# value is the position's w, so a wrong sampler moves the triangle off the target.
+WATERFALL_TEXTURE_INDEX, WATERFALL_SAMPLER_INDEX = 100, 5
+WATERFALL_VERTEX_CODE = (
+    0xBE9C030A,               # s_mov_b32 s28, s10
+    0xBE9D0380,               # s_mov_b32 s29, 0
+    0xB0140064,               # s_movk_i32 s20, 0x64
+    0x8F158514,               # s_lshl_b32 s21, s20, 5
+    0xF40C0304, 0x2A000000,   # s_load_dwordx8 s[12:19], s[8:9], s21
+    0x7D880081,               # v_cmp_gt_u32_e32 vcc, 1, v0
+    0xBE96246A,               # s_and_saveexec_b64 s[22:23], vcc
+    0xBF880007,               # s_cbranch_execz 7
+    0xF408060E, 0xFA000050,   # s_load_dwordx4 s[24:27], s[28:29], 0x50
+    0xBF8CC07F,               # s_waitcnt lgkmcnt(0)
+    0x7E140218,               # v_mov_b32_e32 v10, s24
+    0x7E160219,               # v_mov_b32_e32 v11, s25
+    0x7E18021A,               # v_mov_b32_e32 v12, s26
+    0x7E1A021B,               # v_mov_b32_e32 v13, s27
+    0x8AFE7E16,               # s_andn2_b64 exec, s[22:23], exec
+    0xBF880007,               # s_cbranch_execz 7
+    0xF408060E, 0xFA000050,   # s_load_dwordx4 s[24:27], s[28:29], 0x50
+    0xBF8CC07F,               # s_waitcnt lgkmcnt(0)
+    0x7E140218,               # v_mov_b32_e32 v10, s24
+    0x7E160219,               # v_mov_b32_e32 v11, s25
+    0x7E18021A,               # v_mov_b32_e32 v12, s26
+    0x7E1A021B,               # v_mov_b32_e32 v13, s27
+    0xBEFE0416,               # s_mov_b64 exec, s[22:23]
+    0x7E0802FF, 0x3EC00000,   # v_mov_b32_e32 v4, 0x3ec00000
+    0x7E0A02F0,               # v_mov_b32_e32 v5, 0.5
+    0xBE9E047E,               # s_mov_b64 s[30:31], exec
+    0x7E40050A,               # v_readfirstlane_b32 s32, v10
+    0x7E42050B,               # v_readfirstlane_b32 s33, v11
+    0x7E44050C,               # v_readfirstlane_b32 s34, v12
+    0x7E46050D,               # v_readfirstlane_b32 s35, v13
+    0x7DC41420,               # v_cmp_eq_u64_e32 vcc, s[32:33], v[10:11]
+    0xD4E20024, 0x00021822,   # v_cmp_eq_u64_e64 s[36:37], s[34:35], v[12:13]
+    0x87A4246A,               # s_and_b64 s[36:37], vcc, s[36:37]
+    0xBEA42424,               # s_and_saveexec_b64 s[36:37], s[36:37]
+    0xBF8CC07F,               # s_waitcnt lgkmcnt(0)
+    0xF09C0108, 0x01030E04,   # image_sample_lz v14, v[4:5], s[12:19], s[32:35] dmask:0x1 dim:SQ_RSRC_IMG_2D
+    0x89FE247E,               # s_xor_b64 exec, exec, s[36:37]
+    0xBF89FFF2,               # s_cbranch_execnz -14
+    0xBEFE041E,               # s_mov_b64 exec, s[30:31]
+    0xBF8C3F70,               # s_waitcnt vmcnt(0)
+    0x7E1202FF, 0x40400000,   # v_mov_b32_e32 v9, 0x40400000
+    0x7D840082,               # v_cmp_eq_u32_e32 vcc, 2, v0
+    0x020C12F3,               # v_cndmask_b32_e32 v6, -1.0, v9, vcc
+    0x7D840081,               # v_cmp_eq_u32_e32 vcc, 1, v0
+    0x020E12F3,               # v_cndmask_b32_e32 v7, -1.0, v9, vcc
+    0x7E100280,               # v_mov_b32_e32 v8, 0
+    0xF80008CF, 0x0E080706,   # exp pos0 v6, v7, v8, v14 done
+    0xBF810000,               # s_endpgm
+)
+WATERFALL_USER = ([5, 0, 1, 0, 8], [6, 0, 1, 0, 10])
+# The texture is the sampler programs' 2x1 one, sampled at (0.375, 0.5): the point
+# sampler at the program's index gives w = 1.0, the linear ones 1.5.
 # One 32-byte record per vertex of a fullscreen triangle: the position, then four
 # zero floats. A load with any other stride reads a different triangle.
 HEAP_STRIDE_BYTES = 32
@@ -253,6 +314,15 @@ def heap_stride_vertex():
     ])
 
 
+def sampler_waterfall_vertex():
+    return container(0x10060, image(7, WATERFALL_VERTEX_CODE, WATERFALL_USER), [
+        (b"SFI0", struct.pack("<Q", 3 << 25)),
+        (b"ISGN", signature([("SV_VertexID", 0, 6, 1, 0, 1, 1)])),
+        (b"OSGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
+        (b"PSV0", validation(1)),
+    ])
+
+
 def heap_stride_pixel():
     return container(0x60, image(5, HEAP_STRIDE_PIXEL_CODE, inputs=2), [
         (b"ISGN", signature([("SV_Position", 0, 1, 3, 0, 15, 0)])),
@@ -291,7 +361,10 @@ def header(vertex_data, pixel_data, sampler_data=None):
             + array("heap_stride_vertex", heap_stride_vertex()) + array("heap_stride_pixel", heap_stride_pixel())
             + f"constexpr UINT heap_stride_index = {HEAP_STRIDE_INDEX}, heap_stride_bytes = {HEAP_STRIDE_BYTES}, "
               f"heap_stride_expected = {HEAP_STRIDE_EXPECTED:#x};\n"
-            + f"constexpr float heap_stride_records[] = {{{records}}};\n")
+            + f"constexpr float heap_stride_records[] = {{{records}}};\n"
+            + array("waterfall_vertex", sampler_waterfall_vertex())
+            + f"constexpr UINT waterfall_texture_index = {WATERFALL_TEXTURE_INDEX}, "
+              f"waterfall_sampler_index = {WATERFALL_SAMPLER_INDEX};\n")
 
 
 if __name__ == "__main__":

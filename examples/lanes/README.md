@@ -69,6 +69,7 @@ The game also imports Windows core API sets for services such as files, timing a
 | `lane-spill-interp` | A console pixel program whose f16 interpolator's attribute selector matches the number of its lane-spill register ([raster tables](#raster-tables)) |
 | `raster-heap-stride` | A console vertex program reading its positions by index from a structured buffer in the resource heap ([raster tables](#raster-tables)); not part of `all` |
 | `large-dispatch` | A console compute program that stores its group ID, dispatched with 70,000 groups across and then 70,000 down ([large dispatches](#large-dispatches)); not part of `all` |
+| `raster-sampler-waterfall` | A console vertex program sampling with a sampler from the sampler heap, read back through a waterfall loop after an if/else copied it ([raster tables](#raster-tables)); not part of `all` |
 | `compute-root` | Two root-less console compute programs under a root with three descriptor tables that the provider cannot reflect ([compute roots](#compute-roots)) |
 | `compute-root-srv` | A console compute program under three tables and a root SRV stores through a table slot that the title's root declares an SRV ([compute roots](#a-compute-root-with-a-root-srv-after-its-tables)) |
 | `mesh-samplers` | The same literal sampler in a mesh pipeline, whose mesh root the provider builds ([raster tables](#raster-tables)); not part of `all` |
@@ -151,6 +152,8 @@ python tuxbox.py verify --only lanes-raster-tables --output build/lanes-raster-t
 The suite runs on the Proton backend and removes only these programs' cache entries from the prefix.
 
 The `raster-heap-stride` scenario draws with its own vertex and pixel pair under a root with no parameters and a paged resource heap (resident limit 64). The vertex program takes the descriptor of a structured buffer with 32-byte records from heap slot 100 and reads its position at its vertex number. The program carries no stride, so the provider has to retry the translation against a root with its stride table and bind that table for the draw; every texel must then hold the pixel program's constant. A refused pipeline, a skipped draw or another stride leaves the target at its clear value. `verify` requires the paged stride table bind and a translation made against the pipeline's root.
+
+The `raster-sampler-waterfall` scenario draws with its own vertex program and the same pixel program under a root with no parameters that indexes both heaps directly. The vertex program samples the 2x1 texture at resource heap slot 100 with the sampler at sampler heap slot 5, which it loads at a constant offset. As RAGE's VfxVBuffer programs do, both arms of an if/else copy that sampler into vector registers and a waterfall loop reads it back for the sample. The sampled value is the position's w: slot 5 holds a point sampler, which keeps the triangle over the whole target, and every other slot a linear one, which shrinks it. A program the translator refuses becomes a stand-in pipeline and leaves the target at its clear value.
 
 ## Compute roots
 

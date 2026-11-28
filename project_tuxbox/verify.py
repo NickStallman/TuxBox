@@ -860,9 +860,12 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     `raster-heap-stride`: the vertex program reads a heap buffer by index under
     a root with no parameters, so the provider must translate it against a root
     with its stride table and bind that table, with a paged resource heap.
+    `raster-sampler-waterfall`: a vertex program that reads a sampler from the
+    sampler heap back through a waterfall loop, after an if/else copied it into
+    vector registers; the sampled value is its position's w.
     """
     from examples.lanes.raster_fixture import (heap_stride_pixel, heap_stride_vertex, mesh, mesh_sampler_pixel, pixel,
-                                               rootless_sampler_pixel, sampler_pixel, vertex)
+                                               rootless_sampler_pixel, sampler_pixel, sampler_waterfall_vertex, vertex)
     from examples.lanes.spill_fixture import pixel as spill_pixel
     from .runtime_shaders import shader_session
     from .shader_prep import SOURCE_CACHE
@@ -870,7 +873,7 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     sources = Path(host.env["WINEPREFIX"]) / SOURCE_CACHE
     rootless = {hashlib.sha256(data).hexdigest()
                 for data in (vertex(), pixel(), sampler_pixel(), mesh_sampler_pixel(), rootless_sampler_pixel(),
-                             spill_pixel(), heap_stride_vertex(), heap_stride_pixel())}
+                             spill_pixel(), heap_stride_vertex(), heap_stride_pixel(), sampler_waterfall_vertex())}
     mesh_key = hashlib.sha256(mesh()).hexdigest()
     messages = []
 
@@ -940,7 +943,8 @@ def lanes_raster_tables(host, check, gpu_args, pci, memory_symbols):
     try:
         for scenario, slots in (("raster-tables", 3), ("lane-spill-interp", None), ("raster-samplers", RASTER_SAMPLER_SLOTS),
                                 ("mesh-samplers", MESH_SAMPLER_SLOTS), ("mesh-sampler-single", MESH_SAMPLER_SLOTS),
-                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS), ("raster-heap-stride", None)):
+                                ("mesh-sampler-rootless", MESH_SAMPLER_SLOTS), ("raster-heap-stride", None),
+                                ("raster-sampler-waterfall", None)):
             if scenario == "raster-heap-stride":
                 # The stride table exists only for a paged heap.
                 host.env["TUXBOX_DESCRIPTOR_HEAP_LIMIT"] = "64"
@@ -1516,6 +1520,7 @@ GATE_LABELS = {
     "lanes-lane-spill-interp": "A console pixel program with a lane-spill area and an f16 interpolator selector of the same number",
     "lanes-raster-samplers": "A console pixel program's literal linear sampler, which the title's root names in another state",
     "lanes-raster-heap-stride": "A console vertex program's indexed read of a heap buffer, through the paged stride table",
+    "lanes-raster-sampler-waterfall": "A console vertex program's heap sampler, read back through a waterfall loop after an if/else",
     "lanes-compute-root": "Root-less console compute programs translated only against a three-table root",
     "lanes-mesh-samplers": "The same literal sampler in a mesh pipeline, added to the mesh root the provider builds",
     "lanes-mesh-sampler-rootless": "Literal samplers in mesh pipelines whose root has no static samplers",
