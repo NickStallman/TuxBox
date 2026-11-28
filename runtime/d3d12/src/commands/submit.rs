@@ -172,7 +172,6 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                 .then(|| placement::held::Waits::new(splits.len().into()));
             let waits = holds.clone();
             unsafe {
-                placement::gather_reads(parent(&queue.parent), &read_views.borrow(), &mut textures);
                 placement::submit(
                     parent(&queue.parent),
                     &queue.native,
@@ -180,6 +179,7 @@ pub(super) unsafe fn execute_batch(queue: &Queue, count: u32, lists: *const *mut
                     &mut textures,
                     &mut writes,
                     &shader_views,
+                    &read_views.borrow(),
                     holds,
                     || {
                         let pending_waits = memory_wait::PendingWaits::new(waits, splits.len());

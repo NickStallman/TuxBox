@@ -124,34 +124,81 @@ impl<T> Views<T> {
 
 }
 
-#[derive(Clone)]
-pub(crate) struct PlacedView {
-    texture: Weak<super::Texture>,
+pub(crate) struct PlacedView<T = super::Texture> {
+    texture: Weak<T>,
     writable: bool,
 }
 
-impl DescriptorMap<PlacedView> {
-    pub(crate) fn set(&self, handle: usize, texture: Option<&Arc<super::Texture>>, writable: bool) {
+impl<T> Clone for PlacedView<T> {
+    fn clone(&self) -> Self {
+        Self { texture: self.texture.clone(), writable: self.writable }
+    }
+}
+
+/// Sort `ranges` and join those that overlap or touch.
+fn coalesce(ranges: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut sorted: Vec<_> = ranges.iter().filter(|r| r.start < r.end).cloned().collect();
+    sorted.sort_unstable_by_key(|r| r.start);
+    let mut joined: Vec<Range<usize>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match joined.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => joined.push(range),
+        }
+    }
+    joined
+}
+
+/// The parts of `ranges` outside `covered`. Both are coalesced.
+fn outside(ranges: &[Range<usize>], covered: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut parts = Vec::new();
+    for range in ranges {
+        let mut start = range.start;
+        let first = covered.partition_point(|c| c.end <= start);
+        for c in covered[first..].iter().take_while(|c| c.start < range.end) {
+            if start < c.start {
+                parts.push(start..c.start);
+            }
+            start = start.max(c.end);
+        }
+        if start < range.end {
+            parts.push(start..range.end);
+        }
+    }
+    parts
+}
+
+impl<T> DescriptorMap<PlacedView<T>> {
+    pub(crate) fn set(&self, handle: usize, texture: Option<&Arc<T>>, writable: bool) {
         self.store(handle, texture.map(|t| PlacedView { texture: Arc::downgrade(t), writable }));
     }
 
-    pub(crate) fn gather(&self, heaps: &[Range<usize>], reads: &mut Vec<Arc<super::Texture>>, writes: &mut Vec<Arc<super::Texture>>) {
-        if heaps.is_empty() { return; }
+    /// The placed textures viewed in the participating heaps of a batch.
+    /// A writable view in `sampled` is a write. Every view in `read` is a
+    /// read: the batch cannot write through those ranges.
+    ///
+    /// Every list of a batch that indexes a heap directly names the whole
+    /// heap, so the ranges repeat. Each descriptor is visited once.
+    pub(crate) fn gather(
+        &self,
+        sampled: &[Range<usize>],
+        read: &[Range<usize>],
+        reads: &mut Vec<Arc<T>>,
+        writes: &mut Vec<Arc<T>>,
+    ) {
+        if sampled.is_empty() && read.is_empty() { return; }
+        let sampled = coalesce(sampled);
+        // A view in a sampled range already joins the batch, as a read or a write.
+        let read = outside(&coalesce(read), &sampled);
         let views = lock(&self.0);
-        for heap in heaps {
+        for heap in &sampled {
             for (_, view) in views.range(heap.clone()) {
                 if let Some(texture) = view.texture.upgrade() {
                     if view.writable { writes.push(texture); } else { reads.push(texture); }
                 }
             }
         }
-    }
-
-    /// Every placed texture viewed in `heaps`, whatever the view allows.
-    pub(crate) fn gather_reads(&self, heaps: &[Range<usize>], reads: &mut Vec<Arc<super::Texture>>) {
-        if heaps.is_empty() { return; }
-        let views = lock(&self.0);
-        for heap in heaps {
+        for heap in &read {
             reads.extend(views.range(heap.clone()).filter_map(|(_, view)| view.texture.upgrade()));
         }
     }
@@ -247,3 +294,7 @@ impl<V: Clone> DescriptorMap<V> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/device/placement/descriptors.rs"]
+mod tests;
