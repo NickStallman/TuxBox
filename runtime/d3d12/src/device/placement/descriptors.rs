@@ -194,7 +194,11 @@ impl<T> DescriptorMap<PlacedView<T>> {
         for heap in &sampled {
             for (_, view) in views.range(heap.clone()) {
                 if let Some(texture) = view.texture.upgrade() {
-                    if view.writable { writes.push(texture); } else { reads.push(texture); }
+                    if view.writable {
+                        writes.push(texture);
+                    } else {
+                        reads.push(texture);
+                    }
                 }
             }
         }

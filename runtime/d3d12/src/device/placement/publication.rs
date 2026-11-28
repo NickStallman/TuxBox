@@ -15,6 +15,7 @@ struct Job {
 
 pub(super) struct Worker {
     pub(super) published: ID3D12Fence,
+    pub(super) spares: Arc<super::writeback::Spares>,
     sender: mpsc::Sender<Job>,
 }
 
@@ -97,6 +98,7 @@ impl QueueAccess {
                         remember(Err(E_FAIL.into()));
                     } else {
                         let result = job.readback.complete();
+                        job.readback.recycle();
                         if result.is_ok() {
                             static FIRST_PUBLICATION: std::sync::Once = std::sync::Once::new();
                             crate::diagnostics::log_once(&FIRST_PUBLICATION, || {
@@ -111,6 +113,6 @@ impl QueueAccess {
                 }
             })
             .map_err(|_| E_OUTOFMEMORY)?;
-        Ok(self.worker.get_or_init(|| Worker { published, sender }))
+        Ok(self.worker.get_or_init(|| Worker { published, spares: Arc::default(), sender }))
     }
 }

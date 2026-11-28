@@ -425,6 +425,9 @@ impl Recording {
         destination: Option<&Arc<Texture>>,
         source: Option<&Arc<Texture>>,
     ) -> Result<(), HRESULT> {
+        if let Some(texture) = destination {
+            texture.note_write(crate::device::placement::WriteSource::Copy);
+        }
         for (accesses, texture) in [
             (&mut self.placed_reads, source),
             (&mut self.placed_writes, destination),
@@ -603,6 +606,7 @@ impl Recording {
         };
         if rasterizes {
             for target in &self.bound_placed_targets {
+                target.note_write(crate::device::placement::WriteSource::RenderTarget);
                 if let Err(error) = Self::track_texture(&mut self.placed_writes, target) {
                     self.error = error;
                     return;
