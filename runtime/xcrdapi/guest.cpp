@@ -68,6 +68,21 @@ struct __declspec(uuid("fb3b54ac-bf82-463a-b777-73195837864d")) Factory
   virtual HRESULT STDMETHODCALLTYPE CreateStatusArray(UINT32, const char *,
                                                       REFIID, void **) = 0;
 };
+struct PriorityStats {
+  UINT32 queues, peak, total, statuses, fences, pending, requests;
+  UINT64 source, destination;
+};
+struct StorageStats {
+  PriorityStats priorities[4];
+  BYTE rest[64];
+};
+struct __declspec(uuid("62959d11-d45f-4884-a0a3-f7862ea243ae")) Factory2
+    : Factory {
+  virtual HRESULT STDMETHODCALLTYPE SetCpuAffinity(UINT64) = 0;
+  virtual void STDMETHODCALLTYPE SetDebugFlags(UINT32) = 0;
+  virtual HRESULT STDMETHODCALLTYPE SetStagingBufferSize(UINT32) = 0;
+  virtual void STDMETHODCALLTYPE GetStats(StorageStats *) = 0;
+};
 extern "C" __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(REFIID,
                                                                    void **);
 static_assert(offsetof(Request, capacity) == 24 &&
@@ -395,6 +410,49 @@ static void run(int argc, wchar_t **argv) {
                 b7.front() == 0xa5 && b7.back() == 0xa5,
             "BC7 blocks and guards");
   }
+  {
+    // A request the title cancels while it is already running completes
+    // without counting as a failure. 64 MiB of stored deflate blocks with a
+    // wrong Adler-32 keep the inflate busy long enough to cancel it.
+    const size_t size = 64 << 20, block = 65535;
+    std::vector<unsigned char> z{0x78, 0x01};
+    for (size_t done = 0; done < size; done += block) {
+      size_t n = (std::min)(block, size - done);
+      z.push_back(done + n == size ? 1 : 0);
+      z.push_back(n & 0xff);
+      z.push_back(n >> 8);
+      z.push_back(~n & 0xff);
+      z.push_back((~n >> 8) & 0xff);
+      z.insert(z.end(), n, 0);
+    }
+    z.insert(z.end(), {0xde, 0xad, 0xbe, 0xef});
+    std::vector<unsigned char> sink(size);
+    Request c{(UINT64(1) << 22) | 1,
+              sink.data(),
+              0,
+              UINT32(size),
+              reinterpret_cast<IUnknown *>(z.data()),
+              0,
+              UINT32(z.size()),
+              0,
+              0x99,
+              nullptr};
+    ComPtr<Factory2> f2;
+    check(f.As(&f2), "factory stats");
+    memory->EnqueueRequest(&c);
+    memory->EnqueueStatus(status.Get(), 2);
+    memory->Submit();
+    StorageStats stats{};
+    ULONGLONG deadline = GetTickCount64() + 10000;
+    do
+      f2->GetStats(&stats);
+    while (stats.priorities[3].pending == 0 && status->GetHResult(2) == E_PENDING &&
+           GetTickCount64() < deadline);
+    require(stats.priorities[3].pending == 1, "cancelled read in flight");
+    memory->CancelRequestsWithTag(~UINT64(0), 0x99);
+    require(wait_status(status.Get(), 2) == S_OK,
+            "a read cancelled while running is not a failure");
+  }
   r.capacity = 4;
   std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   memory->EnqueueRequest(&r);
@@ -418,7 +476,7 @@ int wmain(int argc, wchar_t **argv) {
   try {
     run(argc, argv);
     constexpr auto result =
-        "raw=16 zlib=16 guards=2 errors=2 cancellation=1 bc1=4 bc7=2 autosubmit=64 PASS";
+        "raw=16 zlib=16 guards=2 errors=2 cancellation=2 bc1=4 bc7=2 autosubmit=64 PASS";
     if (argc == 2 || argc == 6) {
       std::ofstream report(argv[argc - 1], std::ios::binary);
       if (argc == 6)
