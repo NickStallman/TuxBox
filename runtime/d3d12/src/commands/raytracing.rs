@@ -20,6 +20,7 @@ pub(super) enum SceneCommand {
         native: u64,
     },
     Cooked(blas::Input),
+    Rehydrate(super::build_raytracing::rehydrate::Deferred),
     Instances {
         guest: u64,
         native: u64,
@@ -52,6 +53,7 @@ impl SceneCommand {
                 }
                 Self::Fixup(instances) => instances.prepare(owner)?,
                 Self::Cooked(input) => input.prepare(owner)?,
+                Self::Rehydrate(deferred) => deferred.prepare(owner),
                 Self::Instances {
                     guest,
                     native,

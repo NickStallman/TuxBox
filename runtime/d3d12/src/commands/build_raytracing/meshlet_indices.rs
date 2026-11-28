@@ -12,7 +12,6 @@
 //!
 //! A host build cannot read this, so the stream is decoded on the CPU into
 //! R32_UINT indices.
-use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
 
 pub(super) const FORMAT: u32 = 53;
 const HEADER: usize = 12;
@@ -27,13 +26,9 @@ fn read(address: u64, bytes: usize) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = vec![0u8; bytes];
-    let mut copied = 0;
-    // SAFETY: ReadProcessMemory checks the source range and fails instead of faulting.
-    unsafe {
-        ReadProcessMemory(GetCurrentProcess(), address as _, out.as_mut_ptr().cast(), bytes, Some(&mut copied))
-    }
-    .ok()?;
-    (copied == bytes).then_some(out)
+    // The address is the one the title gives the GPU, which need not be
+    // where its CPU wrote the data.
+    crate::device::read_title_bytes(address, &mut out).then_some(out)
 }
 
 /// The decoded indices of the stream at `address`, which the build describes

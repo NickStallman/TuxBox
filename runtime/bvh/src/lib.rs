@@ -143,6 +143,20 @@ unsafe extern "system" fn tuxbox_bvh_copy(
     unsafe { record(list, dst, src, mode) };
 }
 
+/// The graphics provider's entry for rehydration, which records each entry
+/// as a host build of the geometry it names.
+type Rehydrate = unsafe extern "system" fn(Object, u32, *const Build, *const u64) -> HRESULT;
+
+fn provider_rehydrate() -> Option<Rehydrate> {
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows::core::{s, w};
+    // The title's device and lists come from this module, so it is loaded.
+    let module = unsafe { GetModuleHandleW(w!("d3d12_xs.dll")) }.ok()?;
+    let entry = unsafe { GetProcAddress(module, s!("TuxBoxRehydrateAccelerationStructures")) }?;
+    // SAFETY: the provider exports this signature under that name.
+    Some(unsafe { core::mem::transmute::<unsafe extern "system" fn() -> isize, Rehydrate>(entry) })
+}
+
 #[unsafe(no_mangle)]
 unsafe extern "system" fn tuxbox_bvh_rehydrate2(
     _this: &Builder,
@@ -157,9 +171,15 @@ unsafe extern "system" fn tuxbox_bvh_rehydrate2(
     if list.is_null() || builds.is_null() {
         return E_INVALIDARG;
     }
-    // Cooked Xbox node records cannot be submitted as native serialized DXR.
-    // Nothing is built at the destinations, so scenes that reference them
-    // point at console node data; say which ones.
+    // Cooked Xbox node records cannot be submitted as native serialized DXR,
+    // but each entry names the geometry its structure was made from, so the
+    // provider builds a host structure from that at the same address.
+    static PROVIDER: std::sync::LazyLock<Option<Rehydrate>> = std::sync::LazyLock::new(provider_rehydrate);
+    if let Some(rehydrate) = *PROVIDER {
+        return unsafe { rehydrate(list, count, builds, addresses) };
+    }
+    // Without it nothing is built at the destinations, so scenes that
+    // reference them point at console node data; say which ones.
     let builds = unsafe { core::slice::from_raw_parts(builds, count as usize) };
     unsafe { report_rehydrate(builds, addresses) };
     E_NOTIMPL

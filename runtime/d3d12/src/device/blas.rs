@@ -230,6 +230,33 @@ pub(crate) unsafe fn geometry_upload(owner: &IUnknown, data: &[u8]) -> Result<ID
     Ok(buffer)
 }
 
+/// Write `data` at the start of an upload buffer at least that large.
+pub(crate) fn fill_upload(buffer: &ID3D12Resource, data: &[u8]) -> Result<()> {
+    if unsafe { buffer.GetDesc() }.Width < data.len() as u64 {
+        return Err(E_INVALIDARG.into());
+    }
+    let mut mapped = core::ptr::null_mut();
+    unsafe { buffer.Map(0, Some(&D3D12_RANGE::default()), Some(&mut mapped))? };
+    // SAFETY: the mapping spans at least `data.len()` bytes.
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), mapped.cast::<u8>(), data.len()) };
+    unsafe { buffer.Unmap(0, None) };
+    Ok(())
+}
+
+/// Scratch space for a build whose title gives none.
+///
+/// # Safety
+/// The owner must identify the controlling guest device.
+pub(crate) unsafe fn scratch_buffer(owner: &IUnknown, bytes: u64) -> Result<ID3D12Resource> {
+    rebuild::buffer(
+        &unsafe { guest(owner) }.native,
+        bytes,
+        D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    )
+}
+
 /// Empty TLASes still need a valid root SRV; no ray can index an instance.
 /// Committed upload memory starts zeroed and is read-only to every list.
 ///
@@ -402,6 +429,33 @@ pub(crate) unsafe fn build_destination(
     }
     guest_memory::target(&device.native, registry, &pool, address, bytes, bytes)
         .map(|(storage, _)| Some(storage))
+}
+
+/// Storage for a structure the host builds in place of one the title holds
+/// at `address`, where the title's own structure spans `extent` bytes and
+/// the host's needs `capacity`. Unlike `build_destination` this never leaves
+/// the address to the host as it is: the host's structure can be larger than
+/// the title's, and the title packs neighbours right after it. Returns the
+/// storage and its address.
+///
+/// # Safety
+/// The owner must identify the list's controlling TuxBox device.
+pub(crate) unsafe fn replacement_destination(
+    owner: &IUnknown,
+    address: u64,
+    extent: u64,
+    capacity: u64,
+) -> Result<(ID3D12Resource, u64)> {
+    let device = unsafe { guest(owner) };
+    let registry = &device.state.blas;
+    let pool = registry.structure_pool_in(address, true)?;
+    // The extent comes from the title's bytes; it cannot pass its allocation.
+    let extent = extent.min(pool.start + pool.bytes - address);
+    if pool.native.is_some() {
+        target(&device.native, registry, &pool, address, extent, capacity)
+    } else {
+        guest_memory::target(&device.native, registry, &pool, address, extent, capacity)
+    }
 }
 
 struct Upload {

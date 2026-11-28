@@ -19,7 +19,6 @@
 //!
 //! A host build would read the records as two floats per vertex, so they are
 //! decoded on the CPU into R32G32B32_FLOAT positions.
-use windows::Win32::System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess};
 
 pub(super) const HEADER: u64 = 32;
 const RECORD: usize = 8;
@@ -31,13 +30,9 @@ fn read(address: u64, bytes: usize) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = vec![0u8; bytes];
-    let mut copied = 0;
-    // SAFETY: ReadProcessMemory checks the source range and fails instead of faulting.
-    unsafe {
-        ReadProcessMemory(GetCurrentProcess(), address as _, out.as_mut_ptr().cast(), bytes, Some(&mut copied))
-    }
-    .ok()?;
-    (copied == bytes).then_some(out)
+    // The address is the one the title gives the GPU, which need not be
+    // where its CPU wrote the data.
+    crate::device::read_title_bytes(address, &mut out).then_some(out)
 }
 
 /// The stride the console builder uses for a title's `StrideInBytes`: the

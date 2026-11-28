@@ -13,20 +13,26 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::E_INVALIDARG;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Memory::{
-    MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
 };
 use windows::core::Result;
 
 /// The committed private or mapped allocation holding `address`, as its
-/// reserved base and size. Module images are never structure memory.
-fn allocation(address: u64) -> Option<(u64, u64)> {
+/// reserved base and size. Module images are never structure memory. With
+/// `reserved`, the address itself need not be committed: a console title
+/// names a structure by its address in the view the GPU uses, which the CPU
+/// may never touch.
+fn allocation(address: u64, reserved: bool) -> Option<(u64, u64)> {
     let query = |at: u64| {
         let mut region = MEMORY_BASIC_INFORMATION::default();
         let size = size_of_val(&region);
         (unsafe { VirtualQuery(Some(at as _), &mut region, size) } != 0).then_some(region)
     };
     let region = query(address)?;
-    if region.State != MEM_COMMIT || !(region.Type == MEM_PRIVATE || region.Type == MEM_MAPPED) {
+    let committed = region.State == MEM_COMMIT;
+    if !(committed || (reserved && region.State == MEM_RESERVE))
+        || !(region.Type == MEM_PRIVATE || region.Type == MEM_MAPPED)
+    {
         return None;
     }
     let base = region.AllocationBase.addr() as u64;
@@ -53,6 +59,12 @@ impl Buffers {
     /// The structure pool covering `address`, adding one for a committed guest
     /// allocation that no registered resource covers.
     pub(super) fn structure_pool(&self, address: u64) -> Result<Arc<Buffer>> {
+        self.structure_pool_in(address, false)
+    }
+
+    /// As `structure_pool`; with `reserved`, an address that is reserved but
+    /// not committed also gets a pool.
+    pub(super) fn structure_pool_in(&self, address: u64, reserved: bool) -> Result<Arc<Buffer>> {
         match self.find(address, Kind::Structure) {
             Err(error) if error.code() == E_INVALIDARG => (),
             found => return found,
@@ -62,7 +74,7 @@ impl Buffers {
             Err(error) if error.code() == E_INVALIDARG => (),
             found => return found,
         }
-        let (start, bytes) = allocation(address).ok_or(E_INVALIDARG)?;
+        let (start, bytes) = allocation(address, reserved).ok_or(E_INVALIDARG)?;
         let pool = Arc::new(Buffer {
             native: None,
             start,
