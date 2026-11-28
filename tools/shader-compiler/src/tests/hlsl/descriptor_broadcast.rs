@@ -112,3 +112,79 @@ fn a_32_bit_scalar_result_beside_a_kept_mask_leaves_it_alone() {
         assert_eq!(find(&after(scalar(name, s))).1, BTreeSet::new(), "{name} s{s}");
     }
 }
+
+fn keep(s: u8) -> (Insn, usize) { plain(op("s_mov_b64", Enc::Sop1, vec![Opnd::Sgpr(s)], vec![Opnd::ExecLo])) }
+fn restore(s: u8) -> (Insn, usize) { plain(op("s_mov_b64", Enc::Sop1, vec![Opnd::ExecLo], vec![Opnd::Sgpr(s)])) }
+fn otherwise(s: u8) -> (Insn, usize) { plain(op("s_andn2_b64", Enc::Sop2, vec![Opnd::ExecLo], vec![Opnd::Sgpr(s), Opnd::ExecLo])) }
+fn narrow() -> (Insn, usize) { plain(op("v_cmpx_eq_u32", Enc::Vopc, vec![Opnd::VccLo], vec![Opnd::Sgpr(30), Opnd::Vgpr(3)])) }
+fn clobber(v: u8) -> (Insn, usize) { plain(op("v_mov_b32", Enc::Vop1, vec![Opnd::Vgpr(v)], vec![Opnd::Vgpr(3)])) }
+fn nop() -> (Insn, usize) { plain(op("s_nop", Enc::Sopp, vec![], vec![])) }
+
+/// save s20; execz else; <then>; else: s20 & ~exec; execz join; <else>; join: exec = s20;
+/// read v57. Branch targets follow the arms' lengths.
+fn if_else(then: Vec<(Insn, usize)>, other: Vec<(Insn, usize)>) -> Vec<Insn> {
+    let split = 2 + then.len();
+    let join = split + 2 + other.len();
+    let mut items = vec![save(20), branch(8, split)];
+    items.extend(then);
+    items.extend([otherwise(20), branch(8, join)]);
+    items.extend(other);
+    items.extend([restore(20), read(12, 57), end()]);
+    program(items)
+}
+
+#[test]
+fn copies_in_both_arms_of_an_if_else_reach_every_lane() {
+    let both = if_else(vec![copy(57, 8)], vec![copy(57, 16)]);
+    assert_eq!(find(&both), (BTreeSet::from([2, 5]), BTreeSet::from([7])));
+    // The then arm turns lanes off after its copy: they take the else arm's.
+    let off = if_else(vec![copy(57, 8), narrow()], vec![copy(57, 16)]);
+    assert_eq!(find(&off).1, BTreeSet::from([8]));
+    // The else arm narrows and writes v57 for some lanes, then restores the EXEC it
+    // kept on entry and copies for all of them.
+    let kept = if_else(vec![copy(57, 8)], vec![keep(30), narrow(), clobber(57), restore(30), copy(57, 16)]);
+    assert_eq!(find(&kept), (BTreeSet::from([2, 9]), BTreeSet::from([11])));
+}
+
+#[test]
+fn an_if_else_without_a_copy_for_every_lane_is_not_proven() {
+    let cases = [
+        // No copy in the else arm.
+        ("one arm", if_else(vec![copy(57, 8)], vec![nop()])),
+        // The then arm turns lanes off before its copy.
+        ("narrowed first", if_else(vec![narrow(), copy(57, 8)], vec![copy(57, 16)])),
+        // Something writes v57 after the else arm's copy.
+        ("written after", if_else(vec![copy(57, 8)], vec![copy(57, 16), clobber(57)])),
+        // The saved mask is overwritten inside the if/else.
+        ("mask clobbered", if_else(vec![copy(57, 8), plain(op("s_mov_b64", Enc::Sop1, vec![Opnd::Sgpr(20)], vec![Opnd::Sgpr(4)]))], vec![copy(57, 16)])),
+        // The else arm turns on lanes from a mask it didn't keep, after its copy.
+        ("widened", if_else(vec![copy(57, 8)], vec![copy(57, 16), restore(30)])),
+    ];
+    for (name, program) in cases {
+        assert_eq!(find(&program).1, BTreeSet::new(), "{name}");
+    }
+    // A branch from before the if/else into its else arm.
+    let mut entered = vec![branch(5, 6)];
+    entered.extend([save(20), branch(8, 4), copy(57, 8), otherwise(20), branch(8, 7), copy(57, 16), restore(20), read(12, 57), end()]);
+    assert_eq!(find(&program(entered)).1, BTreeSet::new());
+}
+
+#[test]
+fn an_if_that_leaves_the_register_alone_is_passed_over() {
+    // copy; save s20; execz end; <body>; end: exec = s20; read
+    let around = |body: Vec<(Insn, usize)>| {
+        let end_at = 3 + body.len();
+        let mut items = vec![copy(57, 8), save(20), branch(8, end_at)];
+        items.extend(body);
+        items.extend([restore(20), read(12, 57), end()]);
+        program(items)
+    };
+    let quiet = around(vec![narrow(), clobber(58)]);
+    assert_eq!(find(&quiet), (BTreeSet::from([0]), BTreeSet::from([6])));
+    // The body writes the register for its lanes.
+    assert_eq!(find(&around(vec![clobber(57)])).1, BTreeSet::new());
+    // A branch from before the copy into the body.
+    let mut entered = vec![branch(5, 4)];
+    entered.extend([copy(57, 8), save(20), branch(8, 5), nop(), restore(20), read(12, 57), end()]);
+    assert_eq!(find(&program(entered)).1, BTreeSet::new());
+}
