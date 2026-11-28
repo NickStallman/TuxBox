@@ -121,3 +121,18 @@ float tb_min(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a 
 float tb_max(float a, float b) { return tb_isnan(a) ? b : (tb_isnan(b) ? a : (a > b ? a : b)); }
 float tb_med3(float a, float b, float c) { if (tb_isnan(a) || tb_isnan(b) || tb_isnan(c)) return tb_min(tb_min(a, b), c); float mx = tb_max(tb_max(a, b), c); if (mx == a) return tb_max(b, c); if (mx == b) return tb_max(a, c); return tb_max(a, b); }
 "#;
+
+/// OMOD scales an instruction's rounded result by 2^k. It adds k to the exponent
+/// bits, so no compiler can move the scale into a product and lose an overflow
+/// to infinity: a `precise` multiply still came back finite on NVIDIA. With
+/// output denormals off OMOD flushes them, so a result below the normal range
+/// and a denormal input become a zero of the same sign. Infinity and NaN pass.
+pub(in crate::hlsl) const OMOD: &str = r#"float tb_omod(float x, int k) {
+    uint b = asuint(x), e = (b >> 23) & 0xffu, sign = b & 0x80000000u;
+    if (e == 0xffu) return x;
+    int n = int(e) + k;
+    if (e == 0u || n <= 0) return asfloat(sign);
+    if (n >= 255) return asfloat(sign | 0x7f800000u);
+    return asfloat((b & 0x807fffffu) | (uint(n) << 23));
+}
+"#;

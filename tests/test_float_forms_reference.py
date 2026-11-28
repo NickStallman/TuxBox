@@ -122,18 +122,11 @@ class FloatFormsReferenceTests(unittest.TestCase):
         self.assertFalse(clamped.matches(0x41000000))
         self.assertConsole(mix(0, 0b011)(0x7c00, 0, 0), QUIET)
 
-    def test_known_faults_are_modelled_for_their_hosts(self):
+    def test_omod_scales_the_rounded_result(self):
+        # 2 MAX overflows before OMOD halves it, on every host.
         label = "v_mul_legacy_f32_e64 v{d}, v4, v5 div:2"
-        self.assertEqual(known_for("1002:13c0", label), [])
-        [(name, model)] = known_for("10de:2b85", label)
-        self.assertEqual(name, "omod-in-product")
-        # 2 MAX is infinite on the console before OMOD halves it; with the 0.5
-        # moved into the product it is MAX.
-        self.assertEqual(model(0x7f7fffff, 0x40000000, 0), 0x7f7fffff)
+        self.assertEqual(known_for("10de:2b85", label), [])
         self.assertFalse(result(label, 0x7f7fffff, 0x40000000).matches(0x7f7fffff))
-        self.assertEqual(model(0x3fc00000, 0xff7fffff, 0), 0xff3fffff)
-        # Elsewhere the fault and the console agree.
-        self.assertTrue(result(label, 0x40000000, 0x40400000).matches(model(0x40000000, 0x40400000, 0)))
         for fault in KNOWN.values():
             self.assertTrue(set(fault["forms"]) <= set(FORM))
 
